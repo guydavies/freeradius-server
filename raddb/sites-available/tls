@@ -7,17 +7,79 @@
 listen {
 	ipaddr = *
 	port = 2083
-	type = auth
+
+	#
+	#  TCP and TLS sockets can accept Access-Request and
+	#  Accounting-Request on the same socket.
+	#
+	#	auth	  = only Access-Request
+	#	acct	  = only Accounting-Request
+	#	auth+acct = both
+	#
+	type = auth+acct
 
 	# For now, only TCP transport is allowed.
 	proto = tcp
 
+	# Send packets to the default virtual server
+	virtual_server = default
+
 	clients = radsec
+
+	#
+	#  Connection limiting for sockets with "proto = tcp".
+	#
+	limit {
+	      #
+	      #  Limit the number of simultaneous TCP connections to the socket
+	      #
+	      #  The default is 16.
+	      #  Setting this to 0 means "no limit"
+	      max_connections = 16
+
+	      #  The per-socket "max_requests" option does not exist.
+
+	      #
+	      #  The lifetime, in seconds, of a TCP connection.  After
+	      #  this lifetime, the connection will be closed.
+	      #
+	      #  Setting this to 0 means "forever".
+	      lifetime = 0
+
+	      #
+	      #  The idle timeout, in seconds, of a TCP connection.
+	      #  If no packets have been received over the connection for
+	      #  this time, the connection will be closed.
+	      #
+	      #  Setting this to 0 means "no timeout".
+	      #
+	      #  We STRONGLY RECOMMEND that you set an idle timeout.
+	      #
+	      idle_timeout = 30
+	}
 
 	#  This is *exactly* the same configuration as used by the EAP-TLS
 	#  module.  It's OK for testing, but for production use it's a good
 	#  idea to use different server certificates for EAP and for RADIUS
 	#  transport.
+	#
+	#  If you want only one TLS configuration for multiple sockets,
+	#  then we suggest putting "tls { ...}" into radiusd.conf.
+	#  The subsection below can then be changed into a reference:
+	#
+	#	tls = ${tls}
+	#
+	#  Which means "the tls sub-section is not here, but instead is in
+	#  the top-level section called 'tls'".
+	#
+	#  If you have multiple tls configurations, you can put them into
+	#  sub-sections of a top-level "tls" section.  There's no need to
+	#  call them all "tls".  You can then use:
+	#
+	#	tls = ${tls.site1}
+	#
+	#  to refer to the "site1" sub-section of the "tls" section.
+	#
 	tls {
 		private_key_password = whatever
 		private_key_file = ${certdir}/server.pem
@@ -27,7 +89,7 @@ listen {
 		#  certificate_file must contain the same file
 		#  name.
 		#
-		#  If CA_file (below) is not used, then the
+		#  If ca_file (below) is not used, then the
 		#  certificate_file below MUST include not
 		#  only the server certificate, but ALSO all
 		#  of the CA certificates used to sign the
@@ -49,7 +111,7 @@ listen {
 		#  not use client certificates, and you do not want
 		#  to permit EAP-TLS authentication, then delete
 		#  this configuration item.
-		CA_file = ${cadir}/ca.pem
+		ca_file = ${cadir}/ca.pem
 
 		#
 		#  For DH cipher suites to work, you have to
@@ -58,7 +120,17 @@ listen {
 		#  	openssl dhparam -out certs/dh 1024
 		#
 		dh_file = ${certdir}/dh
-		random_file = ${certdir}/random
+
+		#
+		#  If your system doesn't have /dev/urandom,
+		#  you will need to create this file, and
+		#  periodically change its contents.
+		#
+		#  For security reasons, FreeRADIUS doesn't
+		#  write to files in its configuration
+		#  directory.
+		#
+#		random_file = ${certdir}/random
 
 		#
 		#  The default fragment size is 1K.
@@ -68,7 +140,7 @@ listen {
 		#  there are fewer round trips when setting up a TLS
 		#  connection.  But only if the certificates are large.
 		#
-	#	fragment_size = 65536
+		fragment_size = 8192
 
 		#  include_length is a flag which is
 		#  by default set to yes If set to
@@ -88,13 +160,13 @@ listen {
 		#  3) uncomment the line below.
 		#  5) Restart radiusd
 	#	check_crl = yes
-		CA_path = ${cadir}
+		ca_path = ${cadir}
 
 	       #
 	       #  If check_cert_issuer is set, the value will
 	       #  be checked against the DN of the issuer in
 	       #  the client certificate.  If the values do not
-	       #  match, the cerficate verification will fail,
+	       #  match, the certificate verification will fail,
 	       #  rejecting the user.
 	       #
 	       #  In 2.1.10 and later, this check can be done
@@ -263,15 +335,15 @@ listen {
 			#  We recommend using the OpenSSL command-line
 			#  tool.
 			#
-			#  The ${..CA_path} text is a reference to
-			#  the CA_path variable defined above.
+			#  The ${..ca_path} text is a reference to
+			#  the ca_path variable defined above.
 			#
 			#  The %{TLS-Client-Cert-Filename} is the name
 			#  of the temporary file containing the cert
 			#  in PEM format.  This file is automatically
 			#  deleted by the server when the command
 			#  returns.
-	#    		client = "/path/to/openssl verify -CApath ${..CA_path} %{TLS-Client-Cert-Filename}"
+	#    		client = "/path/to/openssl verify -CApath ${..ca_path} %{TLS-Client-Cert-Filename}"
 		}
 	}
 }
@@ -279,15 +351,32 @@ listen {
 clients radsec {
 	client 127.0.0.1 {
 		ipaddr = 127.0.0.1
-		proto = tcp
-		secret = testing123
-	}
-}
 
-listen {
-       ipaddr = 127.0.0.1
-       port = 4000
-       type = auth
+		#
+		#  Ensure that this client is TLS *only*.
+		#
+		proto = tls
+
+		#
+		#  TCP clients can have any shared secret.
+		#
+		#  TLS clients MUST have the shared secret
+		#  set to "radsec".  Or, for "proto = tls",
+		#  you can omit the secret, and it will
+		#  automatically be set to "radsec".
+		#
+		secret = radsec
+
+		#
+		#  You can also use a "limit" section here.
+		#  See raddb/clients.conf for examples.
+		#
+		#  Note that BOTH limits are applied.  You
+		#  should therefore set the "listen" limits
+		#  higher than the ones for each individual
+		#  client.
+		#
+	}
 }
 
 home_server tls {
@@ -307,7 +396,7 @@ home_server tls {
 		#  certificate_file must contain the same file
 		#  name.
 		#
-		#  If CA_file (below) is not used, then the
+		#  If ca_file (below) is not used, then the
 		#  certificate_file below MUST include not
 		#  only the server certificate, but ALSO all
 		#  of the CA certificates used to sign the
@@ -329,7 +418,7 @@ home_server tls {
 		#  not use client certificates, and you do not want
 		#  to permit EAP-TLS authentication, then delete
 		#  this configuration item.
-		CA_file = ${cadir}/ca.pem
+		ca_file = ${cadir}/ca.pem
 
 		#
 		#  For DH cipher suites to work, you have to
@@ -345,7 +434,7 @@ home_server tls {
 		#  However, TLS can send 64K of data at once.
 		#  It can be useful to set it higher.
 		#
-	#	fragment_size = 65536
+		fragment_size = 8192
 
 		#  include_length is a flag which is
 		#  by default set to yes If set to
@@ -365,13 +454,13 @@ home_server tls {
 		#  3) uncomment the line below.
 		#  5) Restart radiusd
 	#	check_crl = yes
-		CA_path = ${cadir}
+		ca_path = ${cadir}
 
 	       #
 	       #  If check_cert_issuer is set, the value will
 	       #  be checked against the DN of the issuer in
 	       #  the client certificate.  If the values do not
-	       #  match, the cerficate verification will fail,
+	       #  match, the certificate verification will fail,
 	       #  rejecting the user.
 	       #
 	       #  In 2.1.10 and later, this check can be done

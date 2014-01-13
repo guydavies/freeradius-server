@@ -7,14 +7,18 @@
 #
 #  This module processes the 'huntgroups' and 'hints' files.
 #  In addition, it re-writes some weird attributes created
-#  by some NASes, and converts the attributes into a form which
+#  by some NAS, and converts the attributes into a form which
 #  is a little more standard.
 #
 preprocess {
-	huntgroups = ${confdir}/huntgroups
-	hints = ${confdir}/hints
+	# Search for files in a subdirectory of mods-config which
+	# matches this instance of the preprocess module.
+	moddir = ${modconfdir}/${.:instance}
 
-	# This hack changes Ascend's wierd port numberings
+	huntgroups = ${moddir}/huntgroups
+	hints = ${moddir}/hints
+
+	# This hack changes Ascend's weird port numbering
 	# to standard 0-??? port numbers so that the "+" works
 	# for IP address assignments.
 	with_ascend_hack = no

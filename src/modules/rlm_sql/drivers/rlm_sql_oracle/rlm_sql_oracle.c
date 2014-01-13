@@ -19,27 +19,39 @@
  * Copyright 2000  David Kerry <davidk@snti.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 
 #include <sys/stat.h>
 
+/*
+ *	There are typos in the Oracle Instaclient where the definition controlling prototype
+ *	format is _STDC_ (not __STDC__).
+ *
+ *	There are still cases where the oracle headers do not declare ANSI C function types
+ *	but this at least cuts down the errors.
+ *
+ *	-Wno-strict-prototypes does the rest.
+ */
+#if defined(__STDC__) && __STDC__
+#  define _STDC_
+#endif
+
 #include <oci.h>
 #include "rlm_sql.h"
 
-typedef struct rlm_sql_oracle_sock {
+typedef struct rlm_sql_oracle_conn_t {
 	OCIEnv		*env;
-	OCIError	*errHandle;
-	OCISvcCtx	*conn;
-	OCIStmt		*queryHandle;
-	sb2		*indicators;
-	char		**results;
+	OCIStmt		*query;
+	OCIError	*error;
+	OCISvcCtx	*ctx;
+	sb2		*ind;
+	char		**row;
 	int		id;
-	int		in_use;
+	int		col_count;	//!< Number of columns associated with the result set
 	struct timeval	tv;
-} rlm_sql_oracle_sock;
+} rlm_sql_oracle_conn_t;
 
 #define	MAX_DATASTR_LEN	64
 
@@ -49,27 +61,27 @@ typedef struct rlm_sql_oracle_sock {
  *	Function: sql_error
  *
  *	Purpose: database specific error. Returns error associated with
- *               connection
+ *	       connection
  *
  *************************************************************************/
-static const char *sql_error(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
+static char const *sql_error(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+{
 
 	static char	msgbuf[512];
 	sb4		errcode = 0;
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
+	rlm_sql_oracle_conn_t *conn = handle->conn;
 
-	if (!oracle_sock) return "rlm_sql_oracle: no connection to db";
+	if (!conn) return "rlm_sql_oracle: no connection to db";
 
-	memset((void *) msgbuf, (int)'\0', sizeof(msgbuf));
+	msgbuf[0] = '\0';
 
-	OCIErrorGet((dvoid *) oracle_sock->errHandle, (ub4) 1, (text *) NULL,
-		&errcode, msgbuf, (ub4) sizeof(msgbuf), (ub4) OCI_HTYPE_ERROR);
+	OCIErrorGet((dvoid *) conn->error, 1, (OraText *) NULL, &errcode, (OraText *) msgbuf,
+		    sizeof(msgbuf), OCI_HTYPE_ERROR);
 	if (errcode) {
 		return msgbuf;
 	}
-	else {
-		return NULL;
-	}
+
+	return NULL;
 }
 
 /*************************************************************************
@@ -79,125 +91,94 @@ static const char *sql_error(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
  *	Purpose: check the error to see if the server is down
  *
  *************************************************************************/
-static int sql_check_error(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
+static int sql_check_error(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+{
 
-	if (strstr(sql_error(sqlsocket, config), "ORA-03113") ||
-			strstr(sql_error(sqlsocket, config), "ORA-03114")) {
-		radlog(L_ERR,"rlm_sql_oracle: OCI_SERVER_NOT_CONNECTED");
-		return SQL_DOWN;
+	if (strstr(sql_error(handle, config), "ORA-03113") || strstr(sql_error(handle, config), "ORA-03114")) {
+		ERROR("rlm_sql_oracle: OCI_SERVER_NOT_CONNECTED");
+		return RLM_SQL_RECONNECT;
 	}
 	else {
-		radlog(L_ERR,"rlm_sql_oracle: OCI_SERVER_NORMAL");
+		ERROR("rlm_sql_oracle: OCI_SERVER_NORMAL");
 		return -1;
 	}
 }
 
-/*************************************************************************
- *
- *	Function: sql_close
- *
- *	Purpose: database specific close. Closes an open database
- *               connection and cleans up any open handles.
- *
- *************************************************************************/
-static int sql_close(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
-
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
-
-	if (oracle_sock->conn) {
-		OCILogoff (oracle_sock->conn, oracle_sock->errHandle);
+static int _sql_socket_destructor(rlm_sql_oracle_conn_t *conn)
+{
+	if (conn->ctx) {
+		OCILogoff(conn->ctx, conn->error);
 	}
 
-	if (oracle_sock->queryHandle) {
-		OCIHandleFree((dvoid *)oracle_sock->queryHandle, (ub4) OCI_HTYPE_STMT);
-	}
-	if (oracle_sock->errHandle) {
-		OCIHandleFree((dvoid *)oracle_sock->errHandle, (ub4) OCI_HTYPE_ERROR);
-	}
-	if (oracle_sock->env) {
-		OCIHandleFree((dvoid *)oracle_sock->env, (ub4) OCI_HTYPE_ENV);
+	if (conn->query) {
+		OCIHandleFree((dvoid *)conn->query, OCI_HTYPE_STMT);
 	}
 
-	oracle_sock->conn = NULL;
-	free(oracle_sock);
-	sqlsocket->conn = NULL;
+	if (conn->error) {
+		OCIHandleFree((dvoid *)conn->error, OCI_HTYPE_ERROR);
+	}
+
+	if (conn->env) {
+		OCIHandleFree((dvoid *)conn->env, OCI_HTYPE_ENV);
+	}
 
 	return 0;
 }
 
-
 /*************************************************************************
  *
- *	Function: sql_init_socket
+ *	Function: sql_socket_init
  *
  *	Purpose: Establish connection to the db
  *
  *************************************************************************/
-static int sql_init_socket(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
-
-	rlm_sql_oracle_sock *oracle_sock;
-
-	if (!sqlsocket->conn) {
-		sqlsocket->conn = (rlm_sql_oracle_sock *)rad_malloc(sizeof(rlm_sql_oracle_sock));
-		if (!sqlsocket->conn) {
-			return -1;
-		}
-	}
-	memset(sqlsocket->conn,0,sizeof(rlm_sql_oracle_sock));
-
-	oracle_sock = sqlsocket->conn;
-
-	if (OCIEnvCreate(&oracle_sock->env, OCI_DEFAULT|OCI_THREADED, (dvoid *)0,
-		(dvoid * (*)(dvoid *, size_t)) 0,
-		(dvoid * (*)(dvoid *, dvoid *, size_t))0,
-		(void (*)(dvoid *, dvoid *)) 0,
-		0, (dvoid **)0 )) {
-		radlog(L_ERR,"rlm_sql_oracle: Couldn't init Oracle OCI environment (OCIEnvCreate())");
-		return -1;
-	}
-
-	if (OCIHandleAlloc((dvoid *) oracle_sock->env, (dvoid **) &oracle_sock->errHandle,
-		(ub4) OCI_HTYPE_ERROR, (size_t) 0, (dvoid **) 0))
-	{
-		radlog(L_ERR,"rlm_sql_oracle: Couldn't init Oracle ERROR handle (OCIHandleAlloc())");
-		return -1;
-	}
-
-	/* Allocate handles for select and update queries */
-	if (OCIHandleAlloc((dvoid *)oracle_sock->env, (dvoid **) &oracle_sock->queryHandle,
-				(ub4)OCI_HTYPE_STMT, (CONST size_t) 0, (dvoid **) 0))
-	{
-		radlog(L_ERR,"rlm_sql_oracle: Couldn't init Oracle query handles: %s",
-			sql_error(sqlsocket, config));
-		return -1;
-	}
-
-
-	if (OCILogon(oracle_sock->env, oracle_sock->errHandle, &oracle_sock->conn,
-			config->sql_login, strlen(config->sql_login),
-			config->sql_password,  strlen(config->sql_password),
-			config->sql_db, strlen(config->sql_db)))
-	{
-		radlog(L_ERR,"rlm_sql_oracle: Oracle logon failed: '%s'", sql_error(sqlsocket, config));
-		sql_close(sqlsocket,config);
-		return -1;
-	}
-
-	return 0;
-}
-
-
-/*************************************************************************
- *
- *	Function: sql_destroy_socket
- *
- *	Purpose: Free socket and private connection data
- *
- *************************************************************************/
-static int sql_destroy_socket(SQLSOCK *sqlsocket, SQL_CONFIG *config)
+static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
 {
-	free(sqlsocket->conn);
-	sqlsocket->conn = NULL;
+
+	rlm_sql_oracle_conn_t *conn;
+
+	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_oracle_conn_t));
+	talloc_set_destructor(conn, _sql_socket_destructor);
+
+	/*
+	 *	Initialises the oracle environment
+	 */
+	if (OCIEnvCreate(&conn->env, OCI_DEFAULT | OCI_THREADED, NULL, NULL, NULL, NULL, 0, NULL)) {
+		ERROR("rlm_sql_oracle: Couldn't init Oracle OCI environment (OCIEnvCreate())");
+
+		return -1;
+	}
+
+	/*
+	 *	Allocates an error handle
+	 */
+	if (OCIHandleAlloc((dvoid *)conn->env, (dvoid **)&conn->error, OCI_HTYPE_ERROR, 0, NULL)) {
+		ERROR("rlm_sql_oracle: Couldn't init Oracle ERROR handle (OCIHandleAlloc())");
+
+		return -1;
+	}
+
+	/*
+	 *	Allocate handles for select and update queries
+	 */
+	if (OCIHandleAlloc((dvoid *)conn->env, (dvoid **)&conn->query, OCI_HTYPE_STMT, 0, NULL)) {
+		ERROR("rlm_sql_oracle: Couldn't init Oracle query handles: %s", sql_error(handle, config));
+
+		return -1;
+	}
+
+	/*
+	 *	Login to the oracle server
+	 */
+	if (OCILogon(conn->env, conn->error, &conn->ctx,
+		     (OraText const *)config->sql_login, strlen(config->sql_login),
+                     (OraText const *)config->sql_password, strlen(config->sql_password),
+                     (OraText const *)config->sql_db, strlen(config->sql_db))) {
+		ERROR("rlm_sql_oracle: Oracle logon failed: '%s'", sql_error(handle, config));
+
+		return -1;
+	}
+
 	return 0;
 }
 
@@ -206,25 +187,22 @@ static int sql_destroy_socket(SQLSOCK *sqlsocket, SQL_CONFIG *config)
  *	Function: sql_num_fields
  *
  *	Purpose: database specific num_fields function. Returns number
- *               of columns from query
+ *	       of columns from query
  *
  *************************************************************************/
-static int sql_num_fields(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
-
-	ub4		count;
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
+static int sql_num_fields(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+{
+	int count;
+	rlm_sql_oracle_conn_t *conn = handle->conn;
 
 	/* get the number of columns in the select list */
-	if (OCIAttrGet ((dvoid *)oracle_sock->queryHandle,
-			(ub4)OCI_HTYPE_STMT,
-			(dvoid *) &count,
-			(ub4 *) 0,
-			(ub4)OCI_ATTR_PARAM_COUNT,
-			oracle_sock->errHandle)) {
-		radlog(L_ERR,"rlm_sql_oracle: Error retrieving column count in sql_num_fields: %s",
-			sql_error(sqlsocket, config));
+	if (OCIAttrGet((dvoid *)conn->query, OCI_HTYPE_STMT, (dvoid *)&count, NULL, OCI_ATTR_PARAM_COUNT,
+		       conn->error)) {
+		ERROR("rlm_sql_oracle: Error retrieving column count : %s", sql_error(handle, config));
+
 		return -1;
 	}
+
 	return count;
 }
 
@@ -233,47 +211,44 @@ static int sql_num_fields(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
  *	Function: sql_query
  *
  *	Purpose: Issue a non-SELECT query (ie: update/delete/insert) to
- *               the database.
+ *	       the database.
  *
  *************************************************************************/
-static int sql_query(SQLSOCK *sqlsocket, SQL_CONFIG *config, char *querystr) {
+static sql_rcode_t sql_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config, char const *query)
+{
+	int status;
+	rlm_sql_oracle_conn_t *conn = handle->conn;
 
-	int	x;
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
+	OraText *oracle_query;
 
-	if (oracle_sock->conn == NULL) {
-		radlog(L_ERR, "rlm_sql_oracle: Socket not connected");
-		return SQL_DOWN;
+	memcpy(&oracle_query, &query, sizeof(oracle_query));
+
+	if (!conn->ctx) {
+		ERROR("rlm_sql_oracle: Socket not connected");
+
+		return RLM_SQL_RECONNECT;
 	}
 
-	if (OCIStmtPrepare (oracle_sock->queryHandle, oracle_sock->errHandle,
-				querystr, strlen(querystr),
-				OCI_NTV_SYNTAX, OCI_DEFAULT))  {
-		radlog(L_ERR,"rlm_sql_oracle: prepare failed in sql_query: %s",sql_error(sqlsocket, config));
+	if (OCIStmtPrepare(conn->query, conn->error, oracle_query, strlen(query),
+			   OCI_NTV_SYNTAX, OCI_DEFAULT)) {
+		ERROR("rlm_sql_oracle: prepare failed in sql_query: %s", sql_error(handle, config));
+
 		return -1;
 	}
 
-	x = OCIStmtExecute(oracle_sock->conn,
-				oracle_sock->queryHandle,
-				oracle_sock->errHandle,
-				(ub4) 1,
-				(ub4) 0,
-				(OCISnapshot *) NULL,
-				(OCISnapshot *) NULL,
-				(ub4) OCI_COMMIT_ON_SUCCESS);
+	status = OCIStmtExecute(conn->ctx, conn->query, conn->error, 1, 0,
+				NULL, NULL, OCI_COMMIT_ON_SUCCESS);
 
-	if (x == OCI_SUCCESS) {
+	if (status == OCI_SUCCESS) {
 		return 0;
 	}
 
-	if (x == OCI_ERROR) {
-		radlog(L_ERR,"rlm_sql_oracle: execute query failed in sql_query: %s",
-				sql_error(sqlsocket, config));
-		return sql_check_error(sqlsocket, config);
+	if (status == OCI_ERROR) {
+		ERROR("rlm_sql_oracle: execute query failed in sql_query: %s", sql_error(handle, config));
+		return sql_check_error(handle, config);
 	}
-	else {
-		return -1;
-	}
+
+	return -1;
 }
 
 
@@ -284,98 +259,86 @@ static int sql_query(SQLSOCK *sqlsocket, SQL_CONFIG *config, char *querystr) {
  *	Purpose: Issue a select query to the database
  *
  *************************************************************************/
-static int sql_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config, char *querystr) {
+static sql_rcode_t sql_select_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config, char const *query)
+{
 
-	int		x;
-	int		y;
-	int		colcount;
+	int		status;
+	char		**row;
+
+	int		i;
 	OCIParam	*param;
 	OCIDefine	*define;
+
 	ub2		dtype;
 	ub2		dsize;
-	char		**rowdata=NULL;
-	sb2		*indicators;
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
 
-	if (oracle_sock->conn == NULL) {
-		radlog(L_ERR, "rlm_sql_oracle: Socket not connected");
-		return SQL_DOWN;
-	}
+	sb2		*ind;
 
-	if (OCIStmtPrepare (oracle_sock->queryHandle, oracle_sock->errHandle,
-				querystr, strlen(querystr),
-				OCI_NTV_SYNTAX, OCI_DEFAULT))  {
-		radlog(L_ERR,"rlm_sql_oracle: prepare failed in sql_select_query: %s",sql_error(sqlsocket, config));
+	OraText 	*oracle_query;
+
+	rlm_sql_oracle_conn_t *conn = handle->conn;
+
+	memcpy(&oracle_query, &query, sizeof(oracle_query));
+
+	if (OCIStmtPrepare(conn->query, conn->error, oracle_query, strlen(query), OCI_NTV_SYNTAX,
+			   OCI_DEFAULT)) {
+		ERROR("rlm_sql_oracle: prepare failed in sql_select_query: %s", sql_error(handle, config));
+
 		return -1;
 	}
 
-	/* Query only one row by default (for now) */
-	x = OCIStmtExecute(oracle_sock->conn,
-				oracle_sock->queryHandle,
-				oracle_sock->errHandle,
-				(ub4) 0,
-				(ub4) 0,
-				(OCISnapshot *) NULL,
-				(OCISnapshot *) NULL,
-				(ub4) OCI_DEFAULT);
-
-	if (x == OCI_NO_DATA) {
-		/* Nothing to fetch */
+	/*
+	 *	Retrieve a single row
+	 */
+	status = OCIStmtExecute(conn->ctx, conn->query, conn->error, 0, 0, NULL, NULL, OCI_DEFAULT);
+	if (status == OCI_NO_DATA) {
 		return 0;
 	}
 
-	if (x != OCI_SUCCESS) {
-		radlog(L_ERR,"rlm_sql_oracle: query failed in sql_select_query: %s",
-				sql_error(sqlsocket, config));
-		return sql_check_error(sqlsocket, config);
+	if (status != OCI_SUCCESS) {
+		ERROR("rlm_sql_oracle: query failed in sql_select_query: %s", sql_error(handle, config));
+
+		return sql_check_error(handle, config);
 	}
 
 	/*
-	 * Define where the output from fetch calls will go
-	 *
-	 * This is a gross hack, but it works - we convert
-	 * all data to strings for ease of use.  Fortunately, most
-	 * of the data we deal with is already in string format.
+	 *	We only need to do this once per result set, because
+	 *	the number of columns won't change.
 	 */
-	colcount = sql_num_fields(sqlsocket, config);
+	if (conn->col_count == 0) {
+		conn->col_count = sql_num_fields(handle, config);
 
-	/* DEBUG2("sql_select_query(): colcount=%d",colcount); */
-
-	/*
-	 *	FIXME: These malloc's can probably go, as the schema
-	 *	is fixed...
-	 */
-	rowdata=(char **)rad_malloc(sizeof(char *) * (colcount+1) );
-	memset(rowdata, 0, (sizeof(char *) * (colcount+1) ));
-	indicators = (sb2 *) rad_malloc(sizeof(sb2) * (colcount+1) );
-	memset(indicators, 0, sizeof(sb2) * (colcount+1));
-
-	for (y=1; y <= colcount; y++) {
-		x=OCIParamGet(oracle_sock->queryHandle, OCI_HTYPE_STMT,
-				oracle_sock->errHandle,
-				(dvoid **)&param,
-				(ub4) y);
-		if (x != OCI_SUCCESS) {
-			radlog(L_ERR,"rlm_sql_oracle: OCIParamGet() failed in sql_select_query: %s",
-				sql_error(sqlsocket, config));
+		if (conn->col_count == 0) {
 			return -1;
 		}
+	}
 
-		x=OCIAttrGet((dvoid*)param, OCI_DTYPE_PARAM,
-			   (dvoid*)&dtype, (ub4*)0, OCI_ATTR_DATA_TYPE,
-			   oracle_sock->errHandle);
-		if (x != OCI_SUCCESS) {
-			radlog(L_ERR,"rlm_sql_oracle: OCIAttrGet() failed in sql_select_query: %s",
-				sql_error(sqlsocket, config));
-			return -1;
+	MEM(row = talloc_zero_array(conn, char*, conn->col_count + 1));
+	MEM(ind = talloc_zero_array(row, sb2, conn->col_count + 1));
+
+	for (i = 0; i < conn->col_count; i++) {
+		status = OCIParamGet(conn->query, OCI_HTYPE_STMT, conn->error, (dvoid **)&param, i + 1);
+		if (status != OCI_SUCCESS) {
+			ERROR("rlm_sql_oracle: OCIParamGet() failed in sql_select_query: %s",
+			       sql_error(handle, config));
+
+			goto error;
 		}
 
-		dsize=MAX_DATASTR_LEN;
+		status = OCIAttrGet((dvoid*)param, OCI_DTYPE_PARAM, (dvoid*)&dtype, NULL, OCI_ATTR_DATA_TYPE,
+				    conn->error);
+		if (status != OCI_SUCCESS) {
+			ERROR("rlm_sql_oracle: OCIAttrGet() failed in sql_select_query: %s",
+			       sql_error(handle, config));
+
+			goto error;
+		}
+
+		dsize = MAX_DATASTR_LEN;
 
 		/*
-		 * Use the retrieved length of dname to allocate an output
-		 * buffer, and then define the output variable (but only
-		 * for char/string type columns).
+		 *	Use the retrieved length of dname to allocate an output buffer, and then define the output
+		 *	variable (but only for char/string type columns).
 		 */
 		switch(dtype) {
 #ifdef SQLT_AFC
@@ -387,16 +350,17 @@ static int sql_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config, char *querys
 		case SQLT_VCS:	/* var char */
 		case SQLT_CHR:	/* char */
 		case SQLT_STR:	/* string */
-			x=OCIAttrGet((dvoid*)param, (ub4) OCI_DTYPE_PARAM,
-				   (dvoid*) &dsize, (ub4 *)0, (ub4) OCI_ATTR_DATA_SIZE,
-				   oracle_sock->errHandle);
-			if (x != OCI_SUCCESS) {
-				radlog(L_ERR,"rlm_sql_oracle: OCIAttrGet() failed in sql_select_query: %s",
-					sql_error(sqlsocket, config));
-				return -1;
+			status = OCIAttrGet((dvoid *)param, OCI_DTYPE_PARAM, (dvoid *)&dsize, NULL,
+					    OCI_ATTR_DATA_SIZE, conn->error);
+			if (status != OCI_SUCCESS) {
+				ERROR("rlm_sql_oracle: OCIAttrGet() failed in sql_select_query: %s",
+				       sql_error(handle, config));
+
+				goto error;
 			}
-			rowdata[y-1]=rad_malloc(dsize+1);
-			memset(rowdata[y-1], 0, dsize+1);
+
+			MEM(row[i] = talloc_zero_array(row, char, dsize + 1));
+
 			break;
 		case SQLT_DAT:
 		case SQLT_INT:
@@ -405,42 +369,40 @@ static int sql_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config, char *querys
 		case SQLT_PDN:
 		case SQLT_BIN:
 		case SQLT_NUM:
-			rowdata[y-1]=rad_malloc(dsize+1);
-			memset(rowdata[y-1], 0, dsize+1);
+			MEM(row[i] = talloc_zero_array(row, char, dsize + 1));
+
 			break;
 		default:
-			dsize=0;
-			rowdata[y-1]=NULL;
+			dsize = 0;
+			row[i] = NULL;
 			break;
 		}
 
-		indicators[y-1] = 0;
-		x=OCIDefineByPos(oracle_sock->queryHandle,
-				&define,
-				oracle_sock->errHandle,
-				y,
-				(ub1 *) rowdata[y-1],
-				dsize+1,
-				SQLT_STR,
-				&indicators[y-1],
-				(dvoid *) 0,
-				(dvoid *) 0,
-				OCI_DEFAULT);
+		ind[i] = 0;
 
 		/*
-		 *	FIXME: memory leaks of indicators & rowdata?
+		 *	Grab the actual row value and write it to the buffer we allocated.
 		 */
-		if (x != OCI_SUCCESS) {
-			radlog(L_ERR,"rlm_sql_oracle: OCIDefineByPos() failed in sql_select_query: %s",
-				sql_error(sqlsocket, config));
-			return -1;
+		status = OCIDefineByPos(conn->query, &define, conn->error, i + 1, (ub1 *)row[i], dsize + 1, SQLT_STR,
+					(dvoid *)&ind[i], NULL, NULL, OCI_DEFAULT);
+
+		if (status != OCI_SUCCESS) {
+			ERROR("rlm_sql_oracle: OCIDefineByPos() failed in sql_select_query: %s",
+			       sql_error(handle, config));
+
+			goto error;
 		}
 	}
 
-	oracle_sock->results=rowdata;
-	oracle_sock->indicators=indicators;
+	conn->row = row;
+	conn->ind = ind;
 
 	return 0;
+
+ error:
+	talloc_free(row);
+
+	return -1;
 }
 
 
@@ -449,10 +411,11 @@ static int sql_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config, char *querys
  *	Function: sql_store_result
  *
  *	Purpose: database specific store_result function. Returns a result
- *               set for the query.
+ *	       set for the query.
  *
  *************************************************************************/
-static int sql_store_result(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
+static sql_rcode_t sql_store_result(UNUSED rlm_sql_handle_t *handle,UNUSED rlm_sql_config_t *config)
+{
 	/* Not needed for Oracle */
 	return 0;
 }
@@ -463,20 +426,16 @@ static int sql_store_result(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
  *	Function: sql_num_rows
  *
  *	Purpose: database specific num_rows. Returns number of rows in
- *               query
+ *	       query
  *
  *************************************************************************/
-static int sql_num_rows(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
+static int sql_num_rows(UNUSED rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+{
+	rlm_sql_oracle_conn_t *conn = handle->conn;
+	ub4 rows = 0;
+	ub4 size = sizeof(ub4);
 
-	ub4	rows=0;
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
-
-	OCIAttrGet((CONST dvoid *)oracle_sock->queryHandle,
-			OCI_HTYPE_STMT,
-			(dvoid *)&rows,
-			(ub4 *) sizeof(ub4),
-			OCI_ATTR_ROW_COUNT,
-			oracle_sock->errHandle);
+	OCIAttrGet((CONST dvoid *)conn->query, OCI_HTYPE_STMT, (dvoid *)&rows, &size, OCI_ATTR_ROW_COUNT, conn->error);
 
 	return rows;
 }
@@ -486,42 +445,38 @@ static int sql_num_rows(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
  *
  *	Function: sql_fetch_row
  *
- *	Purpose: database specific fetch_row. Returns a SQL_ROW struct
- *               with all the data for the query in 'sqlsocket->row'. Returns
- *		 0 on success, -1 on failure, SQL_DOWN if database is down.
+ *	Purpose: database specific fetch_row. Returns a rlm_sql_row_t struct
+ *	       with all the data for the query in 'handle->row'. Returns
+ *		 0 on success, -1 on failure, RLM_SQL_RECONNECT if database is down.
  *
  *************************************************************************/
-static int sql_fetch_row(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
+static sql_rcode_t sql_fetch_row(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
+{
 
-	int	x;
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
+	int status;
+	rlm_sql_oracle_conn_t *conn = handle->conn;
 
-	if (oracle_sock->conn == NULL) {
-		radlog(L_ERR, "rlm_sql_oracle: Socket not connected");
-		return SQL_DOWN;
+	if (!conn->ctx) {
+		ERROR("rlm_sql_oracle: Socket not connected");
+
+		return RLM_SQL_RECONNECT;
 	}
 
-	sqlsocket->row = NULL;
+	handle->row = NULL;
 
-	x=OCIStmtFetch(oracle_sock->queryHandle,
-			oracle_sock->errHandle,
-			1,
-			OCI_FETCH_NEXT,
-			OCI_DEFAULT);
+	status = OCIStmtFetch(conn->query, conn->error, 1, OCI_FETCH_NEXT, OCI_DEFAULT);
+	if (status == OCI_SUCCESS) {
+		handle->row = conn->row;
 
-	if (x == OCI_SUCCESS) {
-		sqlsocket->row = oracle_sock->results;
 		return 0;
 	}
 
-	if (x == OCI_ERROR) {
-		radlog(L_ERR,"rlm_sql_oracle: fetch failed in sql_fetch_row: %s",
-				sql_error(sqlsocket, config));
-		return sql_check_error(sqlsocket, config);
+	if (status == OCI_ERROR) {
+		ERROR("rlm_sql_oracle: fetch failed in sql_fetch_row: %s", sql_error(handle, config));
+		return sql_check_error(handle, config);
 	}
-	else {
-		return -1;
-	}
+
+	return -1;
 }
 
 
@@ -531,32 +486,20 @@ static int sql_fetch_row(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
  *	Function: sql_free_result
  *
  *	Purpose: database specific free_result. Frees memory allocated
- *               for a result set
+ *	       for a result set
  *
  *************************************************************************/
-static int sql_free_result(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
-
-	int x;
-	int num_fields;
-
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
+static sql_rcode_t sql_free_result(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+{
+	rlm_sql_oracle_conn_t *conn = handle->conn;
 
 	/* Cancel the cursor first */
-	x=OCIStmtFetch(oracle_sock->queryHandle,
-			oracle_sock->errHandle,
-			0,
-			OCI_FETCH_NEXT,
-			OCI_DEFAULT);
+	(void) OCIStmtFetch(conn->query, conn->error, 0, OCI_FETCH_NEXT, OCI_DEFAULT);
 
-	num_fields = sql_num_fields(sqlsocket, config);
-	if (num_fields >= 0) {
-		for(x=0; x < num_fields; x++) {
-			free(oracle_sock->results[x]);
-		}
-		free(oracle_sock->results);
-		free(oracle_sock->indicators);
-	}
-	oracle_sock->results=NULL;
+	TALLOC_FREE(conn->row);
+	conn->ind = NULL;	/* ind is a child of row */
+	conn->col_count = 0;
+
 	return 0;
 }
 
@@ -569,7 +512,7 @@ static int sql_free_result(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
  *	Purpose: End the query, such as freeing memory
  *
  *************************************************************************/
-static int sql_finish_query(SQLSOCK *sqlsocket, SQL_CONFIG *config)
+static sql_rcode_t sql_finish_query(UNUSED rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
 {
 	return 0;
 }
@@ -583,17 +526,13 @@ static int sql_finish_query(SQLSOCK *sqlsocket, SQL_CONFIG *config)
  *	Purpose: End the select query, such as freeing memory or result
  *
  *************************************************************************/
-static int sql_finish_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
+static sql_rcode_t sql_finish_select_query(rlm_sql_handle_t *handle, UNUSED rlm_sql_config_t *config)
+{
+	rlm_sql_oracle_conn_t *conn = handle->conn;
 
-	int 	x=0;
-	rlm_sql_oracle_sock *oracle_sock = sqlsocket->conn;
-
-	if (oracle_sock->results) {
-		while(oracle_sock->results[x]) free(oracle_sock->results[x++]);
-		free(oracle_sock->results);
-		free(oracle_sock->indicators);
-		oracle_sock->results=NULL;
-	}
+	TALLOC_FREE(conn->row);
+	conn->ind = NULL;	/* ind is a child of row */
+	conn->col_count = 0;
 
 	return 0;
 }
@@ -604,20 +543,19 @@ static int sql_finish_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
  *	Function: sql_affected_rows
  *
  *	Purpose: Return the number of rows affected by the query (update,
- *               or insert)
+ *	       or insert)
  *
  *************************************************************************/
-static int sql_affected_rows(SQLSOCK *sqlsocket, SQL_CONFIG *config) {
-
-	return sql_num_rows(sqlsocket, config);
+static int sql_affected_rows(rlm_sql_handle_t *handle, rlm_sql_config_t *config) {
+	return sql_num_rows(handle, config);
 }
 
 
 /* Exported to rlm_sql */
 rlm_sql_module_t rlm_sql_oracle = {
 	"rlm_sql_oracle",
-	sql_init_socket,
-	sql_destroy_socket,
+	NULL,
+	sql_socket_init,
 	sql_query,
 	sql_select_query,
 	sql_store_result,
@@ -626,7 +564,6 @@ rlm_sql_module_t rlm_sql_oracle = {
 	sql_fetch_row,
 	sql_free_result,
 	sql_error,
-	sql_close,
 	sql_finish_query,
 	sql_finish_select_query,
 	sql_affected_rows

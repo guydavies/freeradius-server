@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_dynamic_clients.c
@@ -21,7 +21,6 @@
  * @copyright 2008  The FreeRADIUS server project
  * @copyright 2008  Alan DeKok <aland@deployingradius.com>
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -31,11 +30,11 @@ RCSID("$Id$")
 /*
  *	Find the client definition.
  */
-static rlm_rcode_t dynamic_client_authorize(UNUSED void *instance,
-					    REQUEST *request)
+static rlm_rcode_t mod_authorize(UNUSED void *instance,
+				 REQUEST *request)
 {
 	size_t length;
-	const char *value;
+	char const *value;
 	CONF_PAIR *cp;
 	RADCLIENT *c;
 	char buffer[2048];
@@ -63,7 +62,7 @@ static rlm_rcode_t dynamic_client_authorize(UNUSED void *instance,
 
 	value = cf_pair_value(cp);
 	if (!value) {
-		RDEBUG("No value given for the directory entry in the client.");
+		RDEBUG("No value given for the directory entry in the client");
 		return RLM_MODULE_NOOP;
 	}
 
@@ -80,7 +79,7 @@ static rlm_rcode_t dynamic_client_authorize(UNUSED void *instance,
 	/*
 	 *	Read the buffer and generate the client.
 	 */
-	c = client_read(buffer, (request->client->server != NULL), TRUE);
+	c = client_read(buffer, (request->client->server != NULL), true);
 	if (!c) return RLM_MODULE_FAIL;
 
 	/*
@@ -92,9 +91,9 @@ static rlm_rcode_t dynamic_client_authorize(UNUSED void *instance,
 	return RLM_MODULE_OK;
 }
 #else
-static rlm_rcode_t dynamic_client_authorize(UNUSED void *instance, REQUEST *request)
+static rlm_rcode_t mod_authorize(UNUSED void *instance, REQUEST *request)
 {
-	RDEBUG("Dynamic clients are unsupported in this build.");
+	RDEBUG("Dynamic clients are unsupported in this build");
 	return RLM_MODULE_FAIL;
 }
 #endif
@@ -112,11 +111,13 @@ module_t rlm_dynamic_clients = {
 	RLM_MODULE_INIT,
 	"dynamic_clients",
 	RLM_TYPE_THREAD_SAFE,		/* type */
+	0,
+	NULL,				/* CONF_PARSER */
 	NULL,				/* instantiation */
 	NULL,				/* detach */
 	{
 		NULL,			/* authentication */
-		dynamic_client_authorize,	/* authorization */
+		mod_authorize,	/* authorization */
 		NULL,			/* preaccounting */
 		NULL,			/* accounting */
 		NULL,			/* checksimul */

@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_cram.c
@@ -32,13 +32,12 @@
  * @copyright 2001,2006  The FreeRADIUS server project
  * @copyright 2002 SANDY (http://www.sandy.ru/) under GPLr
  */
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include	<freeradius-devel/radiusd.h>
 #include	<freeradius-devel/modules.h>
 
-#include        <freeradius-devel/md5.h>
+#include	<freeradius-devel/md5.h>
 
 #include 	<ctype.h>
 
@@ -47,23 +46,19 @@ RCSID("$Id$")
 #define		SM_CHALLENGE	102
 #define		SM_RESPONSE     103
 
-
-
-
-static void calc_apop_digest(uint8_t *buffer, const uint8_t *challenge,
-			     size_t challen, const char *password)
+static void calc_apop_digest(uint8_t *buffer, uint8_t const *challenge,
+			     size_t challen, char const *password)
 {
 	FR_MD5_CTX context;
 
 	fr_MD5Init(&context);
 	fr_MD5Update(&context, challenge, challen);
-	fr_MD5Update(&context, (const uint8_t *) password, strlen(password));
-        fr_MD5Final(buffer, &context);
+	fr_MD5Update(&context, (uint8_t const *) password, strlen(password));
+	fr_MD5Final(buffer, &context);
 }
 
 
-static void calc_md5_digest(uint8_t *buffer, const uint8_t *challenge,
-			    size_t challen, const char *password)
+static void calc_md5_digest(uint8_t *buffer, uint8_t const *challenge, size_t challen, char const *password)
 {
 	uint8_t buf[1024];
 	int i;
@@ -77,14 +72,13 @@ static void calc_md5_digest(uint8_t *buffer, const uint8_t *challenge,
 	fr_MD5Update(&context, buf, 64+challen);
 	memset(buf, 0x5c, 64);
 	for(i=0; i<64 && password[i]; i++) buf[i]^=password[i];
-        fr_MD5Final(buf+64,&context);
+	fr_MD5Final(buf+64,&context);
 	fr_MD5Init(&context);
 	fr_MD5Update(&context,buf,64+16);
-        fr_MD5Final(buffer,&context);
+	fr_MD5Final(buffer,&context);
 }
 
-static void calc_md4_digest(uint8_t *buffer, const uint8_t *challenge,
-			    size_t challen, const char *password)
+static void calc_md4_digest(uint8_t *buffer, uint8_t const *challenge, size_t challen, char const *password)
 {
 	uint8_t buf[1024];
 	int i;
@@ -98,14 +92,14 @@ static void calc_md4_digest(uint8_t *buffer, const uint8_t *challenge,
 	fr_MD4Update(&context,buf,64+challen);
 	memset(buf, 0x5c, 64);
 	for(i=0; i<64 && password[i]; i++) buf[i]^=password[i];
-        fr_MD4Final(buf+64,&context);
+	fr_MD4Final(buf+64,&context);
 	fr_MD4Init(&context);
 	fr_MD4Update(&context,buf,64+16);
-        fr_MD4Final(buffer,&context);
+	fr_MD4Final(buffer,&context);
 }
 
-static void calc_sha1_digest(uint8_t *buffer, const uint8_t *challenge,
-			     size_t challen, const char *password)
+static void calc_sha1_digest(uint8_t *buffer, uint8_t const *challenge,
+			     size_t challen, char const *password)
 {
 	uint8_t buf[1024];
 	int i;
@@ -119,42 +113,42 @@ static void calc_sha1_digest(uint8_t *buffer, const uint8_t *challenge,
 	fr_SHA1Update(&context,buf,64+challen);
 	memset(buf, 0x5c, 64);
 	for(i=0; i<64 && password[i]; i++) buf[i]^=password[i];
-        fr_SHA1Final(buf+64,&context);
+	fr_SHA1Final(buf+64,&context);
 	fr_SHA1Init(&context);
 	fr_SHA1Update(&context,buf,64+20);
-        fr_SHA1Final(buffer,&context);
+	fr_SHA1Final(buffer,&context);
 }
 
 
-static rlm_rcode_t cram_authenticate(UNUSED void * instance, REQUEST *request)
+static rlm_rcode_t mod_authenticate(UNUSED void * instance, REQUEST *request)
 {
 	VALUE_PAIR *authtype, *challenge, *response, *password;
 	uint8_t buffer[64];
 
 	password = pairfind(request->config_items, PW_CLEARTEXT_PASSWORD, 0, TAG_ANY);
 	if(!password) {
-		radlog(L_AUTH, "rlm_cram: Cleartext-Password is required for authentication.");
+		AUTH("rlm_cram: Cleartext-Password is required for authentication");
 		return RLM_MODULE_INVALID;
 	}
 	authtype = pairfind(request->packet->vps, SM_AUTHTYPE, VENDORPEC_SM, TAG_ANY);
 	if(!authtype) {
-		radlog(L_AUTH, "rlm_cram: Required attribute Sandy-Mail-Authtype missed");
+		AUTH("rlm_cram: Required attribute Sandy-Mail-Authtype missed");
 		return RLM_MODULE_INVALID;
 	}
 	challenge = pairfind(request->packet->vps, SM_CHALLENGE, VENDORPEC_SM, TAG_ANY);
 	if(!challenge) {
-		radlog(L_AUTH, "rlm_cram: Required attribute Sandy-Mail-Challenge missed");
+		AUTH("rlm_cram: Required attribute Sandy-Mail-Challenge missed");
 		return RLM_MODULE_INVALID;
 	}
 	response = pairfind(request->packet->vps, SM_RESPONSE, VENDORPEC_SM, TAG_ANY);
 	if(!response) {
-		radlog(L_AUTH, "rlm_cram: Required attribute Sandy-Mail-Response missed");
+		AUTH("rlm_cram: Required attribute Sandy-Mail-Response missed");
 		return RLM_MODULE_INVALID;
 	}
 	switch(authtype->vp_integer){
 		case 2:				/*	CRAM-MD5	*/
 			if(challenge->length < 5 || response->length != 16) {
-				radlog(L_AUTH, "rlm_cram: invalid MD5 challenge/response length");
+				AUTH("rlm_cram: invalid MD5 challenge/response length");
 				return RLM_MODULE_INVALID;
 			}
 			calc_md5_digest(buffer, challenge->vp_octets, challenge->length, password->vp_strvalue);
@@ -162,7 +156,7 @@ static rlm_rcode_t cram_authenticate(UNUSED void * instance, REQUEST *request)
 			break;
 		case 3:				/*	APOP	*/
 			if(challenge->length < 5 || response->length != 16) {
-				radlog(L_AUTH, "rlm_cram: invalid APOP challenge/response length");
+				AUTH("rlm_cram: invalid APOP challenge/response length");
 				return RLM_MODULE_INVALID;
 			}
 			calc_apop_digest(buffer, challenge->vp_octets, challenge->length, password->vp_strvalue);
@@ -170,7 +164,7 @@ static rlm_rcode_t cram_authenticate(UNUSED void * instance, REQUEST *request)
 			break;
 		case 8:				/*	CRAM-MD4	*/
 			if(challenge->length < 5 || response->length != 16) {
-				radlog(L_AUTH, "rlm_cram: invalid MD4 challenge/response length");
+				AUTH("rlm_cram: invalid MD4 challenge/response length");
 				return RLM_MODULE_INVALID;
 			}
 			calc_md4_digest(buffer, challenge->vp_octets, challenge->length, password->vp_strvalue);
@@ -178,14 +172,14 @@ static rlm_rcode_t cram_authenticate(UNUSED void * instance, REQUEST *request)
 			break;
 		case 9:				/*	CRAM-SHA1	*/
 			if(challenge->length < 5 || response->length != 20) {
-				radlog(L_AUTH, "rlm_cram: invalid MD4 challenge/response length");
+				AUTH("rlm_cram: invalid MD4 challenge/response length");
 				return RLM_MODULE_INVALID;
 			}
 			calc_sha1_digest(buffer, challenge->vp_octets, challenge->length, password->vp_strvalue);
 			if(!memcmp(buffer, response->vp_octets, 20)) return RLM_MODULE_OK;
 			break;
 		default:
-			radlog(L_AUTH, "rlm_cram: unsupported Sandy-Mail-Authtype");
+			AUTH("rlm_cram: unsupported Sandy-Mail-Authtype");
 			return RLM_MODULE_INVALID;
 	}
 	return RLM_MODULE_NOTFOUND;
@@ -196,10 +190,12 @@ module_t rlm_cram = {
 	RLM_MODULE_INIT,
 	"CRAM",
 	RLM_TYPE_THREAD_SAFE,		/* type */
+	0,
+	NULL,				/* CONF_PARSER */
 	NULL,				/* instantiation */
 	NULL,				/* detach */
 	{
-		cram_authenticate,	/* authenticate */
+		mod_authenticate,	/* authenticate */
 		NULL,			/* authorize */
 		NULL,			/* pre-accounting */
 		NULL,			/* accounting */

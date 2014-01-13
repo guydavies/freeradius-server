@@ -53,7 +53,6 @@
  SUCH DAMAGE.
 */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/libradius.h>
@@ -95,7 +94,7 @@ typedef struct ippool_key {
 
 void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 	   char *NASname, char *NASport, int old);
-	   
+
 void viewdb(char *sessiondbname, char *indexdbname, char *ipaddress, int old);
 
 void tonewformat(char *sessiondbname, char *newsessiondbname);
@@ -109,10 +108,10 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 	GDBM_FILE indexdb;
 	datum key_datum, data_datum, save_datum;
 	datum nextkey;
-	
+
 	ippool_key key;
 	old_ippool_key old_key;
-	
+
 	ippool_info entry;
 	struct in_addr ipaddr;
 	uint8_t key_str[17];
@@ -123,7 +122,6 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 	signed int rcode;
 	int delete = 0;
 	int port;
-	int extra = 0;
 	int found = 0;
 
 	sessiondb = gdbm_open(sessiondbname, 512, mode, 0,NULL);
@@ -134,12 +132,12 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 		return;
 	}
 
-	if (sessiondb == NULL) {
+	if (!sessiondb) {
 		printf("rlm_ippool_tool: Unable to open DB '%s'\n", sessiondbname);
 		return;
 	}
 
-	if (indexdb == NULL) {
+	if (!indexdb) {
 		printf("rlm_ippool_tool: Unable to open DB '%s'\n", indexdbname);
 		return;
 	}
@@ -158,13 +156,13 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 		FR_MD5_CTX md5_context;
 
 		snprintf(md5_input_str, MAX_STRING_LEN, "%s %s", NASname, NASport);
-		
+
 		fr_MD5Init(&md5_context);
 		fr_MD5Update(&md5_context, (uint8_t *) md5_input_str, strlen(md5_input_str));
 		fr_MD5Final(key_str, &md5_context);
-		
+
 		memcpy(key.key, key_str, 16);
-		fr_bin2hex(key_str, hex_str, 16);
+		fr_bin2hex(hex_str, key_str, 16);
 		hex_str[32] = '\0';
 		key_datum.dptr = (char *) &key;
 		key_datum.dsize = sizeof(ippool_key);
@@ -175,8 +173,7 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 	if (data_datum.dptr != NULL){
 		found = 1;
 		memcpy(&entry, data_datum.dptr, sizeof(ippool_info));
-		free(data_datum.dptr);
-		
+
 		if (entry.active){
 			if (old) {
 				printf("rlm_ippool_tool: Deleting stale entry for ip/port %s/%u",
@@ -184,7 +181,7 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 			} else {
 				printf("rlm_ippool_tool: Deleting stale entry for key: '%s'", hex_str);
 			}
-			
+
 			entry.active = 0;
 			save_datum.dptr = key_datum.dptr;
 			save_datum.dsize = key_datum.dsize;
@@ -202,23 +199,22 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 			key_datum.dptr = (char *) &entry.ipaddr;
 			key_datum.dsize = sizeof(uint32_t);
 			data_datum = gdbm_fetch(indexdb, key_datum);
-			
+
 			if (data_datum.dptr != NULL) {
 				memcpy(&num, data_datum.dptr, sizeof(int));
-				free(data_datum.dptr);
-				
+
 				if (num > 0) {
 					num--;
 					data_datum.dptr = (char *) &num;
 					data_datum.dsize = sizeof(int);
 					rcode = gdbm_store(indexdb, key_datum, data_datum, GDBM_REPLACE);
-					
+
 					if (rcode < 0) {
 						printf("rlm_ippool_tool: Failed storing data to %s: %s\n",
 							indexdbname, gdbm_strerror(gdbm_errno));
 						goto close;
 					}
-					
+
 					if (num > 0 && entry.extra == 1) {
 						gdbm_delete(sessiondb, save_datum);
 					}
@@ -228,9 +224,9 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 	}
 	key_datum.dptr = NULL;
 
-	if (key_datum.dptr == NULL) {
+	if (!key_datum.dptr) {
 		key_datum = gdbm_firstkey(sessiondb);
-		
+
 		while (key_datum.dptr) {
 			data_datum = gdbm_fetch(sessiondb, key_datum);
 			if (data_datum.dptr != NULL) {
@@ -266,7 +262,7 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 			datum key_datum_tmp, data_datum_tmp;
 			old_ippool_key old_key_tmp;
 			ippool_key key_tmp;
-			
+
 			if (old){
 				strlcpy(old_key_tmp.nas, NASname,
 					sizeof(old_key_tmp.nas));
@@ -278,7 +274,7 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 				key_datum_tmp.dptr = (char *) &key_tmp;
 				key_datum_tmp.dsize = sizeof(ippool_key);
 			}
-			
+
 			data_datum_tmp = gdbm_fetch(sessiondb, key_datum_tmp);
 			if (data_datum_tmp.dptr != NULL) {
 				rcode = gdbm_store(sessiondb, key_datum, data_datum_tmp, GDBM_REPLACE);
@@ -292,22 +288,12 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 		} else {
 			if (delete) {
 				gdbm_delete(sessiondb, key_datum);
-			} else {
-				if (mppp)
-					extra = 1;
-#if 0
-				if (!mppp)
-					printf("Error in if statements!!!\n");
-#endif
 			}
 		}
-		
+
 		free(key_datum.dptr);
 		entry.active = 1;
-		if (extra) {
-			entry.extra = 1;
-		}
-		
+
 		data_datum.dptr = (char *) &entry;
 		data_datum.dsize = sizeof(ippool_info);
 
@@ -323,7 +309,7 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 			key_datum.dsize = sizeof(ippool_key);
 			printf("rlm_ippool_tool: Allocating ip to key: '%s'\n", hex_str);
 		}
-		
+
 		rcode = gdbm_store(sessiondb, key_datum, data_datum, GDBM_REPLACE);
 		if (rcode < 0) {
 			printf("rlm_ippool_tool: Failed storing data to %s: %s\n",
@@ -337,21 +323,20 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 		data_datum = gdbm_fetch(indexdb, key_datum);
 		if (data_datum.dptr) {
 			memcpy(&num, data_datum.dptr, sizeof(int));
-			free(data_datum.dptr);
 		} else {
 			num = 0;
 		}
-		
+
 		num++;
 		printf("rlm_ippool_tool: num: %d\n", num);
 		data_datum.dptr = (char *) &num;
 		data_datum.dsize = sizeof(int);
-		
+
 		rcode = gdbm_store(indexdb, key_datum, data_datum, GDBM_REPLACE);
 		if (rcode < 0) {
 			printf("rlm_ippool_tool: Failed storing data to %s: %s\n",
 				indexdbname, gdbm_strerror(gdbm_errno));
-			
+
 			goto close;
 		}
 
@@ -362,7 +347,7 @@ void addip(char *sessiondbname, char *indexdbname, char *ipaddress,
 			printf("rlm_ippool_tool: Allocated ip %s to key  '%s'\n", ipaddress, hex_str);
 		}
 	}
-	
+
 	close:
 	gdbm_close(indexdb);
 	gdbm_close(sessiondb);
@@ -382,44 +367,44 @@ void tonewformat(char *sessiondbname, char *newsessiondbname) {
 	sessiondb = gdbm_open(sessiondbname, 512, GDBM_READER, 0,NULL);
 	newsessiondb = gdbm_open(newsessiondbname, 512, GDBM_NEWDB, 0,NULL);
 
-	if (sessiondb == NULL || newsessiondb == NULL) return;
+	if (!sessiondb || !newsessiondb) return;
 
 	memset(key_str, 0, 17);
 
 	key_datum = gdbm_firstkey(sessiondb);
 	while (key_datum.dptr) {
 		keynext_datum = gdbm_nextkey(sessiondb, key_datum);
-		
+
 		if (key_datum.dsize != sizeof(struct old_ippool_key)) {
 			goto next;
 		}
-		
+
 		char md5_input_str[MAX_STRING_LEN];
 		FR_MD5_CTX md5_context;
 
 		memcpy(&old_key, key_datum.dptr, sizeof(struct old_ippool_key));
-		
+
 		snprintf(md5_input_str, MAX_STRING_LEN, "%s %d", old_key.nas, old_key.port);
-		
+
 		fr_MD5Init(&md5_context);
 		fr_MD5Update(&md5_context, (uint8_t *) md5_input_str, strlen(md5_input_str));
 		fr_MD5Final(key_str, &md5_context);
-		
+
 		memcpy(key.key, key_str, 16);
-		fr_bin2hex(key_str, hex_str, 16);
+		fr_bin2hex(hex_str, key_str, 16);
 		hex_str[32] = '\0';
-		
+
 		printf("rlm_ippool_tool: Transforming pair nas/port (%s/%d) to md5 '%s'\n",
 			old_key.nas, old_key.port, hex_str);
-			
+
 		newkey_datum.dptr = (char *) &key;
 		newkey_datum.dsize = sizeof(ippool_key);
 		data_datum = gdbm_fetch(sessiondb, key_datum);
-		
-		if (data_datum.dptr == NULL) {
+
+		if (!data_datum.dptr) {
 			goto next;
 		}
-		
+
 		rcode = gdbm_store(newsessiondb, newkey_datum, data_datum, GDBM_REPLACE);
 		if (rcode < 0) {
 			printf("Failed to update new file %s: %s\n", newsessiondbname, gdbm_strerror(gdbm_errno));
@@ -431,7 +416,7 @@ void tonewformat(char *sessiondbname, char *newsessiondbname) {
 		next:
 		key_datum = keynext_datum;
 	}
-	
+
 	gdbm_close(newsessiondb);
 	gdbm_close(sessiondb);
 }
@@ -455,49 +440,49 @@ void viewdb(char *sessiondbname, char *indexdbname, char *ipaddress, int old) {
 	sessiondb = gdbm_open(sessiondbname, 512, mode, 0,NULL);
 	indexdb = gdbm_open(indexdbname, 512, mode, 0,NULL);
 
-	if ((sessiondb == NULL) || (indexdb == NULL)) {
+	if ((!sessiondb) || (!indexdb)) {
 		return;
 	}
-	
+
 	memset(key_str, 0,17);
 
 	key_datum = gdbm_firstkey(sessiondb);
 	while (key_datum.dptr) {
 		keynext_datum = gdbm_nextkey(sessiondb, key_datum);
-		
+
 		if ((key_datum.dsize != sizeof(struct ippool_key)) &&
 		    (key_datum.dsize != sizeof(struct old_ippool_key))) {
-		 	goto next;   
+		 	goto next;
 		}
-			    
+
 		if (old) {
 			 memcpy(&old_key, key_datum.dptr, sizeof(struct old_ippool_key));
 		} else {
 			 memcpy(&key, key_datum.dptr, sizeof(struct ippool_key));
 		}
-	
+
 		data_datum = gdbm_fetch(sessiondb, key_datum);
-		if (data_datum.dptr == NULL) {
+		if (!data_datum.dptr) {
 			goto next;
 		}
-		
+
 		memcpy(&info, data_datum.dptr, sizeof(struct ippool_info));
 		memcpy(&ipaddr, &info.ipaddr, 4);
 		ip = inet_ntoa(ipaddr);
 
 		if (info.active) active++;
-		
+
 		if (vflag && MATCH_IP(ipaddress, ip) && MATCH_ACTIVE(info)) {
 			if (old) {
 				printf("NAS:%s port:0x%x - ", old_key.nas, old_key.port);
 			} else {
 				memcpy(key_str, key.key, 16);
-				fr_bin2hex(key_str, hex_str, 16);
+				fr_bin2hex(hex_str, key_str, 16);
 				hex_str[32] = '\0';
 				printf("KEY: '%s' - ", hex_str);
 			}
 		}
-		
+
 		if (!vflag && aflag && info.active && MATCH_IP(ipaddress, ip)) {
 			printf("%s\n", ip);
 		} else if (vflag && MATCH_IP(ipaddress, ip) && MATCH_ACTIVE(info)) {
@@ -516,7 +501,7 @@ void viewdb(char *sessiondbname, char *indexdbname, char *ipaddress, int old) {
 			save_datum.dsize = key_datum.dsize;
 			data_datum.dptr = (char *) &info;
 			data_datum.dsize = sizeof(ippool_info);
-			
+
 			rcode = gdbm_store(sessiondb, key_datum, data_datum, GDBM_REPLACE);
 			if (rcode < 0) {
 				printf("Failed to update %s: %s\n", ip, gdbm_strerror(gdbm_errno));
@@ -524,11 +509,11 @@ void viewdb(char *sessiondbname, char *indexdbname, char *ipaddress, int old) {
 				gdbm_close(sessiondb);
 				return;
 			}
-			
+
 			key_datum.dptr = (char *)&info.ipaddr;
 			key_datum.dsize = sizeof(uint32_t);
 			data_datum = gdbm_fetch(indexdb, key_datum);
-			
+
 			if (data_datum.dptr != NULL) {
 				memcpy(&num, data_datum.dptr, sizeof(int));
 				if (num > 0) {
@@ -536,14 +521,14 @@ void viewdb(char *sessiondbname, char *indexdbname, char *ipaddress, int old) {
 					data_datum.dptr = (char *) &num;
 					data_datum.dsize = sizeof(int);
 					rcode = gdbm_store(indexdb, key_datum, data_datum, GDBM_REPLACE);
-					
+
 					if (rcode < 0) {
 						printf("Failed to update %s: %s\n", ip, gdbm_strerror(gdbm_errno));
 						gdbm_close(indexdb);
 						gdbm_close(sessiondb);
 						return;
 					}
-					
+
 					if (num > 0 && info.extra == 1) {
 						gdbm_delete(sessiondb, save_datum);
 					}
@@ -554,38 +539,38 @@ void viewdb(char *sessiondbname, char *indexdbname, char *ipaddress, int old) {
 		key_datum.dptr = (char *)&info.ipaddr;
 		key_datum.dsize = sizeof(uint32_t);
 		data_datum = gdbm_fetch(indexdb, key_datum);
-		
+
 		if (data_datum.dptr!= NULL) {
 			memcpy(&num, data_datum.dptr, sizeof(int));
-			
+
 			if (vflag && MATCH_IP(ipaddress, ip) && MATCH_ACTIVE(info)) {
 				printf(" num:%d", num);
 			}
 		}
-		
+
 		if (vflag && MATCH_IP(ipaddress, ip) && MATCH_ACTIVE(info)) {
 			printf("\n");
-		} else if (vflag && ipaddress == NULL){
+		} else if (vflag && !ipaddress){
 			if (old) {
 				printf("NAS:%s port:0x%x\n", old_key.nas, old_key.port);
 			} else	{
 				memcpy(key_str, key.key, 16);
-				fr_bin2hex(key_str, hex_str, 16);
+				fr_bin2hex(hex_str, key_str, 16);
 				hex_str[32] = '\0';
 				printf("KEY: '%s' - ", hex_str);
 			}
 		}
-		
+
 		next:
-		key_datum = keynext_datum;	
+		key_datum = keynext_datum;
 	}
-	
+
 	gdbm_close(indexdb);
 	gdbm_close(sessiondb);
 }
 
 void NEVER_RETURNS usage(char *argv0) {
-	printf("Usage: %s [-a] [-c] [-o] [-v] <session-db> <index-db> [ipaddress]\n", argv0);
+	printf("Usage: %s [-a] [-c] [-o] [-v] <filename> <index-db> [ipaddress]\n", argv0);
 	printf("  -a: print all active entries\n");
 	printf("  -c: report number of active entries\n");
 	printf("  -r: remove active entries\n");
@@ -593,9 +578,9 @@ void NEVER_RETURNS usage(char *argv0) {
 	printf("  -o: Assume old database format (nas/port pair, not md5 output)\n");
 	printf("  If an ipaddress is specified then that address is used to\n");
 	printf("  limit the actions or output.\n");
-	printf("  Usage: %s -n  <session-db> <index-db> <ipaddress> <nasIP> <nasPort>\n", argv0);
+	printf("  Usage: %s -n  <filename> <index-db> <ipaddress> <nasIP> <nasPort>\n", argv0);
 	printf("  -n: Mark the entry nasIP/nasPort as having ipaddress\n");
-	printf("  Usage: %s -u <session-db> <new-session-db>\n", argv0);
+	printf("  Usage: %s -u <filename> <new-filename>\n", argv0);
 	printf("  -u: Update old format database to new.\n");
 	exit(0);
 }
@@ -630,6 +615,6 @@ int main(int argc, char **argv) {
 			usage(argv0);
 		}
 	}
-	
+
 	return 0;
 }

@@ -21,11 +21,9 @@
  * Copyright 2000,2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/libradius.h>
-#include <freeradius-devel/token.h>
 
 #include <ctype.h>
 
@@ -70,14 +68,14 @@ const FR_NAME_NUMBER fr_tokens[] = {
  *	At end-of-line, buf[0] is set to '\0'.
  *	Returns 0 or special token value.
  */
-static FR_TOKEN getthing(const char **ptr, char *buf, int buflen, int tok,
-			 const FR_NAME_NUMBER *tokenlist)
+static FR_TOKEN getthing(char const **ptr, char *buf, int buflen, int tok,
+			 FR_NAME_NUMBER const *tokenlist)
 {
-	char *s;
-	const char *p;
-	int	quote, end = 0;
-	unsigned int	x;
-	const FR_NAME_NUMBER*t;
+	char			*s;
+	char const		*p;
+	int			quote, end = 0;
+	unsigned int		x;
+	FR_NAME_NUMBER const	*t;
 	FR_TOKEN rcode;
 
 	buf[0] = 0;
@@ -203,7 +201,7 @@ static FR_TOKEN getthing(const char **ptr, char *buf, int buflen, int tok,
  *	Read a "word" - this means we don't honor
  *	tokens as delimiters.
  */
-int getword(const char **ptr, char *buf, int buflen)
+int getword(char const **ptr, char *buf, int buflen)
 {
 	return getthing(ptr, buf, buflen, 0, fr_tokens) == T_EOL ? 0 : 1;
 }
@@ -212,7 +210,7 @@ int getword(const char **ptr, char *buf, int buflen)
  *	Read a bare "word" - this means we don't honor
  *	tokens as delimiters.
  */
-int getbareword(const char **ptr, char *buf, int buflen)
+int getbareword(char const **ptr, char *buf, int buflen)
 {
 	FR_TOKEN token;
 
@@ -227,7 +225,7 @@ int getbareword(const char **ptr, char *buf, int buflen)
 /*
  *	Read the next word, use tokens as delimiters.
  */
-FR_TOKEN gettoken(const char **ptr, char *buf, int buflen)
+FR_TOKEN gettoken(char const **ptr, char *buf, int buflen)
 {
 	return getthing(ptr, buf, buflen, 1, fr_tokens);
 }
@@ -235,12 +233,12 @@ FR_TOKEN gettoken(const char **ptr, char *buf, int buflen)
 /*
  *	Expect a string.
  */
-FR_TOKEN getstring(const char **ptr, char *buf, int buflen)
+FR_TOKEN getstring(char const **ptr, char *buf, int buflen)
 {
-	const char *p;
+	char const *p;
 
 	if (!ptr || !*ptr || !buf) return T_OP_INVALID;
-	
+
 	p = *ptr;
 
 	while (*p && (isspace((int)*p))) p++;
@@ -257,9 +255,13 @@ FR_TOKEN getstring(const char **ptr, char *buf, int buflen)
 /*
  *	Convert a string to an integer
  */
-int fr_str2int(const FR_NAME_NUMBER *table, const char *name, int def)
+int fr_str2int(FR_NAME_NUMBER const *table, char const *name, int def)
 {
-	const FR_NAME_NUMBER *this;
+	FR_NAME_NUMBER const *this;
+
+	if (!name) {
+		return def;
+	}
 
 	for (this = table; this->name != NULL; this++) {
 		if (strcasecmp(this->name, name) == 0) {
@@ -273,17 +275,30 @@ int fr_str2int(const FR_NAME_NUMBER *table, const char *name, int def)
 /*
  *	Convert a string matching part of name to an integer.
  */
-int fr_substr2int(const FR_NAME_NUMBER *table, const char *name, int def, int len)
+int fr_substr2int(FR_NAME_NUMBER const *table, char const *name, int def, int len)
 {
-	const FR_NAME_NUMBER *this;
+	FR_NAME_NUMBER const *this;
 	size_t max;
-	
+
+	if (!name) {
+		return def;
+	}
+
 	for (this = table; this->name != NULL; this++) {
-		/* 
-		 * Match up to the length of the table entry if len is < 0.
+		size_t tlen;
+
+		tlen = strlen(this->name);
+
+		/*
+		 *	Don't match "request" to user input "req".
 		 */
-		max = (len < 0) ? strlen(this->name) : (unsigned)len;
-		
+		if ((len > 0) && (len < (int) tlen)) continue;
+
+		/*
+		 *	Match up to the length of the table entry if len is < 0.
+		 */
+		max = (len < 0) ? tlen : (unsigned)len;
+
 		if (strncasecmp(this->name, name, max) == 0) {
 			return this->number;
 		}
@@ -295,10 +310,10 @@ int fr_substr2int(const FR_NAME_NUMBER *table, const char *name, int def, int le
 /*
  *	Convert an integer to a string.
  */
-const char *fr_int2str(const FR_NAME_NUMBER *table, int number,
-			 const char *def)
+char const *fr_int2str(FR_NAME_NUMBER const *table, int number,
+			 char const *def)
 {
-	const FR_NAME_NUMBER *this;
+	FR_NAME_NUMBER const *this;
 
 	for (this = table; this->name != NULL; this++) {
 		if (this->number == number) {
@@ -309,7 +324,7 @@ const char *fr_int2str(const FR_NAME_NUMBER *table, int number,
 	return def;
 }
 
-const char *fr_token_name(int token)
+char const *fr_token_name(int token)
 {
 	return fr_int2str(fr_tokens, token, "???");
 }

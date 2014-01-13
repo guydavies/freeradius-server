@@ -24,7 +24,6 @@
  * Copyright 2012 Alan DeKok <aland@deployingradius.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSIDH(process_h, "$Id$")
 
 #ifdef __cplusplus
@@ -52,9 +51,7 @@ int request_enqueue(REQUEST *request);
 
 int request_receive(rad_listen_t *listener, RADIUS_PACKET *packet,
 		    RADCLIENT *client, RAD_REQUEST_FUNP fun);
-int request_insert(rad_listen_t *listener, RADIUS_PACKET *packet,
-		   RADCLIENT *client, RAD_REQUEST_FUNP fun,
-		   struct timeval *pnow);
+
 #ifdef WITH_PROXY
 int request_proxy_reply(RADIUS_PACKET *packet);
 #endif

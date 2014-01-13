@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_pam.c
@@ -27,7 +27,6 @@
  * @copyright 1997  Jeph Blaize <jblaize@kiva.net>
  * @copyright 1999  miguel a.l. paraz <map@iphil.net>
  */
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include	<freeradius-devel/radiusd.h>
@@ -49,7 +48,7 @@ RCSID("$Id$")
 #endif
 
 typedef struct rlm_pam_t {
-	const char *pam_auth_name;
+	char const *pam_auth_name;
 } rlm_pam_t;
 
 static const CONF_PARSER module_config[] = {
@@ -57,39 +56,6 @@ static const CONF_PARSER module_config[] = {
 	  NULL, "radiusd" },
 	{ NULL, -1, 0, NULL, NULL }
 };
-
-/*
- *	(Re-)read radiusd.conf into memory.
- */
-static int pam_instantiate(CONF_SECTION *conf, void **instance)
-{
-	rlm_pam_t *data;
-
-	data = rad_malloc(sizeof(*data));
-	if (!data) {
-		return -1;
-	}
-	memset(data, 0, sizeof(*data));
-
-	if (cf_section_parse(conf, data, module_config) < 0) {
-		free(data);
-		return -1;
-	}
-
-	*instance = data;
-	return 0;
-}
-
-/*
- *	Clean up.
- */
-static int pam_detach(void *instance)
-{
-	rlm_pam_t *data = (rlm_pam_t *) instance;
-
-        free((char *) data);
-	return 0;
-}
 
 /*************************************************************************
  *
@@ -100,21 +66,18 @@ static int pam_detach(void *instance)
  * jab - stolen from pop3d
  *
  * Alan DeKok: modified to use PAM's appdata_ptr, so that we're
- *             multi-threaded safe, and don't have any nasty static
- *             variables hanging around.
+ *	     multi-threaded safe, and don't have any nasty static
+ *	     variables hanging around.
  *
  *************************************************************************/
 
 typedef struct my_PAM {
-  const char *username;
-  const char *password;
-  int         error;
+  char const *username;
+  char const *password;
+  int	 error;
 } my_PAM;
 
-static int PAM_conv (int num_msg,
-                     const struct pam_message **msg,
-                     struct pam_response **resp,
-                     void *appdata_ptr) {
+static int PAM_conv(int num_msg, struct pam_message const **msg, struct pam_response **resp, void *appdata_ptr) {
   int count;
   struct pam_response *reply;
   my_PAM *pam_config = (my_PAM *) appdata_ptr;
@@ -141,11 +104,11 @@ static int PAM_conv (int num_msg,
     default:
       /* Must be an error of some sort... */
       for (count = 0; count < num_msg; count++) {
-        if (reply[count].resp) {
-          /* could be a password, let's be sanitary */
-          memset(reply[count].resp, 0, strlen(reply[count].resp));
-          free(reply[count].resp);
-        }
+	if (reply[count].resp) {
+	  /* could be a password, let's be sanitary */
+	  memset(reply[count].resp, 0, strlen(reply[count].resp));
+	  free(reply[count].resp);
+	}
       }
       free(reply);
       pam_config->error = 1;
@@ -174,7 +137,7 @@ static int PAM_conv (int num_msg,
  * allows you to have multiple authentication types (i.e. multiple
  * files associated with radius in /etc/pam.d)
  */
-static int pam_pass(const char *name, const char *passwd, const char *pamauth)
+static int pam_pass(char const *name, char const *passwd, char const *pamauth)
 {
     pam_handle_t *pamh=NULL;
     int retval;
@@ -226,20 +189,20 @@ static int pam_pass(const char *name, const char *passwd, const char *pamauth)
 }
 
 /* translate between function declarations */
-static rlm_rcode_t pam_auth(void *instance, REQUEST *request)
+static rlm_rcode_t mod_authenticate(void *instance, REQUEST *request)
 {
 	int	r;
 	VALUE_PAIR *pair;
 	rlm_pam_t *data = (rlm_pam_t *) instance;
 
-	const char *pam_auth_string = data->pam_auth_name;
+	char const *pam_auth_string = data->pam_auth_name;
 
 	/*
 	 *	We can only authenticate user requests which HAVE
 	 *	a User-Name attribute.
 	 */
 	if (!request->username) {
-		radlog(L_AUTH, "rlm_pam: Attribute \"User-Name\" is required for authentication.");
+		AUTH("rlm_pam: Attribute \"User-Name\" is required for authentication");
 		return RLM_MODULE_INVALID;
 	}
 
@@ -248,7 +211,7 @@ static rlm_rcode_t pam_auth(void *instance, REQUEST *request)
 	 *	a User-Password attribute.
 	 */
 	if (!request->password) {
-		radlog(L_AUTH, "rlm_pam: Attribute \"User-Password\" is required for authentication.");
+		AUTH("rlm_pam: Attribute \"User-Password\" is required for authentication");
 		return RLM_MODULE_INVALID;
 	}
 
@@ -256,8 +219,8 @@ static rlm_rcode_t pam_auth(void *instance, REQUEST *request)
 	 *  Ensure that we're being passed a plain-text password,
 	 *  and not anything else.
 	 */
-	if (request->password->attribute != PW_USER_PASSWORD) {
-		radlog(L_AUTH, "rlm_pam: Attribute \"User-Password\" is required for authentication.  Cannot use \"%s\".", request->password->name);
+	if (request->password->da->attr != PW_USER_PASSWORD) {
+		AUTH("rlm_pam: Attribute \"User-Password\" is required for authentication.  Cannot use \"%s\".", request->password->da->name);
 		return RLM_MODULE_INVALID;
 	}
 
@@ -266,10 +229,10 @@ static rlm_rcode_t pam_auth(void *instance, REQUEST *request)
 	 *	for backwards compatibility.
 	 */
 	pair = pairfind(request->config_items, PAM_AUTH_ATTR, 0, TAG_ANY);
-	if (pair) pam_auth_string = (char *)pair->vp_strvalue;
+	if (pair) pam_auth_string = pair->vp_strvalue;
 
-	r = pam_pass((char *)request->username->vp_strvalue,
-		     (char *)request->password->vp_strvalue,
+	r = pam_pass(request->username->vp_strvalue,
+		     request->password->vp_strvalue,
 		     pam_auth_string);
 
 	if (r == 0) {
@@ -282,10 +245,12 @@ module_t rlm_pam = {
 	RLM_MODULE_INIT,
 	"pam",
 	RLM_TYPE_THREAD_UNSAFE,	/* The PAM libraries are not thread-safe */
-	pam_instantiate,		/* instantiation */
-	pam_detach,			/* detach */
+	sizeof(rlm_pam_t),
+	module_config,
+	NULL,				/* instantiation */
+	NULL,				/* detach */
 	{
-		pam_auth,		/* authenticate */
+		mod_authenticate,	/* authenticate */
 		NULL,			/* authorize */
 		NULL,			/* pre-accounting */
 		NULL,			/* accounting */

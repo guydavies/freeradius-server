@@ -19,8 +19,6 @@
  *
  * Copyright 2000,2006  The FreeRADIUS server project
  */
-
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include	<freeradius-devel/libradius.h>
@@ -44,11 +42,15 @@ RCSID("$Id$")
 #define DICT_VENDOR_MAX_NAME_LEN (128)
 #define DICT_ATTR_MAX_NAME_LEN (128)
 
+#define DICT_ATTR_SIZE sizeof(DICT_ATTR) + DICT_ATTR_MAX_NAME_LEN
+
 static fr_hash_table_t *vendors_byname = NULL;
 static fr_hash_table_t *vendors_byvalue = NULL;
 
 static fr_hash_table_t *attributes_byname = NULL;
 static fr_hash_table_t *attributes_byvalue = NULL;
+
+static fr_hash_table_t *attributes_combo = NULL;
 
 static fr_hash_table_t *values_byvalue = NULL;
 static fr_hash_table_t *values_byname = NULL;
@@ -109,9 +111,38 @@ const FR_NAME_NUMBER dict_attr_types[] = {
 	{ "integer64",	PW_TYPE_INTEGER64 },
 	{ "uint64",	PW_TYPE_INTEGER64 },
 	{ "ipv4prefix", PW_TYPE_IPV4PREFIX },
+	{ "cidr", 	PW_TYPE_IPV4PREFIX },
+	{ "vsa",	PW_TYPE_VSA },
 	{ NULL, 0 }
 };
 
+/*
+ *	Map data types to min / max data sizes.
+ */
+const size_t dict_attr_sizes[PW_TYPE_MAX][2] = {
+	[PW_TYPE_INVALID]	= { ~0, 0 },
+	[PW_TYPE_STRING]	= { 0, ~0 },
+	[PW_TYPE_INTEGER]	= {4, 4 },
+	[PW_TYPE_IPADDR]	= {4, 4},
+	[PW_TYPE_DATE]		= {4, 4},
+	[PW_TYPE_ABINARY]	= {32, ~0},
+	[PW_TYPE_OCTETS]	= {0, ~0},
+	[PW_TYPE_IFID]		= {8, 8},
+	[PW_TYPE_IPV6ADDR]	= { 16, 16},
+	[PW_TYPE_IPV6PREFIX]	= {2, 18},
+	[PW_TYPE_BYTE]		= {1, 1},
+	[PW_TYPE_SHORT]		= {2, 2},
+	[PW_TYPE_ETHERNET]	= {6, 6},
+	[PW_TYPE_SIGNED]	= {4, 4},
+	[PW_TYPE_COMBO_IP]	= {4, 16},
+	[PW_TYPE_TLV]		= {2, ~0},
+	[PW_TYPE_EXTENDED]	= {2, ~0},
+	[PW_TYPE_LONG_EXTENDED]	= {3, ~0},
+	[PW_TYPE_EVS]		= {6, ~0},
+	[PW_TYPE_INTEGER64]	= {8, 8},
+	[PW_TYPE_IPV4PREFIX]	= {6, 6},
+	[PW_TYPE_VSA]		= {4, ~0}
+};
 
 /*
  *	For packing multiple TLV numbers into one 32-bit integer.  The
@@ -124,9 +155,9 @@ const FR_NAME_NUMBER dict_attr_types[] = {
  *	number into the upper 8 bits of the "vendor" field.
  *
  *	e.g.	OID		attribute	vendor
- *		241.1		1		(241 << 8)
- *		241.26.9.1	1		(241 << 8) | (9)
- *		241.1.2		1 | (2 << 8)	(241 << 8)
+ *		241.1		1		(241 << 24)
+ *		241.26.9.1	1		(241 << 24) | (9)
+ *		241.1.2		1 | (2 << 8)	(241 << 24)
  */
 #define MAX_TLV_NEST (4)
 /*
@@ -155,13 +186,13 @@ const int fr_attr_mask[MAX_TLV_NEST + 1] = {
 #define FNV_MAGIC_INIT (0x811c9dc5)
 #define FNV_MAGIC_PRIME (0x01000193)
 
-static uint32_t dict_hashname(const char *name)
+static uint32_t dict_hashname(char const *name)
 {
 	uint32_t hash = FNV_MAGIC_INIT;
-	const char *p;
+	char const *p;
 
 	for (p = name; *p != '\0'; p++) {
-		int c = *(const unsigned char *) p;
+		int c = *(unsigned char const *) p;
 		if (isalpha(c)) c = tolower(c);
 
 		hash *= FNV_MAGIC_PRIME;
@@ -175,32 +206,32 @@ static uint32_t dict_hashname(const char *name)
 /*
  *	Hash callback functions.
  */
-static uint32_t dict_attr_name_hash(const void *data)
+static uint32_t dict_attr_name_hash(void const *data)
 {
-	return dict_hashname(((const DICT_ATTR *)data)->name);
+	return dict_hashname(((DICT_ATTR const *)data)->name);
 }
 
-static int dict_attr_name_cmp(const void *one, const void *two)
+static int dict_attr_name_cmp(void const *one, void const *two)
 {
-	const DICT_ATTR *a = one;
-	const DICT_ATTR *b = two;
+	DICT_ATTR const *a = one;
+	DICT_ATTR const *b = two;
 
 	return strcasecmp(a->name, b->name);
 }
 
-static uint32_t dict_attr_value_hash(const void *data)
+static uint32_t dict_attr_value_hash(void const *data)
 {
 	uint32_t hash;
-	const DICT_ATTR *attr = data;
+	DICT_ATTR const *attr = data;
 
 	hash = fr_hash(&attr->vendor, sizeof(attr->vendor));
 	return fr_hash_update(&attr->attr, sizeof(attr->attr), hash);
 }
 
-static int dict_attr_value_cmp(const void *one, const void *two)
+static int dict_attr_value_cmp(void const *one, void const *two)
 {
-	const DICT_ATTR *a = one;
-	const DICT_ATTR *b = two;
+	DICT_ATTR const *a = one;
+	DICT_ATTR const *b = two;
 
 	if (a->vendor < b->vendor) return -1;
 	if (a->vendor > b->vendor) return +1;
@@ -208,48 +239,72 @@ static int dict_attr_value_cmp(const void *one, const void *two)
 	return a->attr - b->attr;
 }
 
-static uint32_t dict_vendor_name_hash(const void *data)
+static uint32_t dict_attr_combo_hash(void const *data)
 {
-	return dict_hashname(((const DICT_VENDOR *)data)->name);
+	uint32_t hash;
+	DICT_ATTR const *attr = data;
+
+	hash = fr_hash(&attr->vendor, sizeof(attr->vendor));
+	hash = fr_hash_update(&attr->type, sizeof(attr->type), hash);
+	return fr_hash_update(&attr->attr, sizeof(attr->attr), hash);
 }
 
-static int dict_vendor_name_cmp(const void *one, const void *two)
+static int dict_attr_combo_cmp(void const *one, void const *two)
 {
-	const DICT_VENDOR *a = one;
-	const DICT_VENDOR *b = two;
+	DICT_ATTR const *a = one;
+	DICT_ATTR const *b = two;
+
+	if (a->type < b->type) return -1;
+	if (a->type > b->type) return +1;
+
+	if (a->vendor < b->vendor) return -1;
+	if (a->vendor > b->vendor) return +1;
+
+	return a->attr - b->attr;
+}
+
+static uint32_t dict_vendor_name_hash(void const *data)
+{
+	return dict_hashname(((DICT_VENDOR const *)data)->name);
+}
+
+static int dict_vendor_name_cmp(void const *one, void const *two)
+{
+	DICT_VENDOR const *a = one;
+	DICT_VENDOR const *b = two;
 
 	return strcasecmp(a->name, b->name);
 }
 
-static uint32_t dict_vendor_value_hash(const void *data)
+static uint32_t dict_vendor_value_hash(void const *data)
 {
-	return fr_hash(&(((const DICT_VENDOR *)data)->vendorpec),
-			 sizeof(((const DICT_VENDOR *)data)->vendorpec));
+	return fr_hash(&(((DICT_VENDOR const *)data)->vendorpec),
+			 sizeof(((DICT_VENDOR const *)data)->vendorpec));
 }
 
-static int dict_vendor_value_cmp(const void *one, const void *two)
+static int dict_vendor_value_cmp(void const *one, void const *two)
 {
-	const DICT_VENDOR *a = one;
-	const DICT_VENDOR *b = two;
+	DICT_VENDOR const *a = one;
+	DICT_VENDOR const *b = two;
 
 	return a->vendorpec - b->vendorpec;
 }
 
-static uint32_t dict_value_name_hash(const void *data)
+static uint32_t dict_value_name_hash(void const *data)
 {
 	uint32_t hash;
-	const DICT_VALUE *dval = data;
+	DICT_VALUE const *dval = data;
 
 	hash = dict_hashname(dval->name);
 	hash = fr_hash_update(&dval->vendor, sizeof(dval->vendor), hash);
 	return fr_hash_update(&dval->attr, sizeof(dval->attr), hash);
 }
 
-static int dict_value_name_cmp(const void *one, const void *two)
+static int dict_value_name_cmp(void const *one, void const *two)
 {
 	int rcode;
-	const DICT_VALUE *a = one;
-	const DICT_VALUE *b = two;
+	DICT_VALUE const *a = one;
+	DICT_VALUE const *b = two;
 
 	rcode = a->attr - b->attr;
 	if (rcode != 0) return rcode;
@@ -260,21 +315,21 @@ static int dict_value_name_cmp(const void *one, const void *two)
 	return strcasecmp(a->name, b->name);
 }
 
-static uint32_t dict_value_value_hash(const void *data)
+static uint32_t dict_value_value_hash(void const *data)
 {
 	uint32_t hash;
-	const DICT_VALUE *dval = data;
+	DICT_VALUE const *dval = data;
 
 	hash = fr_hash(&dval->attr, sizeof(dval->attr));
 	hash = fr_hash_update(&dval->vendor, sizeof(dval->vendor), hash);
 	return fr_hash_update(&dval->value, sizeof(dval->value), hash);
 }
 
-static int dict_value_value_cmp(const void *one, const void *two)
+static int dict_value_value_cmp(void const *one, void const *two)
 {
 	int rcode;
-	const DICT_VALUE *a = one;
-	const DICT_VALUE *b = two;
+	DICT_VALUE const *a = one;
+	DICT_VALUE const *b = two;
 
 	if (a->vendor < b->vendor) return -1;
 	if (a->vendor > b->vendor) return +1;
@@ -316,7 +371,7 @@ static void dict_stat_free(void)
 /*
  *	Add an entry to the list of stat buffers.
  */
-static void dict_stat_add(const char *name, const struct stat *stat_buf)
+static void dict_stat_add(char const *name, struct stat const *stat_buf)
 {
 	dict_stat_t *this;
 
@@ -340,7 +395,7 @@ static void dict_stat_add(const char *name, const struct stat *stat_buf)
  *	See if any dictionaries have changed.  If not, don't
  *	do anything.
  */
-static int dict_stat_check(const char *root_dir, const char *root_file)
+static int dict_stat_check(char const *root_dir, char const *root_file)
 {
 	struct stat buf;
 	dict_stat_t *this;
@@ -456,8 +511,10 @@ void dict_free(void)
 
 	fr_hash_table_free(attributes_byname);
 	fr_hash_table_free(attributes_byvalue);
+	fr_hash_table_free(attributes_combo);
 	attributes_byname = NULL;
 	attributes_byvalue = NULL;
+	attributes_combo = NULL;
 
 	fr_hash_table_free(values_byname);
 	fr_hash_table_free(values_byvalue);
@@ -471,11 +528,10 @@ void dict_free(void)
 	dict_stat_free();
 }
 
-
 /*
  *	Add vendor to the list.
  */
-int dict_addvendor(const char *name, unsigned int value)
+int dict_addvendor(char const *name, unsigned int value)
 {
 	size_t length;
 	DICT_VENDOR *dv;
@@ -537,16 +593,41 @@ int dict_addvendor(const char *name, unsigned int value)
 	return 0;
 }
 
+
+/*
+ *	[a-zA-Z0-9_-:.]+
+ */
+const int dict_attr_allowed_chars[256] = {
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+	0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1,
+	0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+
+
 /*
  *	Add an attribute to the dictionary.
  */
-int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
+int dict_addattr(char const *name, int attr, unsigned int vendor, int type,
 		 ATTR_FLAGS flags)
 {
 	size_t namelen;
 	static int      max_attr = 0;
-	const char	*p;
-	DICT_ATTR	*da;
+	uint8_t const *p;
+	DICT_ATTR const	*da;
+	DICT_ATTR *n;
 
 	namelen = strlen(name);
 	if (namelen >= DICT_ATTR_MAX_NAME_LEN) {
@@ -554,19 +635,9 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 		return -1;
 	}
 
-	for (p = name; *p != '\0'; p++) {
-		if (*p < ' ') {
-			fr_strerror_printf("dict_addattr: attribute name cannot contain control characters");
-			return -1;
-		}
-
-		if ((*p == '"') || (*p == '\\')) {
-			fr_strerror_printf("dict_addattr: attribute name cannot contain quotation or backslash");
-			return -1;
-		}
-
-		if ((*p == '<') || (*p == '>') || (*p == '&')) {
-			fr_strerror_printf("dict_addattr: attribute name cannot contain XML control characters");
+	for (p = (uint8_t const *) name; *p != '\0'; p++) {
+		if (!dict_attr_allowed_chars[*p]) {
+			fr_strerror_printf("dict_addattr: Invalid character '%c' in attribute name", *p);
 			return -1;
 		}
 	}
@@ -605,7 +676,7 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 	 */
 	if (flags.extended || flags.long_extended || flags.evs) {
 		if (vendor && (vendor < FR_MAX_VENDOR)) {
-			fr_strerror_printf("dict_addattr: VSAs cannot use the \"extended\" or \"evs\" attribute formats.");
+			fr_strerror_printf("dict_addattr: VSAs cannot use the \"extended\" or \"evs\" attribute formats");
 			return -1;
 		}
 		if (flags.has_tag
@@ -613,7 +684,7 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 		    || flags.array
 #endif
 		    || (flags.encrypt != FLAG_ENCRYPT_NONE)) {
-			fr_strerror_printf("dict_addattr: The \"extended\" attributes MUST NOT have any flags set.");
+			fr_strerror_printf("dict_addattr: The \"extended\" attributes MUST NOT have any flags set");
 			return -1;
 		}
 	}
@@ -630,7 +701,21 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 			return -1;
 		}
 	}
-		
+
+	/*
+	 *	Allow for generic pointers
+	 */
+	switch (type) {
+	default:
+		break;
+
+	case PW_TYPE_STRING:
+	case PW_TYPE_OCTETS:
+	case PW_TYPE_TLV:
+		flags.is_pointer = true;
+		break;
+	}
+
 	if (attr < 0) {
 		fr_strerror_printf("dict_addattr: ATTRIBUTE has invalid number (less than zero)");
 		return -1;
@@ -638,6 +723,23 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 
 	if (flags.has_tlv && flags.length) {
 		fr_strerror_printf("TLVs cannot have a fixed length");
+		return -1;
+	}
+
+	if (vendor && flags.concat) {
+		fr_strerror_printf("VSAs cannot have the \"concat\" flag set");
+		return -1;
+	}
+
+	if (flags.concat && (type != PW_TYPE_OCTETS)) {
+		fr_strerror_printf("The \"concat\" flag can only be set for attributes of type \"octets\".");
+		return -1;
+	}
+
+	if (flags.concat && (flags.has_tag || flags.array || flags.is_tlv || flags.has_tlv ||
+			     flags.length || flags.evs || flags.extended || flags.long_extended ||
+			     (flags.encrypt != FLAG_ENCRYPT_NONE))) {
+		fr_strerror_printf("The \"concat\" flag cannot be used with any other flag");
 		return -1;
 	}
 
@@ -691,7 +793,7 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 		 *	properly.
 		 */
 		if ((dv->type == 1) && (attr >= 256) && !flags.is_tlv) {
-			fr_strerror_printf("dict_addattr: ATTRIBUTE has invalid number (larger than 255).");
+			fr_strerror_printf("dict_addattr: ATTRIBUTE has invalid number (larger than 255)");
 			return -1;
 		} /* else 256..65535 are allowed */
 
@@ -718,8 +820,8 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 			}
 
 			/*
-			 *	These flags are inhereited inherited
-			 *	from the parent.
+			 *	These flags are inherited from the
+			 *	parent.
 			 */
 			flags.extended = da->flags.extended;
 			flags.long_extended = da->flags.long_extended;
@@ -751,33 +853,34 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 	/*
 	 *	Create a new attribute for the list
 	 */
-	if ((da = fr_pool_alloc(sizeof(*da) + namelen)) == NULL) {
-		fr_strerror_printf("dict_addattr: out of memory");
+	if ((n = fr_pool_alloc(sizeof(*n) + namelen)) == NULL) {
+	oom:
+		fr_strerror_printf("dict_adnttr: out of memory");
 		return -1;
 	}
 
-	memcpy(da->name, name, namelen);
-	da->name[namelen] = '\0';
-	da->attr = attr;
-	da->vendor = vendor;
-	da->type = type;
-	da->flags = flags;
+	memcpy(n->name, name, namelen);
+	n->name[namelen] = '\0';
+	n->attr = attr;
+	n->vendor = vendor;
+	n->type = type;
+	n->flags = flags;
 
 	/*
 	 *	Insert the attribute, only if it's not a duplicate.
 	 */
-	if (!fr_hash_table_insert(attributes_byname, da)) {
+	if (!fr_hash_table_insert(attributes_byname, n)) {
 		DICT_ATTR	*a;
 
 		/*
 		 *	If the attribute has identical number, then
 		 *	ignore the duplicate.
 		 */
-		a = fr_hash_table_finddata(attributes_byname, da);
-		if (a && (strcasecmp(a->name, da->name) == 0)) {
-			if (a->attr != da->attr) {
-				fr_strerror_printf("dict_addattr: Duplicate attribute name %s", name);
-				fr_pool_free(da);
+		a = fr_hash_table_finddata(attributes_byname, n);
+		if (a && (strcasecmp(a->name, n->name) == 0)) {
+			if (a->attr != n->attr) {
+				fr_strerror_printf("dict_adnttr: Duplicate attribute name %s", name);
+				fr_pool_free(n);
 				return -1;
 			}
 
@@ -792,9 +895,9 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 
 		fr_hash_table_delete(attributes_byvalue, a);
 
-		if (!fr_hash_table_replace(attributes_byname, da)) {
-			fr_strerror_printf("dict_addattr: Internal error storing attribute %s", name);
-			fr_pool_free(da);
+		if (!fr_hash_table_replace(attributes_byname, n)) {
+			fr_strerror_printf("dict_adnttr: Internal error storing attribute %s", name);
+			fr_pool_free(n);
 			return -1;
 		}
 	}
@@ -808,13 +911,48 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 	 *	files, but when we're printing them, (and looking up
 	 *	by value) we want to use the NEW name.
 	 */
-	if (!fr_hash_table_replace(attributes_byvalue, da)) {
-		fr_strerror_printf("dict_addattr: Failed inserting attribute name %s", name);
+	if (!fr_hash_table_replace(attributes_byvalue, n)) {
+		fr_strerror_printf("dict_adnttr: Failed inserting attribute name %s", name);
 		return -1;
 	}
 
+	/*
+	 *	Hacks for combo-IP
+	 */
+	if (n->type == PW_TYPE_COMBO_IP) {
+		DICT_ATTR *v4, *v6;
+
+		v4 = fr_pool_alloc(sizeof(*v4));
+		if (!v4) goto oom;
+
+		v6 = fr_pool_alloc(sizeof(*v6));
+		if (!v6) {
+			free(v4);
+			goto oom;
+		}
+
+		memcpy(v4, n, sizeof(*v4));
+		v4->type = PW_TYPE_IPADDR;
+
+		memcpy(v6, n, sizeof(*v6));
+		v6->type = PW_TYPE_IPV6ADDR;
+
+		if (!fr_hash_table_insert(attributes_combo, v4)) {
+			fr_strerror_printf("dict_addattr: Failed inserting attribute name %s - IPv4", name);
+			free(v4);
+			free(v6);
+			return -1;
+		}
+
+		if (!fr_hash_table_insert(attributes_combo, v6)) {
+			fr_strerror_printf("dict_addattr: Failed inserting attribute name %s - IPv6", name);
+			free(v6);
+			return -1;
+		}
+	}
+
 	if (!vendor && (attr > 0) && (attr < 256)) {
-		 dict_base_attrs[attr] = da;
+		 dict_base_attrs[attr] = n;
 	}
 
 	return 0;
@@ -824,13 +962,13 @@ int dict_addattr(const char *name, int attr, unsigned int vendor, int type,
 /*
  *	Add a value for an attribute to the dictionary.
  */
-int dict_addvalue(const char *namestr, const char *attrstr, int value)
+int dict_addvalue(char const *namestr, char const *attrstr, int value)
 {
 	size_t		length;
-	DICT_ATTR	*dattr;
+	DICT_ATTR const	*dattr;
 	DICT_VALUE	*dval;
 
-	static DICT_ATTR *last_attr = NULL;
+	static DICT_ATTR const *last_attr = NULL;
 
 	if (!*namestr) {
 		fr_strerror_printf("dict_addvalue: empty names are not permitted");
@@ -913,8 +1051,6 @@ int dict_addvalue(const char *namestr, const char *attrstr, int value)
 					   fr_int2str(dict_attr_types, dattr->type, "?Unknown?"));
 				return -1;
 		}
-
-		dattr->flags.has_value = 1;
 	} else {
 		value_fixup_t *fixup;
 
@@ -941,25 +1077,30 @@ int dict_addvalue(const char *namestr, const char *attrstr, int value)
 	/*
 	 *	Add the value into the dictionary.
 	 */
-	if (!fr_hash_table_insert(values_byname, dval)) {
-		if (dattr) {
-			DICT_VALUE *old;
+	{
+		DICT_ATTR *tmp;
+		memcpy(&tmp, &dval, sizeof(tmp));
 
-			/*
-			 *	Suppress duplicates with the same
-			 *	name and value.  There are lots in
-			 *	dictionary.ascend.
-			 */
-			old = dict_valbyname(dattr->attr, dattr->vendor, namestr);
-			if (old && (old->value == dval->value)) {
-				fr_pool_free(dval);
-				return 0;
+		if (!fr_hash_table_insert(values_byname, tmp)) {
+			if (dattr) {
+				DICT_VALUE *old;
+
+				/*
+				 *	Suppress duplicates with the same
+				 *	name and value.  There are lots in
+				 *	dictionary.ascend.
+				 */
+				old = dict_valbyname(dattr->attr, dattr->vendor, namestr);
+				if (old && (old->value == dval->value)) {
+					fr_pool_free(dval);
+					return 0;
+				}
 			}
-		}
 
-		fr_pool_free(dval);
-		fr_strerror_printf("dict_addvalue: Duplicate value name %s for attribute %s", namestr, attrstr);
-		return -1;
+			fr_pool_free(dval);
+			fr_strerror_printf("dict_addvalue: Duplicate value name %s for attribute %s", namestr, attrstr);
+			return -1;
+		}
 	}
 
 	/*
@@ -975,11 +1116,11 @@ int dict_addvalue(const char *namestr, const char *attrstr, int value)
 	return 0;
 }
 
-static int sscanf_i(const char *str, unsigned int *pvalue)
+static int sscanf_i(char const *str, unsigned int *pvalue)
 {
 	int rcode = 0;
 	int base = 10;
-	static const char *tab = "0123456789";
+	static char const *tab = "0123456789";
 
 	if ((str[0] == '0') &&
 	    ((str[1] == 'x') || (str[1] == 'X'))) {
@@ -990,7 +1131,7 @@ static int sscanf_i(const char *str, unsigned int *pvalue)
 	}
 
 	while (*str) {
-		const char *c;
+		char const *c;
 
 		if (*str == '.') break;
 
@@ -1021,12 +1162,12 @@ static int sscanf_i(const char *str, unsigned int *pvalue)
  *
  *	<whew>!  Are we crazy, or what?
  */
-int dict_str2oid(const char *ptr, unsigned int *pvalue, unsigned int *pvendor,
+int dict_str2oid(char const *ptr, unsigned int *pvalue, unsigned int *pvendor,
 		 int tlv_depth)
 {
-	const char *p;
+	char const *p;
 	unsigned int value;
-	DICT_ATTR *da;
+	DICT_ATTR const *da = NULL;
 
 	if (tlv_depth > fr_attr_max_tlv) {
 		fr_strerror_printf("Too many sub-attributes");
@@ -1040,10 +1181,10 @@ int dict_str2oid(const char *ptr, unsigned int *pvalue, unsigned int *pvendor,
 	if (*pvalue) {
 		da = dict_attrbyvalue(*pvalue, *pvendor);
 		if (!da) {
-			fr_strerror_printf("Parent attribute is undefined.");
+			fr_strerror_printf("Parent attribute is undefined");
 			return -1;
 		}
-		
+
 		if (!da->flags.has_tlv && !da->flags.extended) {
 			fr_strerror_printf("Parent attribute %s cannot have sub-attributes",
 					   da->name);
@@ -1066,7 +1207,7 @@ int dict_str2oid(const char *ptr, unsigned int *pvalue, unsigned int *pvendor,
 	 *	If we find it, re-write the parameters, and recurse.
 	 */
 	if (!*pvendor && (tlv_depth == 0) && (*pvalue == PW_VENDOR_SPECIFIC)) {
-		const DICT_VENDOR *dv;
+		DICT_VENDOR const *dv;
 
 		if (!p) {
 			fr_strerror_printf("VSA needs to have sub-attribute");
@@ -1080,7 +1221,7 @@ int dict_str2oid(const char *ptr, unsigned int *pvalue, unsigned int *pvendor,
 
 		if (*pvendor >= FR_MAX_VENDOR) {
 			fr_strerror_printf("Cannot handle vendor ID larger than 2^24");
-			
+
 			return -1;
 		}
 
@@ -1105,7 +1246,7 @@ int dict_str2oid(const char *ptr, unsigned int *pvalue, unsigned int *pvendor,
 		return -1;
 	}
 
-	if (!*pvendor && (tlv_depth == 1) &&
+	if (!*pvendor && (tlv_depth == 1) && da &&
 	    (da->flags.has_tlv || da->flags.extended)) {
 
 
@@ -1136,7 +1277,7 @@ int dict_str2oid(const char *ptr, unsigned int *pvalue, unsigned int *pvendor,
 /*
  *	Bamboo skewers under the fingernails in 5, 4, 3, 2, ...
  */
-static DICT_ATTR *dict_parent(unsigned int attr, unsigned int vendor)
+static DICT_ATTR const *dict_parent(unsigned int attr, unsigned int vendor)
 {
 	if (vendor < FR_MAX_VENDOR) {
 		return dict_attrbyvalue(attr & 0xff, vendor);
@@ -1153,9 +1294,10 @@ static DICT_ATTR *dict_parent(unsigned int attr, unsigned int vendor)
 /*
  *	Process the ATTRIBUTE command
  */
-static int process_attribute(const char* fn, const int line,
-			     unsigned int block_vendor, DICT_ATTR *block_tlv,
-			     int tlv_depth, char **argv, int argc)
+static int process_attribute(char const* fn, int const line,
+			     unsigned int block_vendor,
+			     DICT_ATTR const *block_tlv, int tlv_depth,
+			     char **argv, int argc)
 {
 	int		oid = 0;
 	unsigned int    vendor = 0;
@@ -1197,7 +1339,7 @@ static int process_attribute(const char* fn, const int line,
 	}
 
 	if (oid) {
-		DICT_ATTR *da;
+		DICT_ATTR const *da;
 
 		vendor = block_vendor;
 
@@ -1208,7 +1350,7 @@ static int process_attribute(const char* fn, const int line,
 			char buffer[256];
 
 			strlcpy(buffer, fr_strerror(), sizeof(buffer));
-			
+
 			fr_strerror_printf("dict_init: %s[%d]: Invalid attribute identifier: %s", fn, line, buffer);
 			return -1;
 		}
@@ -1242,7 +1384,7 @@ static int process_attribute(const char* fn, const int line,
 
 	} else {
 		type = PW_TYPE_OCTETS;
-		
+
 		p = strchr(argv[2] + 7, ']');
 		if (!p) {
 			fr_strerror_printf("dict_init: %s[%d]: Invalid format for octets", fn, line);
@@ -1307,7 +1449,6 @@ static int process_attribute(const char* fn, const int line,
 				fr_strerror_printf("dict_init: %s[%d]: Attributes of type \"extended\" MUST be RFC attributes with value >= 241.", fn, line);
 				return -1;
 			}
-			type = PW_TYPE_OCTETS;
 			flags.extended = 1;
 			break;
 
@@ -1316,13 +1457,11 @@ static int process_attribute(const char* fn, const int line,
 				fr_strerror_printf("dict_init: %s[%d]: Attributes of type \"long-extended\" MUST be RFC attributes with value >= 241.", fn, line);
 				return -1;
 			}
-			type = PW_TYPE_OCTETS;
 			flags.extended = 1;
 			flags.long_extended = 1;
 			break;
 
 		case PW_TYPE_EVS:
-			type = PW_TYPE_OCTETS;
 			flags.extended = 1;
 			flags.evs = 1;
 			if (value != PW_VENDOR_SPECIFIC) {
@@ -1363,7 +1502,7 @@ static int process_attribute(const char* fn, const int line,
 				/* Boolean flag, means this is a
 				   tagged attribute */
 				flags.has_tag = 1;
-				
+
 			} else if (strncmp(key, "encrypt=", 8) == 0) {
 				/* Encryption method, defaults to 0 (none).
 				   Currently valid is just type 2,
@@ -1382,10 +1521,10 @@ static int process_attribute(const char* fn, const int line,
 							    fn, line);
 					return -1;
 				}
-				
+
 			} else if (strncmp(key, "array", 6) == 0) {
 				flags.array = 1;
-				
+
 				switch (type) {
 					case PW_TYPE_IPADDR:
 					case PW_TYPE_BYTE:
@@ -1396,6 +1535,15 @@ static int process_attribute(const char* fn, const int line,
 
 					default:
 						fr_strerror_printf( "dict_init: %s[%d] Only IP addresses can have the \"array\" flag set.",
+							    fn, line);
+						return -1;
+				}
+
+			} else if (strncmp(key, "concat", 6) == 0) {
+				flags.concat = 1;
+
+				if (type != PW_TYPE_OCTETS) {
+						fr_strerror_printf( "dict_init: %s[%d] Only \"octets\" type can have the \"concat\" flag set.",
 							    fn, line);
 						return -1;
 				}
@@ -1474,7 +1622,7 @@ static int process_attribute(const char* fn, const int line,
 		}
 		flags.has_tlv = 1;
 	}
-	
+
 	if (block_tlv) {
 		/*
 		 *	TLV's can be only one octet.
@@ -1486,7 +1634,7 @@ static int process_attribute(const char* fn, const int line,
 		}
 
 		/*
-		 *	
+		 *
 		 */
 		value <<= fr_attr_shift[tlv_depth];
 		value |= block_tlv->attr;
@@ -1525,7 +1673,7 @@ static int process_attribute(const char* fn, const int line,
 /*
  *	Process the VALUE command
  */
-static int process_value(const char* fn, const int line, char **argv,
+static int process_value(char const* fn, int const line, char **argv,
 			 int argc)
 {
 	unsigned int	value;
@@ -1570,10 +1718,10 @@ static int process_value(const char* fn, const int line, char **argv,
  *	This allows VALUE mappings to be shared among multiple
  *	attributes.
  */
-static int process_value_alias(const char* fn, const int line, char **argv,
+static int process_value_alias(char const* fn, int const line, char **argv,
 			       int argc)
 {
-	DICT_ATTR *my_da, *da;
+	DICT_ATTR const *my_da, *da;
 	DICT_VALUE *dval;
 
 	if (argc != 2) {
@@ -1589,12 +1737,6 @@ static int process_value_alias(const char* fn, const int line, char **argv,
 		return -1;
 	}
 
-	if (my_da->flags.has_value) {
-		fr_strerror_printf("dict_init: %s[%d]: Cannot add VALUE-ALIAS to ATTRIBUTE \"%s\" with pre-existing VALUE",
-			   fn, line, argv[0]);
-		return -1;
-	}
-
 	if (my_da->flags.has_value_alias) {
 		fr_strerror_printf("dict_init: %s[%d]: Cannot add VALUE-ALIAS to ATTRIBUTE \"%s\" with pre-existing VALUE-ALIAS",
 			   fn, line, argv[0]);
@@ -1604,12 +1746,6 @@ static int process_value_alias(const char* fn, const int line, char **argv,
 	da = dict_attrbyname(argv[1]);
 	if (!da) {
 		fr_strerror_printf("dict_init: %s[%d]: Cannot find ATTRIBUTE \"%s\" for alias",
-			   fn, line, argv[1]);
-		return -1;
-	}
-
-	if (!da->flags.has_value) {
-		fr_strerror_printf("dict_init: %s[%d]: VALUE-ALIAS cannot refer to ATTRIBUTE %s: It has no values",
 			   fn, line, argv[1]);
 		return -1;
 	}
@@ -1650,12 +1786,12 @@ static int process_value_alias(const char* fn, const int line, char **argv,
 /*
  *	Process the VENDOR command
  */
-static int process_vendor(const char* fn, const int line, char **argv,
+static int process_vendor(char const* fn, int const line, char **argv,
 			  int argc)
 {
-	int	value;
-	int	continuation = 0;
-	const	char *format = NULL;
+	int		value;
+	int		continuation = 0;
+	char const	*format = NULL;
 
 	if ((argc < 2) || (argc > 3)) {
 		fr_strerror_printf( "dict_init: %s[%d] invalid VENDOR entry",
@@ -1703,7 +1839,7 @@ static int process_vendor(const char* fn, const int line, char **argv,
 
 	if (format) {
 		int type, length;
-		const char *p;
+		char const *p;
 		DICT_VENDOR *dv;
 
 		if (strncasecmp(format, "format=", 7) != 0) {
@@ -1815,16 +1951,30 @@ int str2argv(char *str, char **argv, int max_argc)
 	return argc;
 }
 
+static int my_dict_init(char const *parent, char const *filename,
+			char const *src_file, int src_line);
+
+int dict_read(char const *dir, char const *filename)
+{
+	if (!attributes_byname) {
+		fr_strerror_printf("Must call dict_init() before dict_read()");
+		return -1;
+	}
+
+	return my_dict_init(dir, filename, NULL, 0);
+}
+
+
 #define MAX_ARGV (16)
 
 /*
  *	Initialize the dictionary.
  */
-static int my_dict_init(const char *dir, const char *fn,
-			const char *src_file, int src_line)
+static int my_dict_init(char const *parent, char const *filename,
+			char const *src_file, int src_line)
 {
 	FILE	*fp;
-	char 	dirtmp[256];
+	char 	dir[256], fn[256];
 	char	buf[256];
 	char	*p;
 	int	line = 0;
@@ -1833,7 +1983,7 @@ static int my_dict_init(const char *dir, const char *fn,
 	struct stat statbuf;
 	char	*argv[MAX_ARGV];
 	int	argc;
-	DICT_ATTR *da, *block_tlv[MAX_TLV_NEST + 1];
+	DICT_ATTR const *da, *block_tlv[MAX_TLV_NEST + 1];
 	int	which_block_tlv = 0;
 
 	block_tlv[0] = NULL;
@@ -1841,32 +1991,60 @@ static int my_dict_init(const char *dir, const char *fn,
 	block_tlv[2] = NULL;
 	block_tlv[3] = NULL;
 
-	if (strlen(fn) >= sizeof(dirtmp) / 2 ||
-	    strlen(dir) >= sizeof(dirtmp) / 2) {
+	if ((strlen(parent) + 3 + strlen(filename)) > sizeof(dir)) {
 		fr_strerror_printf("dict_init: filename name too long");
 		return -1;
 	}
 
 	/*
-	 *	First see if fn is relative to dir. If so, create
-	 *	new filename. If not, remember the absolute dir.
+	 *	If it's an absolute dir, forget the parent dir,
+	 *	and remember the new one.
+	 *
+	 *	If it's a relative dir, tack on the current filename
+	 *	to the parent dir.  And use that.
 	 */
-	if ((p = strrchr(fn, FR_DIR_SEP)) != NULL) {
-		strcpy(dirtmp, fn);
-		dirtmp[p - fn] = 0;
-		dir = dirtmp;
-	} else if (dir && dir[0] && strcmp(dir, ".") != 0) {
-		snprintf(dirtmp, sizeof(dirtmp), "%s/%s", dir, fn);
-		fn = dirtmp;
+	if (!FR_DIR_IS_RELATIVE(filename)) {
+		strlcpy(dir, filename, sizeof(dir));
+		p = strrchr(dir, FR_DIR_SEP);
+		if (p) {
+			p[1] = '\0';
+		} else {
+			strlcat(dir, "/", sizeof(dir));
+		}
+
+		strlcpy(fn, filename, sizeof(fn));
+	} else {
+		strlcpy(dir, parent, sizeof(dir));
+		p = strrchr(dir, FR_DIR_SEP);
+		if (p) {
+			if (p[1]) strlcat(dir, "/", sizeof(dir));
+		} else {
+			strlcat(dir, "/", sizeof(dir));
+		}
+		strlcat(dir, filename, sizeof(dir));
+		p = strrchr(dir, FR_DIR_SEP);
+		if (p) {
+			p[1] = '\0';
+		} else {
+			strlcat(dir, "/", sizeof(dir));
+		}
+
+		p = strrchr(filename, FR_DIR_SEP);
+		if (p) {
+			snprintf(fn, sizeof(fn), "%s%s", dir, p);
+		} else {
+			snprintf(fn, sizeof(fn), "%s%s", dir, filename);
+		}
+
 	}
 
 	if ((fp = fopen(fn, "r")) == NULL) {
 		if (!src_file) {
 			fr_strerror_printf("dict_init: Couldn't open dictionary \"%s\": %s",
-				   fn, strerror(errno));
+				   fn, fr_syserror(errno));
 		} else {
 			fr_strerror_printf("dict_init: %s[%d]: Couldn't open dictionary \"%s\": %s",
-				   src_file, src_line, fn, strerror(errno));
+				   src_file, src_line, fn, fr_syserror(errno));
 		}
 		return -2;
 	}
@@ -1967,7 +2145,10 @@ static int my_dict_init(const char *dir, const char *fn,
 		if (strcasecmp(argv[0], "$INCLUDE-") == 0) {
 			int rcode = my_dict_init(dir, argv[1], fn, line);
 
-			if (rcode == -2) continue;
+			if (rcode == -2) {
+				fr_strerror_printf(NULL); /* reset error to nothing */
+				continue;
+			}
 
 			if (rcode < 0) {
 				fclose(fp);
@@ -2098,7 +2279,7 @@ static int my_dict_init(const char *dir, const char *fn,
 					fclose(fp);
 					return -1;
 				}
-				
+
 				p = argv[2] + 7;
 				da = dict_attrbyname(p);
 				if (!da) {
@@ -2114,7 +2295,7 @@ static int my_dict_init(const char *dir, const char *fn,
 					fclose(fp);
 					return -1;
 				}
-				
+
 				/*
 				 *	Pack the encapsulating
 				 *	attribute into the upper 8
@@ -2171,11 +2352,8 @@ static int my_dict_init(const char *dir, const char *fn,
 /*
  *	Empty callback for hash table initialization.
  */
-static int null_callback(void *ctx, void *data)
+static int null_callback(UNUSED void *ctx, UNUSED void *data)
 {
-	ctx = ctx;		/* -Wunused */
-	data = data;		/* -Wunused */
-
 	return 0;
 }
 
@@ -2184,7 +2362,7 @@ static int null_callback(void *ctx, void *data)
  *	Initialize the directory, then fix the attr member of
  *	all attributes.
  */
-int dict_init(const char *dir, const char *fn)
+int dict_init(char const *dir, char const *fn)
 {
 	/*
 	 *	Check if we need to change anything.  If not, don't do
@@ -2251,6 +2429,16 @@ int dict_init(const char *dir, const char *fn)
 		return -1;
 	}
 
+	/*
+	 *	Horrible hacks for combo-IP.
+	 */
+	attributes_combo = fr_hash_table_create(dict_attr_combo_hash,
+						dict_attr_combo_cmp,
+						fr_pool_free);
+	if (!attributes_combo) {
+		return -1;
+	}
+
 	values_byname = fr_hash_table_create(dict_value_name_hash,
 					       dict_value_name_cmp,
 					       fr_pool_free);
@@ -2271,7 +2459,7 @@ int dict_init(const char *dir, const char *fn)
 		return -1;
 
 	if (value_fixup) {
-		DICT_ATTR *a;
+		DICT_ATTR const *a;
 		value_fixup_t *this, *next;
 
 		for (this = value_fixup; this != NULL; this = next) {
@@ -2332,10 +2520,398 @@ int dict_init(const char *dir, const char *fn)
 	return 0;
 }
 
+static size_t print_attr_oid(char *buffer, size_t size, unsigned int attr,
+			     int dv_type)
+{
+	int nest;
+	size_t outlen;
+	size_t len;
+
+	switch (dv_type) {
+	case 4:
+		return snprintf(buffer, size, "%u", attr);
+
+	case 2:
+		return snprintf(buffer, size, "%u", attr & 0xffff);
+
+	default:
+	case 1:
+		len = snprintf(buffer, size, "%u", attr & 0xff);
+		break;
+	}
+
+	if ((attr >> 8) == 0) return len;
+
+	outlen = len;
+	buffer += len;
+	size -= len;
+
+	for (nest = 1; nest <= fr_attr_max_tlv; nest++) {
+		if (((attr >> fr_attr_shift[nest]) & fr_attr_mask[nest]) == 0) break;
+
+		len = snprintf(buffer, size, ".%u",
+			       (attr >> fr_attr_shift[nest]) & fr_attr_mask[nest]);
+
+		outlen = len;
+		buffer += len;
+		size -= len;
+	}
+
+	return outlen;
+}
+
+/** Free dynamically allocated (unknown attributes)
+ *
+ * If the da was dynamically allocated it will be freed, else the function
+ * will return without doing anything.
+ *
+ * @param da to free.
+ */
+void dict_attr_free(DICT_ATTR const **da)
+{
+	DICT_ATTR **tmp;
+
+	if (!da || !*da) return;
+
+	/* Don't free real DAs */
+	if (!(*da)->flags.is_unknown) {
+		return;
+	}
+
+	memcpy(&tmp, &da, sizeof(*tmp));
+	free(*tmp);
+
+	*tmp = NULL;
+}
+
+/** Copies a dictionary attr
+ *
+ * If the attr is dynamically allocated (unknown attribute), then it will be
+ * copied to a new attr.
+ *
+ * If the attr is known, a pointer to the da will be returned.
+ *
+ * @param da to copy.
+ * @param vp_free if true, da will be freed at the same time as the
+ *	VALUE_PAIR which contains it.
+ * @return return a copy of the da.
+ */
+DICT_ATTR const *dict_attr_copy(DICT_ATTR const *da, int vp_free)
+{
+	DICT_ATTR *copy;
+
+	if (!da) return NULL;
+
+	if (!da->flags.is_unknown) {
+		return da;
+	}
+
+	copy = malloc(DICT_ATTR_SIZE);
+	if (!copy) {
+		fr_strerror_printf("Out of memory");
+		return NULL;
+	}
+
+	memcpy(copy, da, DICT_ATTR_SIZE);
+	copy->flags.vp_free = (vp_free != 0);
+
+	return copy;
+}
+
+
+/** Allocs an dictionary attr for unknown attributes
+ *
+ * Allocates a dict attr for an unknown attribute/vendor/type
+ * without adding it to dictionary pools/hashes.
+ *
+ * @note Must be freed with dict_attr_free if not used as part of a valuepair.
+ *
+ * @param[in] attr number.
+ * @param[in] vendor number.
+ * @param[in] vp_free if > 0 DICT_ATTR will be freed on VALUE_PAIR free.
+ * @return new dictionary attribute.
+ */
+DICT_ATTR const *dict_attrunknown(unsigned int attr, unsigned int vendor,
+				  int vp_free)
+{
+	DICT_ATTR *da;
+	char *p;
+	int dv_type = 1;
+	size_t len = 0;
+	size_t bufsize = DICT_ATTR_MAX_NAME_LEN;
+
+	da = malloc(DICT_ATTR_SIZE);
+	if (!da) {
+		fr_strerror_printf("Out of memory");
+		return NULL;
+	}
+	memset(da, 0, DICT_ATTR_SIZE);
+
+	da->attr = attr;
+	da->vendor = vendor;
+	da->type = PW_TYPE_OCTETS;
+	da->flags.is_unknown = true;
+	da->flags.vp_free = (vp_free != 0);
+
+	/*
+	 *	Unknown attributes of the "WiMAX" vendor get marked up
+	 *	as being for WiMAX.
+	 */
+	if (vendor == VENDORPEC_WIMAX) {
+		da->flags.wimax = 1;
+	}
+
+	p = da->name;
+
+	len = snprintf(p, bufsize, "Attr-");
+	p += len;
+	bufsize -= len;
+
+	if (vendor > FR_MAX_VENDOR) {
+		len = snprintf(p, bufsize, "%u.", vendor / FR_MAX_VENDOR);
+		p += len;
+		bufsize -= len;
+		vendor &= (FR_MAX_VENDOR) - 1;
+	}
+
+	if (vendor) {
+		DICT_VENDOR *dv;
+
+		/*
+		 *	dv_type is the length of the vendor's type field
+		 *	RFC 2865 never defined a mandatory length, so
+		 *	different vendors have different length type fields.
+		 */
+		dv = dict_vendorbyvalue(vendor);
+		if (dv) {
+			dv_type = dv->type;
+		}
+		len = snprintf(p, bufsize, "26.%u.", vendor);
+
+		p += len;
+		bufsize -= len;
+	}
+
+	print_attr_oid(p, bufsize , attr, dv_type);
+
+	return da;
+}
+
+/** Create a DICT_ATTR from an ASCII attribute and value
+ *
+ * Where the attribute name is in the form:
+ *  - Attr-%d
+ *  - Attr-%d.%d.%d...
+ *  - Vendor-%d-Attr-%d
+ *  - VendorName-Attr-%d
+ *
+ * @todo should check attr/vendor against dictionary and return the real da.
+ *
+ * @param[in] attribute name.
+ * @param[in] vp_free if > 0 DICT_ATTR will be freed on VALUE_PAIR free.
+ * @return new da or NULL on error.
+ */
+DICT_ATTR const *dict_attrunknownbyname(char const *attribute, int vp_free)
+{
+	unsigned int   	attr, vendor = 0;
+	unsigned int    dv_type = 1;	/* The type of vendor field */
+
+	char const	*p = attribute;
+	char		*q;
+
+	DICT_VENDOR	*dv;
+	DICT_ATTR const	*da;
+
+	/*
+	 *	Pull off vendor prefix first.
+	 */
+	if (strncasecmp(p, "Attr-", 5) != 0) {
+		if (strncasecmp(p, "Vendor-", 7) == 0) {
+			vendor = (int) strtol(p + 7, &q, 10);
+			if ((vendor == 0) || (vendor > FR_MAX_VENDOR)) {
+				fr_strerror_printf("Invalid vendor value in "
+						   "attribute name \"%s\"",
+						   attribute);
+				return NULL;
+			}
+
+			p = q;
+
+		/* must be vendor name */
+		} else {
+			char buffer[256];
+
+			q = strchr(p, '-');
+
+			if (!q) {
+				fr_strerror_printf("Invalid vendor name in "
+						   "attribute name \"%s\"",
+						   attribute);
+				return NULL;
+			}
+
+			if ((size_t) (q - p) >= sizeof(buffer)) {
+				fr_strerror_printf("Vendor name too long "
+						   "in attribute name \"%s\"",
+						   attribute);
+				return NULL;
+			}
+
+			memcpy(buffer, p, (q - p));
+			buffer[q - p] = '\0';
+
+			vendor = dict_vendorbyname(buffer);
+			if (!vendor) {
+				fr_strerror_printf("Unknown vendor name in "
+						   "attribute name \"%s\"",
+						   attribute);
+				return NULL;
+			}
+
+			p = q;
+		}
+
+		if (*p != '-') {
+			fr_strerror_printf("Invalid text following vendor "
+					   "definition in attribute name "
+					   "\"%s\"", attribute);
+			return NULL;
+		}
+		p++;
+	}
+
+	/*
+	 *	Attr-%d
+	 */
+	if (strncasecmp(p, "Attr-", 5) != 0) {
+		fr_strerror_printf("Invalid format in attribute name \"%s\"",
+				   attribute);
+		return NULL;
+	}
+
+	attr = strtol(p + 5, &q, 10);
+
+	/*
+	 *	Invalid attribute.
+	 */
+	if (attr == 0) {
+		fr_strerror_printf("Invalid value in attribute name \"%s\"",
+				   attribute);
+		return NULL;
+	}
+
+	p = q;
+
+	/*
+	 *	Vendor-%d-Attr-%d
+	 *	VendorName-Attr-%d
+	 *	Attr-%d
+	 *	Attr-%d.
+	 *
+	 *	Anything else is invalid.
+	 */
+	if (((vendor != 0) && (*p != '\0')) ||
+	    ((vendor == 0) && *p && (*p != '.'))) {
+	invalid:
+		fr_strerror_printf("Invalid OID");
+		return NULL;
+	}
+
+	/*
+	 *	Look for OIDs.  Require the "Attr-26.Vendor-Id.type"
+	 *	format, and disallow "Vendor-%d-Attr-%d" and
+	 *	"VendorName-Attr-%d"
+	 *
+	 *	This section parses the Vendor-Id portion of
+	 *	Attr-%d.%d.  where the first number is 26, *or* an
+	 *	extended attribute of the "evs" data type.
+	 */
+	if (*p == '.') {
+		da = dict_attrbyvalue(attr, 0);
+		if (!da) {
+			fr_strerror_printf("Cannot parse attributes without "
+					   "dictionaries");
+			return NULL;
+		}
+
+		if ((attr != PW_VENDOR_SPECIFIC) &&
+		    !(da->flags.extended || da->flags.long_extended)) {
+			fr_strerror_printf("Standard attributes cannot use "
+					   "OIDs");
+			return NULL;
+		}
+
+		if ((attr == PW_VENDOR_SPECIFIC) || da->flags.evs) {
+			vendor = strtol(p + 1, &q, 10);
+			if ((vendor == 0) || (vendor > FR_MAX_VENDOR)) {
+				fr_strerror_printf("Invalid vendor");
+				return NULL;
+			}
+
+			if (*q != '.') goto invalid;
+
+			p = q;
+
+			if (da->flags.evs) {
+				vendor |= attr * FR_MAX_VENDOR;
+			}
+			attr = 0;
+		} /* else the second number is a TLV number */
+	}
+
+	/*
+	 *	Get the expected maximum size of the attribute.
+	 */
+	if (vendor) {
+		dv = dict_vendorbyvalue(vendor & (FR_MAX_VENDOR - 1));
+		if (dv) {
+			dv_type = dv->type;
+			if (dv_type > 3) dv_type = 3; /* hack */
+		}
+	}
+
+	/*
+	 *	Parse the next number.  It could be a Vendor-Type
+	 *	of 1..2^24, or it could be a TLV.
+	 */
+	if (*p == '.') {
+		attr = strtol(p + 1, &q, 10);
+		if (attr == 0) {
+			fr_strerror_printf("Invalid attribute number");
+			return NULL;
+		}
+
+		if (*q) {
+			if (*q != '.') {
+				goto invalid;
+			}
+
+			if (dv_type != 1) {
+				goto invalid;
+			}
+		}
+
+		p = q;
+	}
+
+	/*
+	 *	Enforce a maximum value on the attribute number.
+	 */
+	if (attr >= (unsigned) (1 << (dv_type << 3))) goto invalid;
+
+	if (*p == '.') {
+		if (dict_str2oid(p + 1, &attr, &vendor, 1) < 0) {
+			return NULL;
+		}
+	}
+
+	return dict_attrunknown(attr, vendor, vp_free);
+}
+
 /*
  *	Get an attribute by its numerical value.
  */
-DICT_ATTR *dict_attrbyvalue(unsigned int attr, unsigned int vendor)
+DICT_ATTR const *dict_attrbyvalue(unsigned int attr, unsigned int vendor)
 {
 	DICT_ATTR dattr;
 
@@ -2347,10 +2923,133 @@ DICT_ATTR *dict_attrbyvalue(unsigned int attr, unsigned int vendor)
 	return fr_hash_table_finddata(attributes_byvalue, &dattr);
 }
 
+
+/**
+ * @brief Get an attribute by its numerical value. and data type
+ *
+ *	Used only for COMBO_IP
+ *
+ * @return The attribute, or NULL if not found
+ */
+DICT_ATTR const *dict_attrbytype(unsigned int attr, unsigned int vendor,
+				 PW_TYPE type)
+{
+	DICT_ATTR dattr;
+
+	dattr.attr = attr;
+	dattr.vendor = vendor;
+	dattr.type = type;
+
+	return fr_hash_table_finddata(attributes_combo, &dattr);
+}
+
+/**
+ * @brief Using a parent and attr/vendor, find a child attr/vendor
+ */
+int dict_attr_child(DICT_ATTR const *parent,
+		    unsigned int *pattr, unsigned int *pvendor)
+{
+	unsigned int attr, vendor;
+	DICT_ATTR dattr;
+
+	if (!parent || !pattr || !pvendor) return false;
+
+	attr = *pattr;
+	vendor = *pvendor;
+
+	/*
+	 *	Only some types can have children
+	 */
+	switch (parent->type) {
+	default: return false;
+
+	case PW_TYPE_VSA:
+	case PW_TYPE_TLV:
+	case PW_TYPE_EVS:
+	case PW_TYPE_EXTENDED:
+	case PW_TYPE_LONG_EXTENDED:
+	  break;
+	}
+
+	if ((vendor == 0) && (parent->vendor != 0)) return false;
+
+	/*
+	 *	Bootstrap by starting off with the parents values.
+	 */
+	dattr.attr = parent->attr;
+	dattr.vendor = parent->vendor;
+
+	/*
+	 *	Do various butchery to insert the "attr" value.
+	 *
+	 *	00VID	000000AA	normal VSA for vendor VID
+	 *	00VID	DDCCBBAA	normal VSAs with TLVs
+	 *	EE000   000000AA	extended attr (241.1)
+	 *	EE000	DDCCBBAA	extended attr with TLVs
+	 *	EEVID	000000AA	EVS with vendor VID, attr AAA
+	 *	EEVID	DDCCBBAA	EVS with TLVs
+	 */
+	if (!dattr.vendor) {
+		dattr.vendor = parent->attr * FR_MAX_VENDOR;
+		dattr.vendor |= vendor;
+		dattr.attr = attr;
+
+	} else {
+		int i;
+
+		/*
+		 *	Trying to nest too deep.  It's an error
+		 */
+		if (parent->attr & (fr_attr_mask[MAX_TLV_NEST] << fr_attr_shift[MAX_TLV_NEST])) {
+			return false;
+		}
+
+		for (i = MAX_TLV_NEST - 1; i >= 0; i--) {
+			if ((parent->attr & (fr_attr_mask[i] << fr_attr_shift[i]))) {
+				dattr.attr |= (attr & fr_attr_mask[i + 1]) << fr_attr_shift[i + 1];
+				goto find;
+			}
+		}
+
+		return false;
+	}
+
+find:
+#if 0
+	fprintf(stderr, "LOOKING FOR %08x %08x + %08x %08x --> %08x %08x\n",
+		parent->vendor, parent->attr, attr, vendor,
+		dattr.vendor, dattr.attr);
+#endif
+
+	*pattr = dattr.attr;
+	*pvendor = dattr.vendor;
+	return true;
+}
+
+/*
+ *	Get an attribute by it's numerical value, and the parent
+ */
+DICT_ATTR const *dict_attrbyparent(DICT_ATTR const *parent, unsigned int attr, unsigned int vendor)
+{
+	unsigned int my_attr, my_vendor;
+	DICT_ATTR dattr;
+
+	my_attr = attr;
+	my_vendor = vendor;
+
+	if (!dict_attr_child(parent, &my_attr, &my_vendor)) return NULL;
+
+	dattr.attr = my_attr;
+	dattr.vendor = my_vendor;
+
+	return fr_hash_table_finddata(attributes_byvalue, &dattr);
+}
+
+
 /*
  *	Get an attribute by its name.
  */
-DICT_ATTR *dict_attrbyname(const char *name)
+DICT_ATTR const *dict_attrbyname(char const *name)
 {
 	DICT_ATTR *da;
 	uint32_t buffer[(sizeof(*da) + DICT_ATTR_MAX_NAME_LEN + 3)/4];
@@ -2392,7 +3091,7 @@ DICT_VALUE *dict_valbyattr(unsigned int attr, unsigned int vendor, int value)
 /*
  *	Associate a value with an attribute and return it.
  */
-const char *dict_valnamebyattr(unsigned int attr, unsigned int vendor, int value)
+char const *dict_valnamebyattr(unsigned int attr, unsigned int vendor, int value)
 {
 	DICT_VALUE *dv;
 
@@ -2405,7 +3104,7 @@ const char *dict_valnamebyattr(unsigned int attr, unsigned int vendor, int value
 /*
  *	Get a value by its name, keyed off of an attribute.
  */
-DICT_VALUE *dict_valbyname(unsigned int attr, unsigned int vendor, const char *name)
+DICT_VALUE *dict_valbyname(unsigned int attr, unsigned int vendor, char const *name)
 {
 	DICT_VALUE *my_dv, *dv;
 	uint32_t buffer[(sizeof(*my_dv) + DICT_VALUE_MAX_NAME_LEN + 3)/4];
@@ -2434,10 +3133,10 @@ DICT_VALUE *dict_valbyname(unsigned int attr, unsigned int vendor, const char *n
  *
  *	This is efficient only for small numbers of vendors.
  */
-int dict_vendorbyname(const char *name)
+int dict_vendorbyname(char const *name)
 {
 	DICT_VENDOR *dv;
-	uint32_t buffer[(sizeof(*dv) + DICT_VENDOR_MAX_NAME_LEN + 3)/4];
+	size_t buffer[(sizeof(*dv) + DICT_VENDOR_MAX_NAME_LEN + sizeof(size_t) - 1) / sizeof(size_t)];
 
 	if (!name) return 0;
 

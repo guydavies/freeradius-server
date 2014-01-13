@@ -20,11 +20,9 @@
  * Copyright (C) 2009 Dante http://dante.net
  */
 
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include	<freeradius-devel/libradius.h>
-#include	<freeradius-devel/tcp.h>
 
 #ifdef WITH_TCP
 
@@ -72,27 +70,32 @@ int fr_tcp_socket(fr_ipaddr_t *ipaddr, int port)
 #ifdef IPV6_V6ONLY
 
 		if (IN6_IS_ADDR_UNSPECIFIED(&ipaddr->ipaddr.ip6addr)) {
-			setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY,
-				   (char *)&on, sizeof(on));
+			if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY,
+				       (char *)&on, sizeof(on)) < 0) {
+				fr_strerror_printf("Failed in setsockopt(): %s",
+						   fr_syserror(errno));
+				close(sockfd);
+				return -1;
+			}
 		}
 #endif /* IPV6_V6ONLY */
 	}
 #endif /* HAVE_STRUCT_SOCKADDR_IN6 */
 
 	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
-		fr_strerror_printf("Failed in setsockopt(): %s", strerror(errno));
+		fr_strerror_printf("Failed in setsockopt(): %s", fr_syserror(errno));
 		close(sockfd);
 		return -1;
 	}
- 
+
 	if (bind(sockfd, (struct sockaddr *) &salocal, salen) < 0) {
-		fr_strerror_printf("Failed in bind(): %s", strerror(errno));
+		fr_strerror_printf("Failed in bind(): %s", fr_syserror(errno));
 		close(sockfd);
 		return -1;
 	}
 
 	if (listen(sockfd, 8) < 0) {
-		fr_strerror_printf("Failed in listen(): %s", strerror(errno));
+		fr_strerror_printf("Failed in listen(): %s", fr_syserror(errno));
 		close(sockfd);
 		return -1;
 	}
@@ -128,18 +131,16 @@ int fr_tcp_client_socket(fr_ipaddr_t *src_ipaddr,
 #ifdef O_NONBLOCK
 	{
 		int flags;
-		
+
 		if ((flags = fcntl(sockfd, F_GETFL, NULL)) < 0)  {
-			fr_strerror_printf("Failure getting socket flags: %s",
-				   strerror(errno));
+			fr_strerror_printf("Failure getting socket flags: %s", fr_syserror(errno));
 			close(sockfd);
 			return -1;
 		}
-		
+
 		flags |= O_NONBLOCK;
 		if( fcntl(sockfd, F_SETFL, flags) < 0) {
-			fr_strerror_printf("Failure setting socket flags: %s",
-				   strerror(errno));
+			fr_strerror_printf("Failure setting socket flags: %s", fr_syserror(errno));
 			close(sockfd);
 			return -1;
 		}
@@ -154,10 +155,9 @@ int fr_tcp_client_socket(fr_ipaddr_t *src_ipaddr,
 			close(sockfd);
 			return -1;
 		}
-		
+
 		if (bind(sockfd, (struct sockaddr *) &salocal, salen) < 0) {
-			fr_strerror_printf("Failure binding to IP: %s",
-					   strerror(errno));
+			fr_strerror_printf("Failure binding to IP: %s", fr_syserror(errno));
 			close(sockfd);
 			return -1;
 		}
@@ -174,7 +174,7 @@ int fr_tcp_client_socket(fr_ipaddr_t *src_ipaddr,
 	 *	socket is ready...
 	 */
 	if (connect(sockfd, (struct sockaddr *) &salocal, salen) < 0) {
-		fr_strerror_printf("Failed in connect(): %s", strerror(errno));
+		fr_strerror_printf("Failed in connect(): %s", fr_syserror(errno));
 		close(sockfd);
 		return -1;
 	}
@@ -185,7 +185,7 @@ int fr_tcp_client_socket(fr_ipaddr_t *src_ipaddr,
 
 RADIUS_PACKET *fr_tcp_recv(int sockfd, int flags)
 {
-	RADIUS_PACKET *packet = rad_alloc(0);
+	RADIUS_PACKET *packet = rad_alloc(NULL, 0);
 
 	if (!packet) return NULL;
 
@@ -235,8 +235,7 @@ int fr_tcp_read_packet(RADIUS_PACKET *packet, int flags)
 #endif
 
 		if (len < 0) {
-			fr_strerror_printf("Error receiving packet: %s",
-				   strerror(errno));
+			fr_strerror_printf("Error receiving packet: %s", fr_syserror(errno));
 			return -1;
 		}
 
@@ -248,7 +247,7 @@ int fr_tcp_read_packet(RADIUS_PACKET *packet, int flags)
 		packet_len = (packet->vector[2] << 8) | packet->vector[3];
 
 		if (packet_len < AUTH_HDR_LEN) {
-			fr_strerror_printf("Discarding packet: Smaller than RFC minimum of 20 bytes.");
+			fr_strerror_printf("Discarding packet: Smaller than RFC minimum of 20 bytes");
 			return -1;
 		}
 
@@ -256,11 +255,11 @@ int fr_tcp_read_packet(RADIUS_PACKET *packet, int flags)
 		 *	If the packet is too big, then the socket is bad.
 		 */
 		if (packet_len > MAX_PACKET_LEN) {
-			fr_strerror_printf("Discarding packet: Larger than RFC limitation of 4096 bytes.");
+			fr_strerror_printf("Discarding packet: Larger than RFC limitation of 4096 bytes");
 			return -1;
 		}
-		
-		packet->data = malloc(packet_len);
+
+		packet->data = talloc_array(packet, uint8_t, packet_len);
 		if (!packet->data) {
 			fr_strerror_printf("Out of memory");
 			return -1;
@@ -285,7 +284,7 @@ int fr_tcp_read_packet(RADIUS_PACKET *packet, int flags)
 #endif
 
 	if (len < 0) {
-		fr_strerror_printf("Error receiving packet: %s", strerror(errno));
+		fr_strerror_printf("Error receiving packet: %s", fr_syserror(errno));
 		return -1;
 	}
 
@@ -298,7 +297,7 @@ int fr_tcp_read_packet(RADIUS_PACKET *packet, int flags)
 	/*
 	 *	See if it's a well-formed RADIUS packet.
 	 */
-	if (!rad_packet_ok(packet, flags)) {
+	if (!rad_packet_ok(packet, flags, NULL)) {
 		return -1;
 	}
 
@@ -341,7 +340,7 @@ RADIUS_PACKET *fr_tcp_accept(int sockfd)
 	socklen_t salen;
 	RADIUS_PACKET *packet;
 	struct sockaddr_storage src;
-	
+
 	salen = sizeof(src);
 
 	newfd = accept(sockfd, (struct sockaddr *) &src, &salen);
@@ -351,7 +350,7 @@ RADIUS_PACKET *fr_tcp_accept(int sockfd)
 		 */
 #ifdef EWOULDBLOCK
 		if (errno == EWOULDBLOCK) {
-			packet = rad_alloc(0);
+			packet = rad_alloc(NULL, 0);
 			if (!packet) return NULL;
 
 			packet->sockfd = sockfd;
@@ -362,9 +361,12 @@ RADIUS_PACKET *fr_tcp_accept(int sockfd)
 
 		return NULL;
 	}
-		
-	packet = rad_alloc(0);
-	if (!packet) return NULL;
+
+	packet = rad_alloc(NULL, 0);
+	if (!packet) {
+		close(newfd);
+		return NULL;
+	}
 
 	if (src.ss_family == AF_INET) {
 		struct sockaddr_in	s4;
@@ -386,6 +388,7 @@ RADIUS_PACKET *fr_tcp_accept(int sockfd)
 #endif
 	} else {
 		rad_free(&packet);
+		close(newfd);
 		return NULL;
 	}
 

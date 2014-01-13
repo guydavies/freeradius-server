@@ -18,7 +18,21 @@ datadir		= @datadir@
 dictdir		= $(datadir)/freeradius
 logdir		= @logdir@
 includedir	= @includedir@
+
+#
+#  In some systems, we don't want to over-write ANY configuration.
+#  So we do:
+#
+#	$./configure
+#	$ make
+#	$ make -Draddbdir=/tmp/garbage install
+#
+#  and all of the configuration files go into /tmp/garbage
+#
+ifeq "${raddbdir}" ""
 raddbdir	= @raddbdir@
+endif
+modconfdir	= @modconfdir@
 radacctdir	= @radacctdir@
 top_builddir	= @abs_top_builddir@
 top_build_prefix=@abs_top_builddir@/
@@ -29,18 +43,23 @@ MAKE		= @MAKE@
 
 # Makeflags set within the makefile appear to be additive and override
 # flags set on the command line and the environmental variables
-MAKEFLAGS	= @MAKEFLAGS@
+MAKEFLAGS	= @FR_MAKEFLAGS@
 
 CC		= @CC@
 RANLIB		= @RANLIB@
-IMACROS		= -imacros ${top_srcdir}/src/freeradius-devel/autoconf.h -imacros ${top_srcdir}/src/freeradius-devel/features.h
+IMACROS		= \
+-imacros ${top_srcdir}/src/freeradius-devel/build.h \
+-imacros ${top_srcdir}/src/freeradius-devel/autoconf.h \
+-imacros ${top_srcdir}/src/freeradius-devel/features.h \
+-imacros ${top_srcdir}/src/freeradius-devel/radpaths.h
+
 INCLUDE		= -I${top_srcdir} -I${top_srcdir}/src
-CFLAGS		= $(IMACROS) $(INCLUDE) @CFLAGS@
+CFLAGS		= $(IMACROS) $(INCLUDE) -std=c99 -fno-strict-aliasing @CFLAGS@
 CPPFLAGS	= @CPPFLAGS@
 LIBPREFIX	= @LIBPREFIX@
 EXEEXT		= @EXEEXT@
 
-LIBTOOL		= @LIBTOOL@
+LIBTOOL		= JLIBTOOL
 ACLOCAL		= @ACLOCAL@
 AUTOCONF	= @AUTOCONF@
 AUTOHEADER	= @AUTOHEADER@
@@ -49,40 +68,47 @@ INSTALL_PROGRAM	= ${INSTALL}
 INSTALL_DATA	= ${INSTALL} -m 644
 INSTALL_SCRIPT	= ${INSTALL_PROGRAM}
 INSTALLSTRIP	= @INSTALLSTRIP@
+DARWIN_CFLAGS	= @DARWIN_CFLAGS@
+
+#
+#  Linker arguments for libraries searched for by the main
+#  configure script.
+#
+TALLOC_LIBS     = @TALLOC_LIBS@
+TALLOC_LDFLAGS  = @TALLOC_LDFLAGS@
+
+OPENSSL_LIBS    = @OPENSSL_LIBS@
+OPENSSL_LDFLAGS = @OPENSSL_LDFLAGS@
+
+PCAP_LIBS	= @PCAP_LIBS@
+PCAP_LDFLAGS    = @PCAP_LDFLAGS@
+
+COLLECTDC_LIBS	= @COLLECTDC_LIBS@
+COLLECTDC_LDFLAGS = @COLLECTDC_LDFLAGS@
 
 LCRYPT		= @CRYPTLIB@
-LIBS		= @LIBS@
-LDFLAGS		= @LDFLAGS@
+
+#
+#  OpenSSL libs (if used) must be linked everywhere in order for
+#  the server to work properly on on all platforms.
+#
+LIBS		= $(OPENSSL_LIBS) $(TALLOC_LIBS) @LIBS@
+LDFLAGS		= $(OPENSSL_LDFLAGS) $(TALLOC_LDFLAGS) @LDFLAGS@
 
 LOGDIR		= ${logdir}
 RADDBDIR	= ${raddbdir}
 RUNDIR		= ${localstatedir}/run/radiusd
 SBINDIR		= ${sbindir}
 RADIR		= ${radacctdir}
-LIBRADIUS	= $(top_builddir)/src/lib/$(LIBPREFIX)freeradius-radius.la
+LIBRADIUS	= $(top_builddir)/src/lib/$(LIBPREFIX)freeradius-radius.la $(TALLOC_LIBS)
 
-LIBLTDL		= @LIBLTDL@
-INCLTDL		= @INCLTDL@
-CFLAGS		+= $(INCLTDL)
+USE_SHARED_LIBS = @USE_SHARED_LIBS@
+bm_shared_libs  = @USE_SHARED_LIBS@
+USE_STATIC_LIBS = @USE_STATIC_LIBS@
+bm_static_libs  = @USE_STATIC_LIBS@
 
-#USE_SHARED_LIBS = @USE_SHARED_LIBS@
-#USE_STATIC_LIBS = @USE_STATIC_LIBS@
-
-USE_SHARED_LIBS = yes
-USE_STATIC_LIBS = yes
 STATIC_MODULES	= @STATIC_MODULES@
-
-OPENSSL_LIBS	= @OPENSSL_LIBS@
-OPENSSL_INCLUDE = @OPENSSL_INCLUDE@
-CFLAGS		+= $(OPENSSL_INCLUDE)
-
 LIBREADLINE	= @LIBREADLINE@
-
-#
-#  SQL driver defines
-#
-SQL_ODBC_LIBS = @ODBC_LIBS@
-SQL_ODBC_INCLUDE = @ODBC_INCLUDE@
 
 #
 #  Version to use for packaging and other Make related things
@@ -90,14 +116,22 @@ SQL_ODBC_INCLUDE = @ODBC_INCLUDE@
 RADIUSD_VERSION_STRING = @RADIUSD_VERSION_STRING@
 
 #
-#  This allows dlopen to do runtime checks for version mistmatches
+#  This allows dlopen to do runtime checks for version mismatches
 #  between what it was originally linked with, and the library it's
 #  actually loading.
 #
-#LDFLAGS += -release=$(RADIUSD_VERSION_STRING)
-
 MODULES		= @MODULES@
 HOSTINFO	= @HOSTINFO@
+
+#
+#  If the system has OpenSSL, use it's version of MD4/MD5/SHA1, instead of
+#  using ours.
+#
+ifeq "$(WITH_OPENSSL)" "yes"
+CFLAGS		+=  -DWITH_OPENSSL_MD4 -DWITH_OPENSSL_MD5
+endif
+
+OPENSSL_LIBS	= @OPENSSL_LIBS@
 
 ifneq ($(WITH_OPENSSL_MD5),)
 LIBRADIUS_WITH_OPENSSL = 1
@@ -119,11 +153,11 @@ endif
 
 #  http://clang.llvm.org/StaticAnalysis.html
 #
-#  $ make SCAN=/path/to/checker/ 
+#  $ make SCAN=/path/to/checker/
 #
 ifneq ($(SCAN),)
 CC		:= $(SCAN)/scan-build gcc -DFR_SCAN_BUILD
-LIBTOOL		:= 
+LIBTOOL		:=
 endif
 
 #
@@ -138,7 +172,7 @@ LINK_MODE.exe	= -static
 endif
 
 ifneq "$(LIBTOOL)" ""
-COMPILE.c	:= $(LIBTOOL) --quiet --mode=compile $(CC) 
+COMPILE.c	:= $(LIBTOOL) --quiet --mode=compile $(CC)
 LINK.lib	:= $(LIBTOOL) --quiet --mode=link $(CC) -rpath $(libdir) -o
 LO		:= lo
 LA		:= la
@@ -162,24 +196,24 @@ LA		:= dylib
 endif
 endif
 
+# Path to clang, setting this enables the 'scan.*' build targets
+# which perform static analysis on various server components.
+ANALYZE.c       := @clang_path@
 
-BOILER = @boilermake@
+ifeq "${CC}" "clang"
+    ifeq "${ANALYZE.c}" ""
+        ANALYZE.c := "${CC}"
+    endif
+endif
 
-ifneq "$(BOILER)" "yes"
-all: $(top_srcdir)/scripts/jlibtool
-
-$(top_srcdir)/scripts/jlibtool: $(top_srcdir)/scripts/jlibtool.c
-	$(CC) $^ -o $@
-
-# Add -module for normal libtool.  It doesn't like building "foo.la"
-# as a library unless you tell it to shut up, yes, I KNOW this is a module
-ifeq "$(findstring jlibtool,$(LIBTOOL))" ""
-  RLM_MOD = -module
+#
+#  With shared libs, the test binaries are in a different place
+#  AND the method we use to run those binaries changes.
+#
+ifeq "$(USE_SHARED_LIBS)" "yes"
+	TESTBINDIR = ./$(BUILD_DIR)/bin/local
+	TESTBIN    = $(JLIBTOOL) --quiet --mode=execute $(TESTBINDIR)
 else
-  MOD_RPATH = -rpath $(libdir)
-endif
-
-ifeq "$(LIBTOOL)" ""
-$(error Building FreeRADIUS requires libtool)
-endif
+	TESTBINDIR = ./$(BUILD_DIR)/bin
+	TESTBIN    = ./$(BUILD_DIR)/bin
 endif

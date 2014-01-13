@@ -14,15 +14,14 @@
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  *
  */
- 
-/** 
+
+/**
  * $Id$
  * @file rlm_always.c
  * @brief Return preconfigured fixed rcodes.
  *
  * @copyright 2000,2006  The FreeRADIUS server project
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -36,30 +35,24 @@ typedef struct rlm_always_t {
 	char		*rcode_str;
 	rlm_rcode_t	rcode;
 	int		simulcount;
-	int		mpp;
+	bool		mpp;
 } rlm_always_t;
 
 /*
  *	A mapping of configuration file names to internal variables.
- *
- *	Note that the string is dynamically allocated, so it MUST
- *	be freed.  When the configuration file parse re-reads the string,
- *	it free's the old one, and strdup's the new one, placing the pointer
- *	to the strdup'd string into 'config.string'.  This gets around
- *	buffer over-flows.
  */
 static const CONF_PARSER module_config[] = {
   { "rcode",      PW_TYPE_STRING_PTR, offsetof(rlm_always_t,rcode_str),
     NULL, "fail" },
   { "simulcount", PW_TYPE_INTEGER,    offsetof(rlm_always_t,simulcount),
     NULL, "0" },
-  { "mpp",        PW_TYPE_BOOLEAN,    offsetof(rlm_always_t,mpp),
+  { "mpp",	PW_TYPE_BOOLEAN,    offsetof(rlm_always_t,mpp),
     NULL, "no" },
 
   { NULL, -1, 0, NULL, NULL }		/* end the list */
 };
 
-static rlm_rcode_t str2rcode(const char *s)
+static rlm_rcode_t str2rcode(char const *s)
 {
 	if(!strcasecmp(s, "reject"))
 		return RLM_MODULE_REJECT;
@@ -80,44 +73,22 @@ static rlm_rcode_t str2rcode(const char *s)
 	else if(!strcasecmp(s, "updated"))
 		return RLM_MODULE_UPDATED;
 	else {
-		radlog(L_ERR|L_CONS,
-			"rlm_always: Unknown module rcode '%s'.\n", s);
+		ERROR("rlm_always: Unknown module rcode '%s'.\n", s);
 		return RLM_MODULE_UNKNOWN;
 	}
 }
 
-static int always_instantiate(CONF_SECTION *conf, void **instance)
+static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
 {
-	rlm_always_t *data;
-
-	/*
-	 *	Set up a storage area for instance data
-	 */
-	data = rad_malloc(sizeof(*data));
-	if (!data) {
-		return -1;
-	}
-	memset(data, 0, sizeof(*data));
-
-	/*
-	 *	If the configuration parameters can't be parsed, then
-	 *	fail.
-	 */
-	if (cf_section_parse(conf, data, module_config) < 0) {
-		free(data);
-		return -1;
-	}
+	rlm_always_t *inst = instance;
 
 	/*
 	 *	Convert the rcode string to an int, and get rid of it
 	 */
-	data->rcode = str2rcode(data->rcode_str);
-	if (data->rcode == RLM_MODULE_UNKNOWN) {
-		free(data);
+	inst->rcode = str2rcode(inst->rcode_str);
+	if (inst->rcode == RLM_MODULE_UNKNOWN) {
 		return -1;
 	}
-
-	*instance = data;
 
 	return 0;
 }
@@ -135,7 +106,7 @@ static rlm_rcode_t always_return(void *instance, UNUSED REQUEST *request)
 /*
  *	checksimul fakes some other variables besides the rcode...
  */
-static rlm_rcode_t always_checksimul(void *instance, REQUEST *request)
+static rlm_rcode_t mod_checksimul(void *instance, REQUEST *request)
 {
 	struct rlm_always_t *inst = instance;
 
@@ -148,25 +119,21 @@ static rlm_rcode_t always_checksimul(void *instance, REQUEST *request)
 }
 #endif
 
-static int always_detach(void *instance)
-{
-	free(instance);
-	return 0;
-}
-
 module_t rlm_always = {
 	RLM_MODULE_INIT,
 	"always",
 	RLM_TYPE_CHECK_CONFIG_SAFE,   	/* type */
-	always_instantiate,		/* instantiation */
-	always_detach,			/* detach */
+	sizeof(rlm_always_t),		/* config size */
+	module_config,			/* configuration */
+	mod_instantiate,		/* instantiation */
+	NULL,				/* detach */
 	{
 		always_return,		/* authentication */
 		always_return,		/* authorization */
 		always_return,		/* preaccounting */
 		always_return,		/* accounting */
 #ifdef WITH_SESSION_MGMT
-		always_checksimul,	/* checksimul */
+		mod_checksimul,	/* checksimul */
 #else
 		NULL,
 #endif

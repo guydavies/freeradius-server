@@ -7,7 +7,6 @@
  *
  */
 
-#include <freeradius-devel/ident.h>
 RCSIDH(detail_h, "$Id$")
 
 #ifdef __cplusplus
@@ -43,7 +42,7 @@ typedef struct listen_detail_t {
 	int		retry_interval;
 	int		packets;
 	int		tries;
-	int		one_shot;
+	bool		one_shot;
 	int		outstanding;
 	int		max_outstanding;
 	int		has_rtt;
@@ -57,7 +56,7 @@ typedef struct listen_detail_t {
 int detail_recv(rad_listen_t *listener);
 int detail_send(rad_listen_t *listener, REQUEST *request);
 void detail_free(rad_listen_t *this);
-int detail_print(const rad_listen_t *this, char *buffer, size_t bufsize);
+int detail_print(rad_listen_t const *this, char *buffer, size_t bufsize);
 int detail_encode(UNUSED rad_listen_t *this, UNUSED REQUEST *request);
 int detail_decode(UNUSED rad_listen_t *this, UNUSED REQUEST *request);
 int detail_parse(CONF_SECTION *cs, rad_listen_t *this);

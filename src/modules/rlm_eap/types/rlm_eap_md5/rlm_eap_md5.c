@@ -21,7 +21,6 @@
  * Copyright 2001  hereUare Communications, Inc. <raghud@hereuare.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <stdio.h>
@@ -34,19 +33,16 @@ RCSID("$Id$")
 /*
  *	Initiate the EAP-MD5 session by sending a challenge to the peer.
  */
-static int md5_initiate(void *type_data, EAP_HANDLER *handler)
+static int md5_initiate(UNUSED void *instance, eap_handler_t *handler)
 {
 	int		i;
 	MD5_PACKET	*reply;
 
-	type_data = type_data;	/* -Wunused */
-
 	/*
 	 *	Allocate an EAP-MD5 packet.
 	 */
-	reply = eapmd5_alloc();
-	if (reply == NULL)  {
-		radlog(L_ERR, "rlm_eap_md5: out of memory");
+	reply = talloc(handler, MD5_PACKET);
+	if (!reply)  {
 		return 0;
 	}
 
@@ -60,10 +56,9 @@ static int md5_initiate(void *type_data, EAP_HANDLER *handler)
 	/*
 	 *	Allocate user data.
 	 */
-	reply->value = malloc(reply->value_size);
-	if (reply->value == NULL) {
-		radlog(L_ERR, "rlm_eap_md5: out of memory");
-		eapmd5_free(&reply);
+	reply->value = talloc_array(reply, uint8_t, reply->value_size);
+	if (!reply->value) {
+		talloc_free(reply);
 		return 0;
 	}
 
@@ -78,10 +73,10 @@ static int md5_initiate(void *type_data, EAP_HANDLER *handler)
 	/*
 	 *	Keep track of the challenge.
 	 */
-	handler->opaque = malloc(reply->value_size);
+	handler->opaque = talloc_array(handler, uint8_t, reply->value_size);
 	rad_assert(handler->opaque != NULL);
 	memcpy(handler->opaque, reply->value, reply->value_size);
-	handler->free_opaque = free;
+	handler->free_opaque = NULL;
 
 	/*
 	 *	Compose the EAP-MD5 packet out of the data structure,
@@ -105,7 +100,7 @@ static int md5_initiate(void *type_data, EAP_HANDLER *handler)
 /*
  *	Authenticate a previously sent challenge.
  */
-static int md5_authenticate(UNUSED void *arg, EAP_HANDLER *handler)
+static int md5_authenticate(UNUSED void *arg, eap_handler_t *handler)
 {
 	MD5_PACKET	*packet;
 	MD5_PACKET	*reply;
@@ -118,7 +113,7 @@ static int md5_authenticate(UNUSED void *arg, EAP_HANDLER *handler)
 	rad_assert(handler->stage == AUTHENTICATE);
 
 	password = pairfind(handler->request->config_items, PW_CLEARTEXT_PASSWORD, 0, TAG_ANY);
-	if (password == NULL) {
+	if (!password) {
 		DEBUG2("rlm_eap_md5: Cleartext-Password is required for EAP-MD5 authentication");
 		return 0;
 	}
@@ -132,9 +127,9 @@ static int md5_authenticate(UNUSED void *arg, EAP_HANDLER *handler)
 	/*
 	 *	Create a reply, and initialize it.
 	 */
-	reply = eapmd5_alloc();
+	reply = talloc(packet, MD5_PACKET);
 	if (!reply) {
-		eapmd5_free(&packet);
+		talloc_free(packet);
 		return 0;
 	}
 	reply->id = handler->eap_ds->request->id;
@@ -155,8 +150,7 @@ static int md5_authenticate(UNUSED void *arg, EAP_HANDLER *handler)
 	 *	and free it.
 	 */
 	eapmd5_compose(handler->eap_ds, reply);
-
-	eapmd5_free(&packet);
+	talloc_free(packet);
 	return 1;
 }
 
@@ -164,7 +158,7 @@ static int md5_authenticate(UNUSED void *arg, EAP_HANDLER *handler)
  *	The module name should be the only globally exported symbol.
  *	That is, everything else should be 'static'.
  */
-EAP_TYPE rlm_eap_md5 = {
+rlm_eap_module_t rlm_eap_md5 = {
 	"eap_md5",
 	NULL,				/* attach */
 	md5_initiate,			/* Start the initial request */

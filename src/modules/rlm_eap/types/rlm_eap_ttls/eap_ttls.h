@@ -23,7 +23,6 @@
 #ifndef _EAP_TTLS_H
 #define _EAP_TTLS_H
 
-#include <freeradius-devel/ident.h>
 RCSIDH(eap_ttls_h, "$Id$")
 
 #include "eap_tls.h"
@@ -33,15 +32,15 @@ typedef struct ttls_tunnel_t {
 	VALUE_PAIR	*state;
 	VALUE_PAIR	*accept_vps;
 	int		authenticated;
-	int		default_eap_type;
+	int		default_method;
 	int		copy_request_to_tunnel;
 	int		use_tunneled_reply;
-	const char	*virtual_server;
+	char const	*virtual_server;
 } ttls_tunnel_t;
 
 /*
  *	Process the TTLS portion of an EAP-TTLS request.
  */
-int eapttls_process(EAP_HANDLER *handler, tls_session_t *tls_session);
+PW_CODE eapttls_process(eap_handler_t *handler, tls_session_t *tls_session);
 
 #endif /* _EAP_TTLS_H */

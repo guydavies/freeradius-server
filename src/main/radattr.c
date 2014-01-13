@@ -20,12 +20,11 @@
  * Copyright 2010  Alan DeKok <aland@freeradius.org>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/libradius.h>
+#include <freeradius-devel/parser.h>
 #include <freeradius-devel/conf.h>
-#include <freeradius-devel/radpaths.h>
 
 #include <ctype.h>
 
@@ -35,16 +34,53 @@ RCSID("$Id$")
 
 #include <assert.h>
 
+typedef struct REQUEST REQUEST;
+
+#include <freeradius-devel/log.h>
+log_debug_t debug_flag = 0;
+
+/**********************************************************************
+ *	Hacks for xlat
+ */
+typedef size_t (*RADIUS_ESCAPE_STRING)(REQUEST *, char *out, size_t outlen, char const *in, void *arg);
+typedef ssize_t (*RAD_XLAT_FUNC)(void *instance, REQUEST *, char const *, char *, size_t);
+int            xlat_register(char const *module, RAD_XLAT_FUNC func, RADIUS_ESCAPE_STRING escape,
+			     void *instance);
+#include <sys/wait.h>
+pid_t rad_fork(void);
+pid_t rad_waitpid(pid_t pid, int *status);
+
+pid_t rad_fork(void)
+{
+	return fork();
+}
+
+pid_t rad_waitpid(pid_t pid, int *status)
+{
+	return waitpid(pid, status, 0);
+}
+
+static ssize_t xlat_test(UNUSED void *instance, UNUSED REQUEST *request,
+			 UNUSED char const *fmt, UNUSED char *out, UNUSED size_t outlen)
+{
+	return 0;
+}
+
+/*
+ *	End of hacks for xlat
+ *
+ **********************************************************************/
+
 static int encode_tlv(char *buffer, uint8_t *output, size_t outlen);
 
-static const char *hextab = "0123456789abcdef";
+static char const *hextab = "0123456789abcdef";
 
 static int encode_data_string(char *buffer,
 			      uint8_t *output, size_t outlen)
 {
 	int length = 0;
 	char *p;
-	
+
 	p = buffer + 1;
 
 	while (*p && (outlen > 0)) {
@@ -109,13 +145,13 @@ static int encode_data_tlv(char *buffer, char **endptr,
 
 	*endptr = p + 1;
 	*p = '\0';
-	
+
 	p = buffer + 1;
 	while (isspace((int) *p)) p++;
-	
+
 	length = encode_tlv(p, output, outlen);
 	if (length == 0) return 0;
-	
+
 	return length;
 }
 
@@ -354,7 +390,7 @@ static int encode_extended(char *buffer,
 	int attr;
 	int length;
 	char *p;
-	
+
 	attr = decode_attr(buffer, &p);
 	if (attr == 0) return 0;
 
@@ -380,7 +416,7 @@ static int encode_long_extended(char *buffer,
 	int attr;
 	int length, total;
 	char *p;
-	
+
 	attr = decode_attr(buffer, &p);
 	if (attr == 0) return 0;
 
@@ -473,7 +509,53 @@ static int encode_rfc(char *buffer, uint8_t *output, size_t outlen)
 	return length + sublen;
 }
 
-static void process_file(const char *filename)
+static void parse_condition(char const *input, char *output, size_t outlen)
+{
+	ssize_t slen;
+	char const *error = NULL;
+	fr_cond_t *cond;
+
+	slen = fr_condition_tokenize(NULL, NULL, input, &cond, &error, FR_COND_ONE_PASS);
+	if (slen <= 0) {
+		snprintf(output, outlen, "ERROR offset %d %s", (int) -slen, error);
+		return;
+	}
+
+	input += slen;
+	if (*input != '\0') {
+		talloc_free(cond);
+		snprintf(output, outlen, "ERROR offset %d 'Too much text'", (int) slen);
+		return;
+	}
+
+	fr_cond_sprint(output, outlen, cond);
+
+	talloc_free(cond);
+}
+
+static void parse_xlat(char const *input, char *output, size_t outlen)
+{
+	ssize_t slen;
+	char const *error = NULL;
+	char *fmt = talloc_strdup(NULL, input);
+	xlat_exp_t *head;
+
+	slen = xlat_tokenize(fmt, fmt, &head, &error);
+	if (slen <= 0) {
+		snprintf(output, outlen, "ERROR offset %d '%s'", (int) -slen, error);
+		return;
+	}
+
+	if (input[slen] != '\0') {
+		snprintf(output, outlen, "ERROR offset %d 'Too much text'", (int) slen);
+		return;
+	}
+
+	xlat_sprint(output, outlen, head);
+	talloc_free(fmt);
+}
+
+static void process_file(const char *root_dir, char const *filename)
 {
 	int lineno;
 	size_t i, outlen;
@@ -481,17 +563,25 @@ static void process_file(const char *filename)
 	FILE *fp;
 	char input[8192], buffer[8192];
 	char output[8192];
+	char directory[8192];
 	uint8_t *attr, data[2048];
 
 	if (strcmp(filename, "-") == 0) {
 		fp = stdin;
 		filename = "<stdin>";
+		directory[0] = '\0';
 
 	} else {
-		fp = fopen(filename, "r");
+		if (root_dir && *root_dir) {
+			snprintf(directory, sizeof(directory), "%s/%s", root_dir, filename);
+		} else {
+			strlcpy(directory, filename, sizeof(directory));
+		}
+
+		fp = fopen(directory, "r");
 		if (!fp) {
 			fprintf(stderr, "Error opening %s: %s\n",
-				filename, strerror(errno));
+				directory, fr_syserror(errno));
 			exit(1);
 		}
 	}
@@ -510,27 +600,31 @@ static void process_file(const char *filename)
 		if (!p) {
 			if (!feof(fp)) {
 				fprintf(stderr, "Line %d too long in %s\n",
-					lineno, filename);
+					lineno, directory);
 				exit(1);
 			}
 		} else {
 			*p = '\0';
 		}
 
+		/*
+		 *	Comments, with hacks for User-Name[#]
+		 */
 		p = strchr(buffer, '#');
-		if (p) *p = '\0';
+		if (p && ((p == buffer) ||
+			  ((p > buffer) && (p[-1] != '[')))) *p = '\0';
 
 		p = buffer;
 		while (isspace((int) *p)) p++;
 		if (!*p) continue;
 
-		strcpy(input, p);
+		strlcpy(input, p, sizeof(input));
 
 		if (strncmp(p, "raw ", 4) == 0) {
 			outlen = encode_rfc(p + 4, data, sizeof(data));
 			if (outlen == 0) {
 				fprintf(stderr, "Parse error in line %d of %s\n",
-					lineno, filename);
+					lineno, directory);
 				exit(1);
 			}
 
@@ -553,7 +647,7 @@ static void process_file(const char *filename)
 		if (strncmp(p, "data ", 5) == 0) {
 			if (strcmp(p + 5, output) != 0) {
 				fprintf(stderr, "Mismatch in line %d of %s, expected: %s\n",
-					lineno, filename, output);
+					lineno, directory, output);
 				exit(1);
 			}
 			continue;
@@ -566,8 +660,8 @@ static void process_file(const char *filename)
 				p += 7;
 			}
 
-			if (userparse(p, &head) != T_EOL) {
-				strcpy(output, fr_strerror());
+			if (userparse(NULL, p, &head) != T_EOL) {
+				strlcpy(output, fr_strerror(), sizeof(output));
 				continue;
 			}
 
@@ -575,18 +669,18 @@ static void process_file(const char *filename)
 			vp = head;
 			len = 0;
 			while (vp) {
-				len = rad_vp2attr(NULL, NULL, NULL, (const VALUE_PAIR **) &vp,
+				len = rad_vp2attr(NULL, NULL, NULL, (VALUE_PAIR const **)(void **)&vp,
 						  attr, sizeof(data) - (attr - data));
 				if (len < 0) {
 					fprintf(stderr, "Failed encoding %s: %s\n",
-						vp->name, fr_strerror());
+						vp->da->name, fr_strerror());
 					exit(1);
 				}
 
 				attr += len;
 				if (len == 0) break;
 			}
-			
+
 			pairfree(&head);
 			outlen = len;
 			goto print_hex;
@@ -602,7 +696,7 @@ static void process_file(const char *filename)
 				attr = data;
 				len = encode_hex(p + 7, data, sizeof(data));
 				if (len == 0) {
-					fprintf(stderr, "Failed decoding hex string at line %d of %s\n", lineno, filename);
+					fprintf(stderr, "Failed decoding hex string at line %d of %s\n", lineno, directory);
 					exit(1);
 				}
 			}
@@ -626,10 +720,10 @@ static void process_file(const char *filename)
 				while (vp) {
 					tail = &(vp->next);
 					vp = vp->next;
-				}				
+				}
 
 				attr += my_len;
-				len -= my_len;				
+				len -= my_len;
 			}
 
 			/*
@@ -637,19 +731,22 @@ static void process_file(const char *filename)
 			 *	it if so.
 			 */
 			if (head) {
+				vp_cursor_t cursor;
 				p = output;
-				for (vp = head; vp != NULL; vp = vp->next) {
+				for (vp = fr_cursor_init(&cursor, &head);
+				     vp;
+				     vp = fr_cursor_next(&cursor)) {
 					vp_prints(p, sizeof(output) - (p - output), vp);
 					p += strlen(p);
-					
+
 					if (vp->next) {strcpy(p, ", ");
 						p += 2;
 					}
 				}
-				
+
 				pairfree(&head);
 			} else if (my_len < 0) {
-				strcpy(output, fr_strerror());
+				strlcpy(output, fr_strerror(), sizeof(output));
 
 			} else { /* zero-length attribute */
 				*output = '\0';
@@ -658,15 +755,36 @@ static void process_file(const char *filename)
 		}
 
 		if (strncmp(p, "$INCLUDE ", 9) == 0) {
+			char *q;
+
 			p += 9;
 			while (isspace((int) *p)) p++;
 
-			process_file(p);
+			q = strrchr(directory, '/');
+			if (q) {
+				*q = '\0';
+				process_file(directory, p);
+				*q = '/';
+			} else {
+				process_file(NULL, p);
+			}
+			continue;
+		}
+
+		if (strncmp(p, "condition ", 10) == 0) {
+			p += 10;
+			parse_condition(p, output, sizeof(output));
+			continue;
+		}
+
+		if (strncmp(p, "xlat ", 5) == 0) {
+			p += 5;
+			parse_xlat(p, output, sizeof(output));
 			continue;
 		}
 
 		fprintf(stderr, "Unknown input at line %d of %s\n",
-			lineno, filename);
+			lineno, directory);
 		exit(1);
 	}
 
@@ -676,11 +794,19 @@ static void process_file(const char *filename)
 int main(int argc, char *argv[])
 {
 	int c;
-	const char *radius_dir = RADDBDIR;
+	int report = false;
+	char const *radius_dir = RADDBDIR;
 
-	while ((c = getopt(argc, argv, "d:")) != EOF) switch(c) {
+	while ((c = getopt(argc, argv, "d:xM")) != EOF) switch(c) {
 		case 'd':
 			radius_dir = optarg;
+			break;
+	  	case 'x':
+			fr_debug_flag++;
+			debug_flag = fr_debug_flag;
+			break;
+		case 'M':
+			report = true;
 			break;
 		default:
 			fprintf(stderr, "usage: radattr [OPTS] filename\n");
@@ -689,16 +815,31 @@ int main(int argc, char *argv[])
 	argc -= (optind - 1);
 	argv += (optind - 1);
 
+	if (report) {
+		talloc_enable_null_tracking();
+	}
+	talloc_set_log_fn(log_talloc);
+
 	if (dict_init(radius_dir, RADIUS_DICTIONARY) < 0) {
 		fr_perror("radattr");
 		return 1;
 	}
 
+	if (xlat_register("test", xlat_test, NULL, NULL) < 0) {
+		fprintf(stderr, "Failed registering xlat");
+		return 1;
+	}
+
 	if (argc < 2) {
-		process_file("-");
+		process_file(NULL, "-");
 
 	} else {
-		process_file(argv[1]);
+		process_file(NULL, argv[1]);
+	}
+
+	if (report) {
+		dict_free();
+		log_talloc_report(NULL);
 	}
 
 	return 0;

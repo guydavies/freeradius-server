@@ -13,7 +13,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /*
  * $Id$
  *
@@ -22,8 +22,7 @@
  *
  * @copyright 2012-2013  Arran Cudbard-Bell <a.cudbard-bell@freeradius.org>
  */
- 
-#include <freeradius-devel/ident.h>
+
 RCSIDH(other_h, "$Id$")
 
 #include <freeradius-devel/connection.h>
@@ -33,6 +32,7 @@ RCSIDH(other_h, "$Id$")
 #define HAVE_JSON
 #endif
 
+#define CURL_NO_OLDIES 1
 #include <curl/curl.h>
 
 #ifdef HAVE_JSON
@@ -87,7 +87,7 @@ typedef enum {
  */
 extern const http_body_type_t http_body_type_supported[HTTP_BODY_NUM_ENTRIES];
 
-extern const http_body_type_t http_curl_auth[HTTP_AUTH_NUM_ENTRIES];
+extern const unsigned long http_curl_auth[HTTP_AUTH_NUM_ENTRIES];
 
 extern const FR_NAME_NUMBER http_auth_table[];
 
@@ -101,9 +101,9 @@ extern const FR_NAME_NUMBER http_content_header_table[];
  *	Structure for section configuration
  */
 typedef struct rlm_rest_section_t {
-	const char *name;
+	char const *name;
 	char *uri;
-	
+
 	char *method_str;
 	http_method_t method;
 
@@ -114,17 +114,17 @@ typedef struct rlm_rest_section_t {
 	char *password;
 	char *auth_str;
 	http_auth_type_t auth;
-	int require_auth;
-	
-	char *tls_certfile;
-	char *tls_keyfile;
-	char *tls_keypassword;
-	char *tls_cacertfile;
-	char *tls_cacertdir;
-	char *tls_randfile;
-	int tls_verify_cert;
-	int tls_verify_cert_cn;
-	
+	bool require_auth;
+
+	char *tls_certificate_file;
+	char *tls_private_key_file;
+	char *tls_private_key_password;
+	char *tls_ca_file;
+	char *tls_ca_path;
+	char *tls_random_file;
+	bool tls_check_cert;
+	bool tls_check_cert_cn;
+
 	int timeout;
 	unsigned int chunk;
 } rlm_rest_section_t;
@@ -133,7 +133,7 @@ typedef struct rlm_rest_section_t {
  *	Structure for module configuration
  */
 typedef struct rlm_rest_t {
-	const char *xlat_name;
+	char const *xlat_name;
 
 	char *connect_uri;
 
@@ -174,8 +174,7 @@ typedef struct rlm_rest_read_t {
 	REQUEST 	*request;
 	read_state_t 	state;
 
-	VALUE_PAIR 	**first;
-	VALUE_PAIR 	**next;
+	vp_cursor_t 	cursor;
 
 	unsigned int	chunk;
 } rlm_rest_read_t;
@@ -191,7 +190,7 @@ typedef struct rlm_rest_write_t {
 
 	char 		 *buffer;	/* HTTP incoming raw data */
 	size_t		 alloc;		/* Space allocated for buffer */
-	size_t		 used;		/* Space used in buffer */ 
+	size_t		 used;		/* Space used in buffer */
 
 	int		 code;		/* HTTP Status Code */
 	http_body_type_t type;		/* HTTP Content Type */
@@ -229,11 +228,11 @@ int rest_init(rlm_rest_t *instance);
 
 void rest_cleanup(void);
 
-void *rest_socket_create(void *instance);
+void *mod_conn_create(void *instance);
 
-int rest_socket_alive(void *instance, void *handle);
+int mod_conn_alive(void *instance, void *handle);
 
-int rest_socket_delete(void *instance, void *handle);
+int mod_conn_delete(void *instance, void *handle);
 
 /*
  *	Request processing API
@@ -241,9 +240,11 @@ int rest_socket_delete(void *instance, void *handle);
 int rest_request_config(rlm_rest_t *instance,
 			rlm_rest_section_t *section, REQUEST *request,
 			void *handle, http_method_t method,
-			http_body_type_t type, char *uri);
+			http_body_type_t type, char const *uri,
+			char const *username, char const *password);
 
-int rest_request_perform(rlm_rest_t *instance, rlm_rest_section_t *section,
+int rest_request_perform(rlm_rest_t *instance,
+			 rlm_rest_section_t *section, REQUEST *request,
 			 void *handle);
 
 int rest_request_decode(rlm_rest_t *instance,
@@ -260,5 +261,4 @@ void rest_request_cleanup(rlm_rest_t *instance, rlm_rest_section_t *section,
 /*
  *	Helper functions
  */
-ssize_t rest_uri_build(rlm_rest_t *instance, rlm_rest_section_t *section,
-		       REQUEST *request, char *buffer, size_t bufsize);
+ssize_t rest_uri_build(char **out, rlm_rest_t *instance, rlm_rest_section_t *section, REQUEST *request);

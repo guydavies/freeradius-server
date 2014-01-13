@@ -21,11 +21,11 @@
  * Copyright 2004  Alan DeKok <aland@freeradius.org>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
+#include <freeradius-devel/rad_assert.h>
 
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
@@ -46,11 +46,6 @@ RCSID("$Id$")
 #define LOG_INFO (0)
 #endif
 #endif
-
-/*
- *	Syslog facilities from main/mainconfig.c
- */
-extern const FR_NAME_NUMBER syslog_str2fac[];
 
 /*
  *	Define a structure for our module configuration.
@@ -76,7 +71,7 @@ typedef struct rlm_linelog_t {
  *	buffer over-flows.
  */
 static const CONF_PARSER module_config[] = {
-	{ "filename",  PW_TYPE_STRING_PTR,
+	{ "filename",  PW_TYPE_FILE_OUTPUT| PW_TYPE_REQUIRED,
 	  offsetof(rlm_linelog_t,filename), NULL,  NULL},
 	{ "syslog_facility",  PW_TYPE_STRING_PTR,
 	  offsetof(rlm_linelog_t,syslog_facility), NULL,  NULL},
@@ -92,46 +87,18 @@ static const CONF_PARSER module_config[] = {
 };
 
 
-static int linelog_detach(void *instance)
-{
-	rlm_linelog_t *inst = instance;
-
-	free(inst);
-	return 0;
-}
-
 /*
  *	Instantiate the module.
  */
-static int linelog_instantiate(CONF_SECTION *conf, void **instance)
+static int mod_instantiate(CONF_SECTION *conf, void *instance)
 {
-	rlm_linelog_t *inst;
+	rlm_linelog_t *inst = instance;
 
-	/*
-	 *	Set up a storage area for instance data
-	 */
-	inst = rad_malloc(sizeof(*inst));
-	memset(inst, 0, sizeof(*inst));
-
-	/*
-	 *	If the configuration parameters can't be parsed, then
-	 *	fail.
-	 */
-	if (cf_section_parse(conf, inst, module_config) < 0) {
-		linelog_detach(inst);
-		return -1;
-	}
-
-	if (!inst->filename) {
-		radlog(L_ERR, "rlm_linelog: Must specify an output filename");
-		linelog_detach(inst);
-		return -1;
-	}
+	rad_assert(inst->filename && *inst->filename);
 
 #ifndef HAVE_SYSLOG_H
 	if (strcmp(inst->filename, "syslog") == 0) {
-		radlog(L_ERR, "rlm_linelog: Syslog output is not supported");
-		linelog_detach(inst);
+		cf_log_err_cs(conf, "Syslog output is not supported on this system");
 		return -1;
 	}
 #else
@@ -140,8 +107,8 @@ static int linelog_instantiate(CONF_SECTION *conf, void **instance)
 	if (inst->syslog_facility) {
 		inst->facility = fr_str2int(syslog_str2fac, inst->syslog_facility, -1);
 		if (inst->facility < 0) {
-			radlog(L_ERR, "rlm_linelog: Bad syslog facility '%s'", inst->syslog_facility);
-			linelog_detach(inst);
+			cf_log_err_cs(conf, "Invalid syslog facility '%s'",
+				   inst->syslog_facility);
 			return -1;
 		}
 	}
@@ -150,14 +117,11 @@ static int linelog_instantiate(CONF_SECTION *conf, void **instance)
 #endif
 
 	if (!inst->line) {
-		radlog(L_ERR, "rlm_linelog: Must specify a log format");
-		linelog_detach(inst);
+		cf_log_err_cs(conf, "Must specify a log format");
 		return -1;
 	}
 
 	inst->cs = conf;
-	*instance = inst;
-
 	return 0;
 }
 
@@ -166,7 +130,7 @@ static int linelog_instantiate(CONF_SECTION *conf, void **instance)
  *	Escape unprintable characters.
  */
 static size_t linelog_escape_func(UNUSED REQUEST *request,
-		char *out, size_t outlen, const char *in,
+		char *out, size_t outlen, char const *in,
 		UNUSED void *arg)
 {
 	int len = 0;
@@ -232,7 +196,7 @@ static rlm_rcode_t do_linelog(void *instance, REQUEST *request)
 	char *p;
 	char line[1024];
 	rlm_linelog_t *inst = (rlm_linelog_t*) instance;
-	const char *value = inst->line;
+	char const *value = inst->line;
 
 #ifdef HAVE_GRP_H
 	gid_t gid;
@@ -244,8 +208,13 @@ static rlm_rcode_t do_linelog(void *instance, REQUEST *request)
 		CONF_ITEM *ci;
 		CONF_PAIR *cp;
 
-		radius_xlat(line + 1, sizeof(line) - 2, inst->reference,
-			    request, linelog_escape_func, NULL);
+		p = line + 1;
+
+		if (radius_xlat(p, sizeof(line) - 2, request, inst->reference, linelog_escape_func,
+		    NULL) < 0) {
+			return RLM_MODULE_FAIL;
+		}
+
 		line[0] = '.';	/* force to be in current section */
 
 		/*
@@ -282,15 +251,16 @@ static rlm_rcode_t do_linelog(void *instance, REQUEST *request)
 	 *	FIXME: Check length.
 	 */
 	if (strcmp(inst->filename, "syslog") != 0) {
-		radius_xlat(buffer, sizeof(buffer), inst->filename, request,
-			    NULL, NULL);
-		
+		if (radius_xlat(buffer, sizeof(buffer), request, inst->filename, NULL, NULL) < 0) {
+			return RLM_MODULE_FAIL;
+		}
+
 		/* check path and eventually create subdirs */
 		p = strrchr(buffer,'/');
 		if (p) {
 			*p = '\0';
 			if (rad_mkdir(buffer, 0700) < 0) {
-				radlog_request(L_ERR, 0, request, "rlm_linelog: Failed to create directory %s: %s", buffer, strerror(errno));
+				RERROR("rlm_linelog: Failed to create directory %s: %s", buffer, fr_syserror(errno));
 				return RLM_MODULE_FAIL;
 			}
 			*p = '/';
@@ -298,8 +268,8 @@ static rlm_rcode_t do_linelog(void *instance, REQUEST *request)
 
 		fd = open(buffer, O_WRONLY | O_APPEND | O_CREAT, inst->permissions);
 		if (fd == -1) {
-			radlog(L_ERR, "rlm_linelog: Failed to open %s: %s",
-			       buffer, strerror(errno));
+			ERROR("rlm_linelog: Failed to open %s: %s",
+			       buffer, fr_syserror(errno));
 			return RLM_MODULE_FAIL;
 		}
 
@@ -308,13 +278,13 @@ static rlm_rcode_t do_linelog(void *instance, REQUEST *request)
 			gid = strtol(inst->group, &endptr, 10);
 			if (*endptr != '\0') {
 				grp = getgrnam(inst->group);
-				if (grp == NULL) {
+				if (!grp) {
 					RDEBUG2("Unable to find system group \"%s\"", inst->group);
 					goto skip_group;
 				}
 				gid = grp->gr_gid;
 			}
-	
+
 			if (chown(buffer, -1, gid) == -1) {
 				RDEBUG2("Unable to change system group of \"%s\"", buffer);
 			}
@@ -327,13 +297,23 @@ static rlm_rcode_t do_linelog(void *instance, REQUEST *request)
 	/*
 	 *	FIXME: Check length.
 	 */
-	radius_xlat(line, sizeof(line) - 1, value, request,
-		    linelog_escape_func, NULL);
+	if (radius_xlat(line, sizeof(line) - 1, request, value, linelog_escape_func, NULL) < 0) {
+		if (fd > -1) {
+			close(fd);
+		}
+
+		return RLM_MODULE_FAIL;
+	}
 
 	if (fd >= 0) {
 		strcat(line, "\n");
-		
-		write(fd, line, strlen(line));
+
+		if (write(fd, line, strlen(line)) < 0) {
+			EDEBUG("rlm_linelog: Failed writing: %s", fr_syserror(errno));
+			close(fd);
+			return RLM_MODULE_FAIL;
+		}
+
 		close(fd);
 
 #ifdef HAVE_SYSLOG_H
@@ -353,8 +333,10 @@ module_t rlm_linelog = {
 	RLM_MODULE_INIT,
 	"linelog",
 	RLM_TYPE_CHECK_CONFIG_SAFE,   	/* type */
-	linelog_instantiate,		/* instantiation */
-	linelog_detach,			/* detach */
+	sizeof(rlm_linelog_t),
+	module_config,
+	mod_instantiate,		/* instantiation */
+	NULL,				/* detach */
 	{
 		do_linelog,	/* authentication */
 		do_linelog,	/* authorization */

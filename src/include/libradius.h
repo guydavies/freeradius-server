@@ -23,11 +23,11 @@
  *
  * @copyright 1999-2008 The FreeRADIUS server project
  */
-
-#include <freeradius-devel/ident.h>
 RCSIDH(libradius_h, "$Id$")
 
 #include <freeradius-devel/missing.h>
+
+#include <talloc.h>
 
 /*
  *  Let any external program building against the library know what
@@ -38,7 +38,9 @@ RCSIDH(libradius_h, "$Id$")
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdbool.h>
 
+#include <freeradius-devel/threads.h>
 #include <freeradius-devel/radius.h>
 #include <freeradius-devel/token.h>
 #include <freeradius-devel/hash.h>
@@ -47,18 +49,6 @@ RCSIDH(libradius_h, "$Id$")
 #if SIZEOF_UNSIGNED_INT != 4
 #error FATAL: sizeof(unsigned int) != 4
 #endif
-#endif
-
-#ifndef FALSE
-#define FALSE 0
-#endif
-#ifndef TRUE
-/*
- *	This definition of true as NOT false is definitive. :) Making
- *	it '1' can cause problems on stupid platforms.  See articles
- *	on C portability for more information.
- */
-#define TRUE (!FALSE)
 #endif
 
 /*
@@ -71,7 +61,26 @@ RCSIDH(libradius_h, "$Id$")
 extern "C" {
 #endif
 
-#define EAP_START               2
+#if defined(WITH_VERIFY_PTR)
+/*
+ *	Requires typeof(), which is in most modern C compilers.
+ */
+
+/*
+#define VERIFY_VP(_x) do { (void) talloc_get_type_abort(_x, VALUE_PAIR); \
+			if (_x->da) { \
+			   	(void) talloc_get_type_abort(_x->da, DICT_ATTR); \
+			} \
+		      } while (0)
+*/
+#define FREE_MAGIC (0xF4EEF4EE)
+
+#define VERIFY_VP(_x) (void) talloc_get_type_abort(_x, VALUE_PAIR)
+#define VERIFY_PACKET(_x) (void) talloc_get_type_abort(_x, RADIUS_PACKET)
+#else
+#define VERIFY_VP(_x)
+#define VERIFY_PACKET(_x)
+#endif
 
 #define AUTH_VECTOR_LEN		16
 #define CHAP_VALUE_LENGTH       16
@@ -95,6 +104,8 @@ extern "C" {
 #define TAG_ANY			-128	/* minimum signed char */
 #define TAG_UNUSED		0
 
+#define PAD(_x, _y)		(_y - ((_x) % _y))
+
 #if defined(__GNUC__)
 # define PRINTF_LIKE(n) __attribute__ ((format(printf, n, n+1)))
 # define NEVER_RETURNS __attribute__ ((noreturn))
@@ -108,43 +119,53 @@ extern "C" {
 #endif
 
 typedef struct attr_flags {
-	unsigned int	has_tag : 1;		//!< Tagged attribute.
-	unsigned int	do_xlat : 1; 		//!< Strvalue is dynamic.
-	unsigned int	unknown_attr : 1;	//!< Not in dictionary.
-	unsigned int	array : 1; 		//!< Pack multiples into 1 attr.
-	unsigned int	has_value : 1;		//!< Has a value.
-	unsigned int	has_value_alias : 1; 	//!< Has a value alias.
-	unsigned int	has_tlv : 1; 		//!< Has sub attributes.
-	unsigned int	is_tlv : 1;		//!< Is a sub attribute.
-	unsigned int	extended : 1; 		//!< Extended attribute.
-	unsigned int	long_extended : 1; 	//!< Long format.
-	unsigned int	evs : 1;		//!< Extended VSA.
-	unsigned int	wimax: 1;		//!< WiMAX format=1,1,c.
+	unsigned int 	is_unknown : 1;				//!< Attribute number or vendor is unknown.
+	unsigned int	is_tlv : 1;				//!< Is a sub attribute.
+	unsigned int	vp_free : 1;				//!< Should be freed when VALUE_PAIR is freed.
 
-	int8_t		tag;			//!< Tag for tunneled.
-						//!< Attributes.
-	uint8_t		encrypt;      		//!< Ecryption method.
+	unsigned int	has_tag : 1;				//!< Tagged attribute.
+	unsigned int	array : 1; 				//!< Pack multiples into 1 attr.
+	unsigned int	has_value : 1;				//!< Has a value.
+	unsigned int	has_value_alias : 1; 			//!< Has a value alias.
+	unsigned int	has_tlv : 1; 				//!< Has sub attributes.
+
+	unsigned int	extended : 1; 				//!< Extended attribute.
+	unsigned int	long_extended : 1; 			//!< Long format.
+	unsigned int	evs : 1;				//!< Extended VSA.
+	unsigned int	wimax: 1;				//!< WiMAX format=1,1,c.
+
+	unsigned int	concat : 1;				//!< concatenate multiple instances
+	unsigned int	is_pointer : 1;				//!< data is a pointer
+
+	uint8_t		encrypt;      				//!< Ecryption method.
 	uint8_t		length;
 } ATTR_FLAGS;
 
 /*
  *  Values of the encryption flags.
  */
-#define FLAG_ENCRYPT_NONE            (0)
+#define FLAG_ENCRYPT_NONE	    (0)
 #define FLAG_ENCRYPT_USER_PASSWORD   (1)
 #define FLAG_ENCRYPT_TUNNEL_PASSWORD (2)
 #define FLAG_ENCRYPT_ASCEND_SECRET   (3)
 
 extern const FR_NAME_NUMBER dict_attr_types[];
+extern const size_t dict_attr_sizes[PW_TYPE_MAX][2];
 
+/** dictionary attribute
+ *
+ */
 typedef struct dict_attr {
 	unsigned int		attr;
-	int			type;
+	PW_TYPE			type;
 	unsigned int		vendor;
-        ATTR_FLAGS              flags;
+	ATTR_FLAGS		flags;
 	char			name[1];
 } DICT_ATTR;
 
+/** value of an enumerated attribute
+ *
+ */
 typedef struct dict_value {
 	unsigned int		attr;
 	unsigned int		vendor;
@@ -152,66 +173,144 @@ typedef struct dict_value {
 	char			name[1];
 } DICT_VALUE;
 
+/** dictionary vendor
+ *
+ */
 typedef struct dict_vendor {
 	unsigned int		vendorpec;
-	size_t			type; /* length of type data */
-	size_t			length;	/* length of length data */
+	size_t			type; 				//!< Length of type data
+	size_t			length;				//!< Length of length data
 	size_t			flags;
 	char			name[1];
 } DICT_VENDOR;
 
-typedef union value_pair_data {
-	char			strvalue[MAX_STRING_LEN];
-	uint8_t			octets[MAX_STRING_LEN];
-	struct in_addr		ipaddr;
-	struct in6_addr		ipv6addr;
-	uint32_t		date;
-	uint32_t		integer;
-	int32_t			sinteger;
-	uint64_t		integer64;
-	uint8_t			filter[32];
-	uint8_t			ifid[8]; /* struct? */
-	uint8_t			ipv6prefix[18]; /* struct? */
-	uint8_t			ipv4prefix[6]; /* struct? */
-     	uint8_t			ether[6];
-	uint8_t			*tlv;
-} VALUE_PAIR_DATA;
+/** Union containing all data types supported by the server
+ *
+ * This union contains all data types that can be represented with VALUE_PAIRs. It may also be used in other parts
+ * of the server where values of different types need to be stored.
+ *
+ * PW_TYPE should be an enumeration of the values in this union.
+ */
+typedef union value_data {
+	char const	        *strvalue;			//!< Pointer to UTF-8 string.
+	uint8_t const		*octets;			//!< Pointer to binary string.
+	uint32_t		integer;			//!< 32bit unsigned integer.
+	struct in_addr		ipaddr;				//!< IPv4 Address.
+	uint32_t		date;				//!< Date (32bit Unix timestamp).
+	size_t			filter[32/sizeof(size_t)];	//!< Ascend binary format a packed data
+								//!< structure.
 
+	uint8_t			ifid[8]; /* struct? */		//!< IPv6 interface ID.
+	struct in6_addr		ipv6addr;			//!< IPv6 Address.
+	uint8_t			ipv6prefix[18]; /* struct? */	//!< IPv6 prefix.
+
+	uint8_t			byte;				//!< 8bit unsigned integer.
+	uint16_t		ushort;				//!< 16bit unsigned integer.
+
+	uint8_t			ether[6];			//!< Ethernet (MAC) address.
+
+	int32_t			sinteger;			//!< 32bit signed integer.
+	uint64_t		integer64;			//!< 64bit unsigned integer.
+
+	uint8_t			ipv4prefix[6]; /* struct? */	//!< IPv4 prefix.
+
+	uint8_t			*tlv;				//!< Nested TLV (should go away).
+	void const		*ptr;				//!< generic pointer.
+} value_data_t;
+
+/** The type of value a VALUE_PAIR contains
+ *
+ * This is used to add structure to nested VALUE_PAIRs and specifies what type of node it is (set, list, data).
+ *
+ * xlat is another type of data node which must first be expanded before use.
+ */
+typedef enum value_type {
+	VT_NONE = 0,						//!< VALUE_PAIR has no value.
+	VT_SET,							//!< VALUE_PAIR has children.
+	VT_LIST,						//!< VALUE_PAIR has multiple values.
+	VT_DATA,						//!< VALUE_PAIR has a single value.
+	VT_XLAT							//!< valuepair value must be xlat expanded when it's
+								//!< added to VALUE_PAIR tree.
+} value_type_t;
+
+/** Stores an attribute, a value and various bits of other data
+ *
+ * VALUE_PAIRs are the main data structure used in the server, they specify an attribute, it's children and
+ * it's siblings.
+ *
+ * They also specify what behaviour should be used when the attribute is merged into a new list/tree.
+ */
 typedef struct value_pair {
-	const char	        *name;
+	DICT_ATTR const		*da;				//!< Dictionary attribute defines the attribute
+								//!< number, vendor and type of the attribute.
+
 	struct value_pair	*next;
 
-	/*
-	 *	Pack 4 32-bit fields together.  Saves ~8 bytes per struct
-	 *	on 64-bit machines.
-	 */
-	unsigned int		attribute;
-	unsigned int	       	vendor;
-	int			type;
+	FR_TOKEN		op;				//!< Operator to use when moving or inserting
+								//!< valuepair into a list.
 
-	FR_TOKEN		op;		//!< Operator to use when 
-						//!< moving or inserting 
-						//!< valuepair into a list.
-						
-        ATTR_FLAGS              flags;
+	int8_t			tag;				//!< Tag value used to group valuepairs.
 
-	size_t			length; /* of data field */
-	VALUE_PAIR_DATA		data;
+	union {
+	//	VALUE_SET	*set;				//!< Set of child attributes.
+	//	VALUE_LIST	*list;				//!< List of values for
+								//!< multivalued attribute.
+	//	value_data_t	*data;				//!< Value data for this attribute.
+
+		char const 	*xlat;				//!< Source string for xlat expansion.
+	} value;
+
+	value_type_t		type;				//!< Type of pointer in value union.
+
+	size_t			length;				//!< of Data field.
+	value_data_t		data;
 } VALUE_PAIR;
-#define vp_strvalue   data.strvalue
-#define vp_octets     data.octets
-#define vp_ipv6addr   data.ipv6addr
-#define vp_ifid       data.ifid
-#define vp_ipv6prefix data.ipv6prefix
-#define vp_ipv4prefix data.ipv4prefix
-#define vp_filter     data.filter
-#define vp_ether      data.ether
-#define vp_signed     data.sinteger
-#define vp_tlv	      data.tlv
-#define vp_integer64  data.integer64
-#define vp_ipaddr     data.ipaddr.s_addr
-#define vp_date       data.date
-#define vp_integer    data.integer
+
+/** Abstraction to allow iterating over different configurations of VALUE_PAIRs
+ *
+ * This allows functions which do not care about the structure of collections of VALUE_PAIRs
+ * to iterate over all members in a collection.
+ *
+ * Field within a vp_cursor should not be accessed directly, and vp_cursors should only be
+ * manipulated with the pair* functions.
+ */
+typedef struct vp_cursor {
+	VALUE_PAIR	**first;
+	VALUE_PAIR	*found;					//!< pairfind marker.
+	VALUE_PAIR	*last;					//!< Temporary only used for fr_cursor_insert
+	VALUE_PAIR	*current;				//!< The current attribute.
+	VALUE_PAIR	*next;					//!< Next attribute to process.
+} vp_cursor_t;
+
+/** A VALUE_PAIR in string format.
+ *
+ * Used to represent pairs in the legacy 'users' file format.
+ */
+typedef struct value_pair_raw {
+	char l_opand[256];					//!< Left hand side of the pair.
+	char r_opand[1024];					//!< Right hand side of the pair.
+
+	FR_TOKEN quote;						//!< Type of quoting around the r_opand.
+
+	FR_TOKEN op;						//!< Operator.
+} VALUE_PAIR_RAW;
+
+#define vp_strvalue	data.strvalue
+#define vp_integer	data.integer
+#define vp_ipaddr	data.ipaddr.s_addr
+#define vp_date		data.date
+#define vp_filter	data.filter
+#define vp_octets	data.octets
+#define vp_ifid		data.ifid
+#define vp_ipv6addr	data.ipv6addr
+#define vp_ipv6prefix	data.ipv6prefix
+#define vp_byte		data.byte
+#define vp_short	data.ushort
+#define vp_ether	data.ether
+#define vp_signed	data.sinteger
+#define vp_integer64	data.integer64
+#define vp_ipv4prefix	data.ipv4prefix
+#define vp_tlv		data.tlv
 
 typedef struct fr_ipaddr_t {
 	int		af;	/* address family */
@@ -234,7 +333,7 @@ typedef struct fr_ipaddr_t {
 typedef struct radius_packet {
 	int			sockfd;
 	fr_ipaddr_t		src_ipaddr;
-        fr_ipaddr_t		dst_ipaddr;
+	fr_ipaddr_t		dst_ipaddr;
 	uint16_t		src_port;
 	uint16_t		dst_port;
 	int			id;
@@ -250,40 +349,68 @@ typedef struct radius_packet {
 #endif
 } RADIUS_PACKET;
 
+typedef enum {
+	DECODE_FAIL_NONE = 0,
+	DECODE_FAIL_MIN_LENGTH_PACKET,
+	DECODE_FAIL_MIN_LENGTH_FIELD,
+	DECODE_FAIL_MIN_LENGTH_MISMATCH,
+	DECODE_FAIL_HEADER_OVERFLOW,
+	DECODE_FAIL_UNKNOWN_PACKET_CODE,
+	DECODE_FAIL_INVALID_ATTRIBUTE,
+	DECODE_FAIL_ATTRIBUTE_TOO_SHORT,
+	DECODE_FAIL_ATTRIBUTE_OVERFLOW,
+	DECODE_FAIL_MA_INVALID_LENGTH,
+	DECODE_FAIL_ATTRIBUTE_UNDERFLOW,
+	DECODE_FAIL_TOO_MANY_ATTRIBUTES,
+	DECODE_FAIL_MA_MISSING,
+	DECODE_FAIL_MAX
+} decode_fail_t;
+
 /*
  *	Printing functions.
  */
-int		fr_utf8_char(const uint8_t *str);
-size_t		fr_print_string(const char *in, size_t inlen,
+int		fr_utf8_char(uint8_t const *str);
+size_t		fr_print_string(char const *in, size_t inlen,
 				 char *out, size_t outlen);
-int     	vp_prints_value(char *out, size_t outlen,
-				const VALUE_PAIR *vp, int delimitst);
-int     	vp_prints_value_json(char *out, size_t outlen,
-				     const VALUE_PAIR *vp);
-size_t		vp_print_name(char *buffer, size_t bufsize,
-			      unsigned int attr, unsigned int vendor);
-int     	vp_prints(char *out, size_t outlen, const VALUE_PAIR *vp);
-void		vp_print(FILE *, const VALUE_PAIR *);
-void		vp_printlist(FILE *, const VALUE_PAIR *);
+size_t   	vp_prints_value(char *out, size_t outlen, VALUE_PAIR const *vp, int8_t quote);
+char		*vp_aprinttype(TALLOC_CTX *ctx, PW_TYPE type);
+char     	*vp_aprint(TALLOC_CTX *ctx, VALUE_PAIR const *vp);
+size_t    	vp_prints_value_json(char *out, size_t outlen, VALUE_PAIR const *vp);
+size_t		vp_print_name(char *out, size_t outlen, unsigned int attr, unsigned int vendor);
+size_t		vp_prints(char *out, size_t outlen, VALUE_PAIR const *vp);
+void		vp_print(FILE *, VALUE_PAIR const *);
+void		vp_printlist(FILE *, VALUE_PAIR const *);
 #define		fprint_attr_val vp_print
 
 /*
  *	Dictionary functions.
  */
+extern const int dict_attr_allowed_chars[256];
 int		str2argv(char *str, char **argv, int max_argc);
-int		dict_str2oid(const char *ptr, unsigned int *pattr,
+int		dict_str2oid(char const *ptr, unsigned int *pattr,
 			     unsigned int *pvendor, int tlv_depth);
-int		dict_addvendor(const char *name, unsigned int value);
-int		dict_addattr(const char *name, int attr, unsigned int vendor, int type, ATTR_FLAGS flags);
-int		dict_addvalue(const char *namestr, const char *attrstr, int value);
-int		dict_init(const char *dir, const char *fn);
+int		dict_addvendor(char const *name, unsigned int value);
+int		dict_addattr(char const *name, int attr, unsigned int vendor, int type, ATTR_FLAGS flags);
+int		dict_addvalue(char const *namestr, char const *attrstr, int value);
+int		dict_init(char const *dir, char const *fn);
 void		dict_free(void);
-DICT_ATTR	*dict_attrbyvalue(unsigned int attr, unsigned int vendor);
-DICT_ATTR	*dict_attrbyname(const char *attr);
+int		dict_read(char const *dir, char const *filename);
+void 		dict_attr_free(DICT_ATTR const **da);
+DICT_ATTR const	*dict_attr_copy(DICT_ATTR const *da, int vp_free);
+DICT_ATTR const	*dict_attrunknown(unsigned int attr, unsigned int vendor, int vp_free);
+DICT_ATTR const	*dict_attrunknownbyname(char const *attribute, int vp_free);
+DICT_ATTR const	*dict_attrbyvalue(unsigned int attr, unsigned int vendor);
+DICT_ATTR const	*dict_attrbyname(char const *attr);
+DICT_ATTR const	*dict_attrbytype(unsigned int attr, unsigned int vendor,
+				 PW_TYPE type);
+DICT_ATTR const	*dict_attrbyparent(DICT_ATTR const *parent, unsigned int attr,
+					   unsigned int vendor);
+int		dict_attr_child(DICT_ATTR const *parent,
+				unsigned int *pattr, unsigned int *pvendor);
 DICT_VALUE	*dict_valbyattr(unsigned int attr, unsigned int vendor, int val);
-DICT_VALUE	*dict_valbyname(unsigned int attr, unsigned int vendor, const char *val);
-const char	*dict_valnamebyattr(unsigned int attr, unsigned int vendor, int value);
-int		dict_vendorbyname(const char *name);
+DICT_VALUE	*dict_valbyname(unsigned int attr, unsigned int vendor, char const *val);
+char const	*dict_valnamebyattr(unsigned int attr, unsigned int vendor, int value);
+int		dict_vendorbyname(char const *name);
 DICT_VENDOR	*dict_vendorbyvalue(int vendor);
 
 #if 1 /* FIXME: compat */
@@ -295,162 +422,181 @@ DICT_VENDOR	*dict_vendorbyvalue(int vendor);
 
 /* md5.c */
 
-void		fr_md5_calc(uint8_t *, const uint8_t *, unsigned int);
+void		fr_md5_calc(uint8_t *, uint8_t const *, unsigned int);
 
 /* hmac.c */
 
-void fr_hmac_md5(const uint8_t *text, int text_len,
-		   const uint8_t *key, int key_len,
-		   unsigned char *digest);
+void fr_hmac_md5(uint8_t const *text, size_t text_len, uint8_t const *key, size_t key_len, unsigned char *digest);
 
 /* hmacsha1.c */
 
-void fr_hmac_sha1(const uint8_t *text, int text_len,
-		    const uint8_t *key, int key_len,
-		    uint8_t *digest);
+void fr_hmac_sha1(uint8_t const *text, size_t text_len, uint8_t const *key, size_t key_len, uint8_t *digest);
 
 /* radius.c */
-int		rad_send(RADIUS_PACKET *, const RADIUS_PACKET *, const char *secret);
-int		rad_packet_ok(RADIUS_PACKET *packet, int flags);
+int		rad_send(RADIUS_PACKET *, RADIUS_PACKET const *, char const *secret);
+bool		rad_packet_ok(RADIUS_PACKET *packet, int flags, decode_fail_t *reason);
 RADIUS_PACKET	*rad_recv(int fd, int flags);
 ssize_t rad_recv_header(int sockfd, fr_ipaddr_t *src_ipaddr, int *src_port,
 			int *code);
 void		rad_recv_discard(int sockfd);
 int		rad_verify(RADIUS_PACKET *packet, RADIUS_PACKET *original,
-			   const char *secret);
-int		rad_decode(RADIUS_PACKET *packet, RADIUS_PACKET *original, const char *secret);
-int		rad_encode(RADIUS_PACKET *packet, const RADIUS_PACKET *original,
-			   const char *secret);
-int		rad_sign(RADIUS_PACKET *packet, const RADIUS_PACKET *original,
-			 const char *secret);
+			   char const *secret);
+int		rad_decode(RADIUS_PACKET *packet, RADIUS_PACKET *original, char const *secret);
+int		rad_encode(RADIUS_PACKET *packet, RADIUS_PACKET const *original,
+			   char const *secret);
+int		rad_sign(RADIUS_PACKET *packet, RADIUS_PACKET const *original,
+			 char const *secret);
 
-int rad_digest_cmp(const uint8_t *a, const uint8_t *b, size_t length);
-RADIUS_PACKET	*rad_alloc(int newvector);
-RADIUS_PACKET	*rad_alloc_reply(RADIUS_PACKET *);
+int rad_digest_cmp(uint8_t const *a, uint8_t const *b, size_t length);
+RADIUS_PACKET	*rad_alloc(TALLOC_CTX *ctx, int newvector);
+RADIUS_PACKET	*rad_alloc_reply(TALLOC_CTX *ctx, RADIUS_PACKET *);
 void		rad_free(RADIUS_PACKET **);
-int		rad_pwencode(char *encpw, size_t *len, const char *secret,
-			     const uint8_t *vector);
-int		rad_pwdecode(char *encpw, size_t len, const char *secret,
-			     const uint8_t *vector);
-int		rad_tunnel_pwencode(char *encpw, size_t *len, const char *secret,
-				    const uint8_t *vector);
+int		rad_pwencode(char *encpw, size_t *len, char const *secret,
+			     uint8_t const *vector);
+int		rad_pwdecode(char *encpw, size_t len, char const *secret,
+			     uint8_t const *vector);
+
+#define	FR_TUNNEL_PW_ENC_LENGTH(_x) (2 + 1 + _x + PAD(_x + 1, 16))
+int		rad_tunnel_pwencode(char *encpw, size_t *len, char const *secret,
+				    uint8_t const *vector);
 int		rad_tunnel_pwdecode(uint8_t *encpw, size_t *len,
-				    const char *secret, const uint8_t *vector);
+				    char const *secret, uint8_t const *vector);
 int		rad_chap_encode(RADIUS_PACKET *packet, uint8_t *output,
 				int id, VALUE_PAIR *password);
 
-int rad_attr_ok(const RADIUS_PACKET *packet, const RADIUS_PACKET *original,
+int rad_attr_ok(RADIUS_PACKET const *packet, RADIUS_PACKET const *original,
 		DICT_ATTR *da,
-		const uint8_t *data, size_t length);
-int rad_tlv_ok(const uint8_t *data, size_t length,
+		uint8_t const *data, size_t length);
+int rad_tlv_ok(uint8_t const *data, size_t length,
 	       size_t dv_type, size_t dv_length);
 
-ssize_t rad_attr2vp_raw(const RADIUS_PACKET *packet,
-			const RADIUS_PACKET *original,
-			const char *secret,
-			const uint8_t *data, size_t length,
-			VALUE_PAIR **pvp);
-ssize_t rad_attr2vp_extended(const RADIUS_PACKET *packet,
-			     const RADIUS_PACKET *original,
-			     const char *secret,
-			     const uint8_t *start, size_t length,
-			     VALUE_PAIR **pvp);
-ssize_t rad_attr2vp_wimax(const RADIUS_PACKET *packet,
-			  const RADIUS_PACKET *original,
-			  const char *secret,
-			  const uint8_t *data, size_t length,
-			  VALUE_PAIR **pvp);
+ssize_t data2vp(RADIUS_PACKET *packet,
+		RADIUS_PACKET const *original,
+		char const *secret,
+		DICT_ATTR const *da, uint8_t const *start,
+		size_t const attrlen, size_t const packetlen,
+		VALUE_PAIR **pvp);
 
-ssize_t rad_attr2vp_vsa(const RADIUS_PACKET *packet,
-			const RADIUS_PACKET *original,
-			const char *secret,
-			const uint8_t *data, size_t length,
-			VALUE_PAIR **pvp);
-ssize_t rad_attr2vp_rfc(const RADIUS_PACKET *packet,
-			const RADIUS_PACKET *original,
-			const char *secret,
-			const uint8_t *data, size_t length,
-			VALUE_PAIR **pvp);
-
-ssize_t	rad_attr2vp(const RADIUS_PACKET *packet, const RADIUS_PACKET *original,
-		    const char *secret,
-		    const uint8_t *data, size_t length,
+ssize_t	rad_attr2vp(RADIUS_PACKET *packet, RADIUS_PACKET const *original,
+		    char const *secret,
+		    uint8_t const *data, size_t length,
 		    VALUE_PAIR **pvp);
 
 ssize_t  rad_data2vp(unsigned int attribute, unsigned int vendor,
-		     const uint8_t *data, size_t length,
+		     uint8_t const *data, size_t length,
 		     VALUE_PAIR **pvp);
 
-ssize_t rad_vp2data(const VALUE_PAIR *vp, uint8_t *out, size_t outlen);
+ssize_t rad_vp2data(VALUE_PAIR const *vp, uint8_t *out, size_t outlen);
 
-int rad_vp2extended(const RADIUS_PACKET *packet,
-		    const RADIUS_PACKET *original,
-		    const char *secret, const VALUE_PAIR **pvp,
+int rad_vp2extended(RADIUS_PACKET const *packet,
+		    RADIUS_PACKET const *original,
+		    char const *secret, VALUE_PAIR const **pvp,
 		    uint8_t *ptr, size_t room);
-int rad_vp2wimax(const RADIUS_PACKET *packet,
-		 const RADIUS_PACKET *original,
-		 const char *secret, const VALUE_PAIR **pvp,
+int rad_vp2wimax(RADIUS_PACKET const *packet,
+		 RADIUS_PACKET const *original,
+		 char const *secret, VALUE_PAIR const **pvp,
 		 uint8_t *ptr, size_t room);
-int rad_vp2vsa(const RADIUS_PACKET *packet, const RADIUS_PACKET *original,
-	       const char *secret, const VALUE_PAIR **pvp, uint8_t *start,
+int rad_vp2vsa(RADIUS_PACKET const *packet, RADIUS_PACKET const *original,
+	       char const *secret, VALUE_PAIR const **pvp, uint8_t *start,
 	       size_t room);
-int rad_vp2rfc(const RADIUS_PACKET *packet,
-	       const RADIUS_PACKET *original,
-	       const char *secret, const VALUE_PAIR **pvp,
+int rad_vp2rfc(RADIUS_PACKET const *packet,
+	       RADIUS_PACKET const *original,
+	       char const *secret, VALUE_PAIR const **pvp,
 	       uint8_t *ptr, size_t room);
 
-int rad_vp2attr(const RADIUS_PACKET *packet,
-		const RADIUS_PACKET *original, const char *secret,
-		const VALUE_PAIR **pvp, uint8_t *ptr, size_t room);
+int rad_vp2attr(RADIUS_PACKET const *packet,
+		RADIUS_PACKET const *original, char const *secret,
+		VALUE_PAIR const **pvp, uint8_t *ptr, size_t room);
 
 /* valuepair.c */
-VALUE_PAIR	*pairalloc(const DICT_ATTR *da);
-VALUE_PAIR	*paircreate_raw(int attr, int vendor, int type, VALUE_PAIR *);
-VALUE_PAIR	*paircreate(int attr, int vendor, int type);
+VALUE_PAIR	*pairalloc(TALLOC_CTX *ctx, DICT_ATTR const *da);
+VALUE_PAIR	*paircreate(TALLOC_CTX *ctx, unsigned int attr, unsigned int vendor);
+int		pair2unknown(VALUE_PAIR *vp);
 void		pairfree(VALUE_PAIR **);
-void            pairbasicfree(VALUE_PAIR *pair);
 VALUE_PAIR	*pairfind(VALUE_PAIR *, unsigned int attr, unsigned int vendor, int8_t tag);
+VALUE_PAIR	*pairfind_da(VALUE_PAIR *, DICT_ATTR const *dattr, int8_t tag);
+
+#define		fr_cursor_init(_x, _y)	_fr_cursor_init(_x,(VALUE_PAIR const * const *) _y)
+VALUE_PAIR	*_fr_cursor_init(vp_cursor_t *cursor, VALUE_PAIR const * const *node);
+VALUE_PAIR	*fr_cursor_first(vp_cursor_t *cursor);
+VALUE_PAIR	*fr_cursor_next_by_num(vp_cursor_t *cursor, unsigned int attr, unsigned int vendor, int8_t tag);
+VALUE_PAIR	*fr_cursor_next_by_da(vp_cursor_t *cursor, DICT_ATTR const *dattr, int8_t tag);
+VALUE_PAIR	*fr_cursor_next(vp_cursor_t *cursor);
+VALUE_PAIR	*fr_cursor_current(vp_cursor_t *cursor);
+void		fr_cursor_insert(vp_cursor_t *cursor, VALUE_PAIR *vp);
+VALUE_PAIR	*fr_cursor_remove(vp_cursor_t *cursor);
+VALUE_PAIR	*fr_cursor_replace(vp_cursor_t *cursor, VALUE_PAIR *new);
 void		pairdelete(VALUE_PAIR **, unsigned int attr, unsigned int vendor, int8_t tag);
 void		pairadd(VALUE_PAIR **, VALUE_PAIR *);
-void            pairreplace(VALUE_PAIR **first, VALUE_PAIR *add);
+void		pairreplace(VALUE_PAIR **first, VALUE_PAIR *add);
 int		paircmp(VALUE_PAIR *check, VALUE_PAIR *data);
-VALUE_PAIR	*paircopyvp(const VALUE_PAIR *vp);
-VALUE_PAIR	*paircopyvpdata(const DICT_ATTR *da, const VALUE_PAIR *vp);
-VALUE_PAIR	*paircopy(VALUE_PAIR *vp);
-VALUE_PAIR	*paircopy2(VALUE_PAIR *vp, unsigned int attr, unsigned int vendor, int8_t tag);
-void		pairmove(VALUE_PAIR **to, VALUE_PAIR **from);
-void		pairmove2(VALUE_PAIR **to, VALUE_PAIR **from, unsigned int attr, unsigned int vendor, int8_t tag);
-VALUE_PAIR	*pairparsevalue(VALUE_PAIR *vp, const char *value);
-VALUE_PAIR	*pairmake(const char *attribute, const char *value, FR_TOKEN op);
-VALUE_PAIR	*pairmake_xlat(const char *attribute, const char *value, FR_TOKEN op);
-VALUE_PAIR	*pairread(const char **ptr, FR_TOKEN *eol);
-FR_TOKEN	userparse(const char *buffer, VALUE_PAIR **first_pair);
-VALUE_PAIR	*readvp2(FILE *fp, int *pfiledone, const char *errprefix);
+int		paircmp_op(VALUE_PAIR const *one, FR_TOKEN op, VALUE_PAIR const *two);
+int8_t		pairlistcmp(VALUE_PAIR *a, VALUE_PAIR *b);
+void		pairsort(VALUE_PAIR **vps, bool with_tag);
+bool		pairvalidate(VALUE_PAIR *filter, VALUE_PAIR *list);
+bool 		pairvalidate_relaxed(VALUE_PAIR *filter, VALUE_PAIR *list);
+VALUE_PAIR	*paircopyvp(TALLOC_CTX *ctx, VALUE_PAIR const *vp);
+VALUE_PAIR	*paircopyvpdata(TALLOC_CTX *ctx, DICT_ATTR const *da, VALUE_PAIR const *vp);
+VALUE_PAIR	*paircopy(TALLOC_CTX *ctx, VALUE_PAIR *from);
+VALUE_PAIR	*paircopy2(TALLOC_CTX *ctx, VALUE_PAIR *from, unsigned int attr, unsigned int vendor, int8_t tag);
+VALUE_PAIR	*pairsteal(TALLOC_CTX *ctx, VALUE_PAIR *from);
+void		pairmemcpy(VALUE_PAIR *vp, uint8_t const * src, size_t len);
+void		pairmemsteal(VALUE_PAIR *vp, uint8_t *src);
+void		pairstrsteal(VALUE_PAIR *vp, char *src);
+void		pairstrcpy(VALUE_PAIR *vp, char const * src);
+void		pairsprintf(VALUE_PAIR *vp, char const * fmt, ...)
+#ifdef __GNUC__
+		__attribute__ ((format (printf, 2, 3)))
+#endif
+;
+void		pairmove(TALLOC_CTX *ctx, VALUE_PAIR **to, VALUE_PAIR **from);
+void		pairfilter(TALLOC_CTX *ctx, VALUE_PAIR **to, VALUE_PAIR **from,
+			   unsigned int attr, unsigned int vendor, int8_t tag);
+VALUE_PAIR  *pairmake_ip(TALLOC_CTX *ctx, char const *value,
+						 DICT_ATTR *ipv4, DICT_ATTR *ipv6, DICT_ATTR *ipv4_prefix, DICT_ATTR *ipv6_prefix);
+bool		pairparsevalue(VALUE_PAIR *vp, char const *value);
+VALUE_PAIR	*pairmake(TALLOC_CTX *ctx, VALUE_PAIR **vps, char const *attribute, char const *value, FR_TOKEN op);
+int 		pairmark_xlat(VALUE_PAIR *vp, char const *value);
+FR_TOKEN 	pairread(char const **ptr, VALUE_PAIR_RAW *raw);
+FR_TOKEN	userparse(TALLOC_CTX *ctx, char const *buffer, VALUE_PAIR **head);
+VALUE_PAIR	*readvp2(TALLOC_CTX *ctx, FILE *fp, int *pfiledone, char const *errprefix);
 
 /*
  *	Error functions.
  */
 #ifdef _LIBRADIUS
-void		fr_strerror_printf(const char *, ...)
+void		fr_strerror_printf(char const *, ...)
 #ifdef __GNUC__
 		__attribute__ ((format (printf, 1, 2)))
 #endif
 ;
 #endif
-void		fr_perror(const char *, ...)
+void		fr_perror(char const *, ...)
 #ifdef __GNUC__
 		__attribute__ ((format (printf, 1, 2)))
 #endif
 ;
-extern const char *fr_strerror(void);
-extern int	fr_dns_lookups;	/* 0 = no dns lookups */
+
+extern bool fr_assert_cond(char const *file, int line, char const *expr, bool cond);
+#define fr_assert(_x) fr_assert_cond(__FILE__,  __LINE__, #_x, (_x))
+
+extern void _fr_exit(char const *file, int line, int status);
+#define fr_exit(_x) _fr_exit(__FILE__,  __LINE__, (_x))
+
+extern void _fr_exit_now(char const *file, int line, int status);
+#define fr_exit_now(_x) _fr_exit_now(__FILE__,  __LINE__, (_x))
+
+extern char const *fr_strerror(void);
+extern char const *fr_syserror(int num);
+extern bool	fr_dns_lookups;	/* do IP -> hostname lookups? */
+extern bool	fr_hostname_lookups; /* do hostname -> IP lookups? */
 extern int	fr_debug_flag;	/* 0 = no debugging information */
 extern int	fr_max_attributes; /* per incoming packet */
 #define	FR_MAX_PACKET_CODE (52)
-extern const char *fr_packet_codes[FR_MAX_PACKET_CODE];
+extern char const *fr_packet_codes[FR_MAX_PACKET_CODE];
 extern FILE	*fr_log_fp;
 extern void rad_print_hex(RADIUS_PACKET *packet);
-void		fr_printf_log(const char *, ...)
+void		fr_printf_log(char const *, ...)
 #ifdef __GNUC__
 		__attribute__ ((format (printf, 1, 2)))
 #endif
@@ -459,28 +605,50 @@ void		fr_printf_log(const char *, ...)
 /*
  *	Several handy miscellaneous functions.
  */
-const char 	*ip_ntoa(char *, uint32_t);
-char		*ifid_ntoa(char *buffer, size_t size, const uint8_t *ifid);
-uint8_t		*ifid_aton(const char *ifid_str, uint8_t *ifid);
+TALLOC_CTX	*fr_autofree_ctx(void);
+char const	*fr_inet_ntop(int af, void const *src);
+char const 	*ip_ntoa(char *, uint32_t);
+char		*ifid_ntoa(char *buffer, size_t size, uint8_t const *ifid);
+uint8_t		*ifid_aton(char const *ifid_str, uint8_t *ifid);
 int		rad_lockfd(int fd, int lock_len);
 int		rad_lockfd_nonblock(int fd, int lock_len);
 int		rad_unlockfd(int fd, int lock_len);
-void		fr_bin2hex(const uint8_t *bin, char *hex, size_t len);
-size_t		fr_hex2bin(const char *hex, uint8_t *bin, size_t len);
-int fr_ipaddr_cmp(const fr_ipaddr_t *a, const fr_ipaddr_t *b);
+size_t		fr_bin2hex(char *hex, uint8_t const *bin, size_t inlen);
+size_t		fr_hex2bin(uint8_t *bin, char const *hex, size_t outlen);
+uint32_t	fr_strtoul(char const *value, char **end);
+bool		fr_whitespace_check(char const *value);
 
-int		ip_hton(const char *src, int af, fr_ipaddr_t *dst);
-const char	*ip_ntoh(const fr_ipaddr_t *src, char *dst, size_t cnt);
-int fr_ipaddr2sockaddr(const fr_ipaddr_t *ipaddr, int port,
+int		fr_ipaddr_cmp(fr_ipaddr_t const *a, fr_ipaddr_t const *b);
+
+int		ip_ptonx(char const *src, fr_ipaddr_t *dst);
+int		ip_hton(char const *src, int af, fr_ipaddr_t *dst);
+char const	*ip_ntoh(fr_ipaddr_t const *src, char *dst, size_t cnt);
+int fr_ipaddr2sockaddr(fr_ipaddr_t const *ipaddr, int port,
 		       struct sockaddr_storage *sa, socklen_t *salen);
-int fr_sockaddr2ipaddr(const struct sockaddr_storage *sa, socklen_t salen,
+int fr_sockaddr2ipaddr(struct sockaddr_storage const *sa, socklen_t salen,
 		       fr_ipaddr_t *ipaddr, int * port);
+ssize_t		fr_utf8_to_ucs2(uint8_t *out, size_t outlen, char const *in, size_t inlen);
+int64_t		fr_pow(int32_t base, uint8_t exp);
+int		fr_get_time(char const *date_str, time_t *date);
 
+/*
+ *	Define TALLOC_DEBUG to check overflows with talloc.
+ *	we can't use valgrind, because the memory used by
+ *	talloc is valid memory... just not for us.
+ */
+#ifdef TALLOC_DEBUG
+void fr_talloc_verify_cb(const void *ptr, int depth,
+			 int max_depth, int is_ref,
+			 void *private_data);
+#define VERIFY_ALL_TALLOC talloc_report_depth_cb(NULL, 0, -1, fr_talloc_verify_cb, NULL)
+#else
+#define VERIFY_ALL_TALLOC
+#endif
 
 #ifdef WITH_ASCEND_BINARY
 /* filters.c */
 int		ascend_parse_filter(VALUE_PAIR *pair);
-void		print_abinary(const VALUE_PAIR *vp, char *buffer, size_t len, int delimitst);
+void		print_abinary(char *out, size_t outlen, VALUE_PAIR const *vp,  int8_t quote);
 #endif /*WITH_ASCEND_BINARY*/
 
 /* random numbers in isaac.c */
@@ -497,11 +665,25 @@ typedef struct fr_randctx {
 void fr_isaac(fr_randctx *ctx);
 void fr_randinit(fr_randctx *ctx, int flag);
 uint32_t fr_rand(void);	/* like rand(), but better. */
-void fr_rand_seed(const void *, size_t ); /* seed the random pool */
+void fr_rand_seed(void const *, size_t ); /* seed the random pool */
 
 
 /* crypt wrapper from crypt.c */
-int fr_crypt_check(const char *key, const char *salt);
+int fr_crypt_check(char const *key, char const *salt);
+
+/* cbuff.c */
+typedef struct fr_cbuff fr_cbuff_t;
+
+fr_cbuff_t	*fr_cbuff_alloc(TALLOC_CTX *ctx, uint32_t size, bool lock);
+void		fr_cbuff_rp_insert(fr_cbuff_t *cbuff, void *obj);
+void		*fr_cbuff_rp_next(fr_cbuff_t *cbuff, TALLOC_CTX *ctx);
+
+/* debug.c */
+typedef struct fr_bt_marker fr_bt_marker_t;
+
+void			fr_debug_break(void);
+void			backtrace_print(fr_cbuff_t *cbuff, void *obj);
+fr_bt_marker_t		*fr_backtrace_attach(fr_cbuff_t **cbuff, TALLOC_CTX *obj);
 
 /* rbtree.c */
 typedef struct rbtree_t rbtree_t;
@@ -510,22 +692,22 @@ typedef struct rbnode_t rbnode_t;
 #define RBTREE_FLAG_NONE    (0)
 #define RBTREE_FLAG_REPLACE (1 << 0)
 #define RBTREE_FLAG_LOCK    (1 << 1)
-rbtree_t       *rbtree_create(int (*Compare)(const void *, const void *),
+rbtree_t       *rbtree_create(int (*Compare)(void const *, void const *),
 			      void (*freeNode)(void *),
 			      int flags);
 void		rbtree_free(rbtree_t *tree);
-int		rbtree_insert(rbtree_t *tree, void *Data);
+bool		rbtree_insert(rbtree_t *tree, void *Data);
 rbnode_t	*rbtree_insertnode(rbtree_t *tree, void *Data);
 void		rbtree_delete(rbtree_t *tree, rbnode_t *Z);
-int		rbtree_deletebydata(rbtree_t *tree, const void *data);
-rbnode_t       *rbtree_find(rbtree_t *tree, const void *Data);
-void	       *rbtree_finddata(rbtree_t *tree, const void *Data);
+bool		rbtree_deletebydata(rbtree_t *tree, void const *data);
+rbnode_t       *rbtree_find(rbtree_t *tree, void const *Data);
+void	       *rbtree_finddata(rbtree_t *tree, void const *Data);
 int		rbtree_num_elements(rbtree_t *tree);
 void	       *rbtree_min(rbtree_t *tree);
 void	       *rbtree_node2data(rbtree_t *tree, rbnode_t *node);
 
 /* callback order for walking  */
-typedef enum { PreOrder, InOrder, PostOrder } RBTREE_ORDER;
+typedef enum { PreOrder, InOrder, PostOrder, DeleteOrder } RBTREE_ORDER;
 
 /*
  *	The callback should be declared as:
@@ -537,8 +719,33 @@ typedef enum { PreOrder, InOrder, PostOrder } RBTREE_ORDER;
  *
  *	It should return 0 if all is OK, and !0 for any error.
  *	The walking will stop on any error.
+ *
+ *	Except with DeleteOrder, where the callback should return <0 for
+ *	errors, and may return 1 to delete the current node and halt,
+ *	or 2 to delete the current node and continue.  This may be
+ *	used to batch-delete select nodes from a locked rbtree.
  */
 int rbtree_walk(rbtree_t *tree, RBTREE_ORDER order, int (*callback)(void *, void *), void *context);
+
+/*
+ *	Find a matching data item in an rbtree and, if one is found,
+ *	perform a callback on it.
+ *
+ *	The callback is similar to rbtree_walk above, except that a
+ *	positive return code from the callback will cause the found node
+ *	to be deleted from the tree.  If the tree was created with
+ *	RBTREE_FLAG_LOCK, then the entire find/callback/delete/rebalance
+ *	sequence happens while the lock is held.
+ *
+ *	Note that the callback MUST NOT alter any of the data which
+ *	is used as the rbtree key, nor attempt to alter the rest of
+ *	the rbtree in any way.
+ *
+ *	Returns a pointer to the user data in the found node, or NULL if the
+ *	item was not found, or NULL if the item was deleted and the tree was
+ *	created with a freeNode garbage collection routine.
+ */
+void *rbtree_callbydata(rbtree_t *tree, void const *Data, int (*callback)(void *, void *), void *context);
 
 /*
  *	FIFOs

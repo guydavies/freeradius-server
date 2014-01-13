@@ -24,7 +24,6 @@
 #ifndef _EAP_H
 #define _EAP_H
 
-#include <freeradius-devel/ident.h>
 RCSIDH(eap_h, "$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -46,8 +45,8 @@ RCSIDH(eap_h, "$Id$")
  *  we send EAP-Request/EAP-success/EAP-failure
  */
 typedef struct eap_ds {
-	EAP_PACKET	*response;
-	EAP_PACKET	*request;
+	eap_packet_t	*response;
+	eap_packet_t	*request;
 	int		set_request_id;
 } EAP_DS;
 
@@ -64,7 +63,7 @@ typedef enum operation_t {
 
 
 /*
- * EAP_HANDLER is the interface for any EAP-Type.
+ * eap_handler_t is the interface for any EAP-Type.
  * Each handler contains information for one specific EAP-Type.
  * This way we don't need to change any interfaces in future.
  * It is also a list of EAP-request handlers waiting for EAP-response
@@ -74,7 +73,7 @@ typedef enum operation_t {
  * state = state attribute from the reply we sent
  * state_len = length of data in the state attribute.
  * src_ipaddr = client which sent us the RADIUS request containing
- *              this EAP conversation.
+ *	      this EAP conversation.
  * eap_id = copy of EAP id we sent to the client.
  * timestamp  = timestamp when this handler was last used.
  * identity = Identity, as obtained, from EAP-Identity response.
@@ -96,14 +95,16 @@ typedef struct _eap_handler {
 	struct _eap_handler *prev, *next;
 	uint8_t		state[EAP_STATE_LEN];
 	fr_ipaddr_t	src_ipaddr;
-	unsigned int	eap_id;
-	unsigned int	eap_type;
+
+	uint8_t		eap_id;		//!< EAP Identifier used to match
+					//!< requests and responses.
+	eap_type_t	type;		//!< EAP type number.
 
 	time_t		timestamp;
 
 	REQUEST		*request;
 
-	char		*identity; /* User name from EAP-Identity */
+	char		*identity;	//!< User name from EAP-Identity
 
 	EAP_DS 		*prev_eapds;
 	EAP_DS 		*eap_ds;
@@ -121,19 +122,19 @@ typedef struct _eap_handler {
 	int		tls;
 	int		finished;
 	VALUE_PAIR	*certs;
-} EAP_HANDLER;
+} eap_handler_t;
 
 /*
  * Interface to call EAP sub mdoules
  */
-typedef struct eap_type_t {
-	const 	char *name;
-	int	(*attach)(CONF_SECTION *conf, void **type_data);
-	int	(*initiate)(void *type_data, EAP_HANDLER *handler);
-	int	(*authorize)(void *type_data, EAP_HANDLER *handler);
-	int	(*authenticate)(void *type_data, EAP_HANDLER *handler);
-	int	(*detach)(void *type_data);
-} EAP_TYPE;
+typedef struct rlm_eap_module {
+	char const *name;
+	int (*attach)(CONF_SECTION *conf, void **instance);
+	int (*initiate)(void *instance, eap_handler_t *handler);
+	int (*authorize)(void *instance, eap_handler_t *handler);
+	int (*authenticate)(void *instance, eap_handler_t *handler);
+	int (*detach)(void *instance);
+} rlm_eap_module_t;
 
 #define REQUEST_DATA_EAP_HANDLER	 (1)
 #define REQUEST_DATA_EAP_TUNNEL_CALLBACK PW_EAP_MESSAGE
@@ -143,7 +144,8 @@ typedef struct eap_type_t {
 /*
  *	This is for tunneled callbacks
  */
-typedef int (*eap_tunnel_callback_t)(EAP_HANDLER *handler, void *tls_session);
+typedef int (*eap_tunnel_callback_t)(eap_handler_t *handler, void *tls_session);
+
 typedef struct eap_tunnel_data_t {
   void			*tls_session;
   eap_tunnel_callback_t callback;

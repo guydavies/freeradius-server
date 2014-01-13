@@ -21,16 +21,15 @@
  * Copyright 2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
+USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #include <freeradius-devel/radiusd.h>
 
 #ifdef WITH_TLS
-
-void cbtls_info(const SSL *s, int where, int ret)
+void cbtls_info(SSL const *s, int where, int ret)
 {
-	const char *str, *state;
+	char const *str, *state;
 	int w;
 	REQUEST *request = SSL_get_ex_data(s, FR_TLS_EX_INDEX_REQUEST);
 	char buffer[1024];
@@ -73,15 +72,8 @@ void cbtls_info(const SSL *s, int where, int ret)
 		}
 	}
 
-	if (buffer[0]) {
-		radlog(L_ERR, "%s", buffer);
-		
-		if (request) {
-			VALUE_PAIR *vp;
-			
-			vp = pairmake("Module-Failure-Message", buffer, T_OP_ADD);
-			if (vp) pairadd(&request->packet->vps, vp);
-		}
+	if (buffer[0] && request) {
+		REDEBUG("SSL says: %s", buffer);
 	}
 }
 
@@ -89,7 +81,7 @@ void cbtls_info(const SSL *s, int where, int ret)
  *	Fill in our 'info' with TLS data.
  */
 void cbtls_msg(int write_p, int msg_version, int content_type,
-	       const void *buf, size_t len,
+	       void const *buf, size_t len,
 	       SSL *ssl UNUSED, void *arg)
 {
 	tls_session_t *state = (tls_session_t *)arg;
@@ -107,12 +99,12 @@ void cbtls_msg(int write_p, int msg_version, int content_type,
 	state->info.initialized = 1;
 
 	if (content_type == SSL3_RT_ALERT) {
-		state->info.alert_level = ((const unsigned char*)buf)[0];
-		state->info.alert_description = ((const unsigned char*)buf)[1];
+		state->info.alert_level = ((unsigned char const *)buf)[0];
+		state->info.alert_description = ((unsigned char const *)buf)[1];
 		state->info.handshake_type = 0x00;
 
 	} else if (content_type == SSL3_RT_HANDSHAKE) {
-		state->info.handshake_type = ((const unsigned char*)buf)[0];
+		state->info.handshake_type = ((unsigned char const *)buf)[0];
 		state->info.alert_level = 0x00;
 		state->info.alert_description = 0x00;
 	}

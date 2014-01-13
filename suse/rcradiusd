@@ -13,12 +13,15 @@
 ### BEGIN INIT INFO
 # Provides:          radiusd
 # Required-Start:    $network $syslog $remotefs
-# Required-Stop:
+# Should-Start:      $time ypbind smtp
+# Required-Stop:     $syslog $remote_fs
+# Should-Stop:       ypbind smtp
 # Default-Start:     3 5
 # Default-Stop:      0 1 2 6
 # Short-Description: RADIUS-Server
 # Description:       Remote Authentication Dialin User Server
 ### END INIT INFO
+
 
 RADIUSD_BIN=/usr/sbin/radiusd
 test -x $RADIUSD_BIN || { echo "$RADIUSD_BIN not installed"; \
@@ -56,6 +59,7 @@ case "$1" in
     restart)
         ## Stop the service and regardless of whether it was
         ## running or not, start it again.
+        $0 configtest "$@" || { rc_failed $?; rc_exit; }
 	$0 stop
 	$0 start
 	rc_status
@@ -64,7 +68,7 @@ case "$1" in
         ## Signal the daemon to reload its config. Most daemons
         ## do this on signal 1 (SIGHUP).
         ## If it does not support it, restart.
-
+        $0 configtest "$@" || { rc_failed $?; rc_exit; }
 	echo -n "Reload RADIUS daemon "
         killproc -HUP $RADIUSD_BIN
         rc_status -v
@@ -72,7 +76,7 @@ case "$1" in
     reload)
         ## Like force-reload, but if daemon does not support
         ## signalling, do nothing (!)
-
+        $0 configtest "$@" || { rc_failed $?; rc_exit; }
 	echo -n "Reload RADIUS daemon "
 	killproc -HUP $RADIUSD_BIN 
 	rc_status -v
@@ -82,8 +86,17 @@ case "$1" in
 	checkproc $RADIUSD_BIN
 	rc_status -v
 	;;
+   configtest|testconfig)
+   	echo -n "Checking config for radiusd "
+   	$RADIUSD_BIN -C
+   	rc_status -v
+   	;;
+   debug)
+   	$RADIUSD_BIN -X
+   	rc_status -v
+   	;;
     *)
-	echo "Usage: $0 {start|stop|status|try-restart|restart|force-reload|reload}"
+	echo "Usage: $0 {start|stop|status|try-restart|restart|force-reload|reload|configtest|debug}"
 	exit 1
 	;;
 esac

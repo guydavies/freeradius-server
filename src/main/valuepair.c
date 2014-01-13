@@ -27,7 +27,6 @@
  * @copyright 2000  Alan DeKok <aland@ox.org>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <ctype.h>
@@ -35,64 +34,20 @@ RCSID("$Id$")
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/rad_assert.h>
 
-#ifdef HAVE_PCREPOSIX_H
-#include <pcreposix.h>
-#else
-#ifdef HAVE_REGEX_H
-#	include <regex.h>
-
-/*
- *  For POSIX Regular expressions.
- *  (0) Means no extended regular expressions.
- *  REG_EXTENDED means use extended regular expressions.
- */
-#ifndef REG_EXTENDED
-#define REG_EXTENDED (0)
-#endif
-
-#ifndef REG_NOSUB
-#define REG_NOSUB (0)
-#endif
-#endif
-#endif
-
-const FR_NAME_NUMBER pair_lists[] = {
-	{ "request",		PAIR_LIST_REQUEST },
-	{ "reply",		PAIR_LIST_REPLY },
-	{ "config",		PAIR_LIST_CONTROL },
-	{ "control",		PAIR_LIST_CONTROL },
-#ifdef WITH_PROXY
-	{ "proxy-request",	PAIR_LIST_PROXY_REQUEST },
-	{ "proxy-reply",	PAIR_LIST_PROXY_REPLY },
-#endif
-#ifdef WITH_COA
-	{ "coa",		PAIR_LIST_COA },
-	{ "coa-reply",		PAIR_LIST_COA_REPLY },
-	{ "disconnect",		PAIR_LIST_DM },
-	{ "disconnect-reply",	PAIR_LIST_DM_REPLY },
-#endif
-	{  NULL , -1 }
-};
-
-const FR_NAME_NUMBER request_refs[] = {
-	{ "outer",		REQUEST_OUTER },
-	{ "current",		REQUEST_CURRENT },
-	{ "parent",		REQUEST_PARENT },
-	{  NULL , -1 }
-};
-
 const FR_NAME_NUMBER vpt_types[] = {
 	{"unknown",		VPT_TYPE_UNKNOWN },
 	{"literal",		VPT_TYPE_LITERAL },
 	{"expanded",		VPT_TYPE_XLAT },
 	{"attribute ref",	VPT_TYPE_ATTR },
 	{"list",		VPT_TYPE_LIST },
-	{"exec",		VPT_TYPE_EXEC }
+	{"exec",		VPT_TYPE_EXEC },
+	{"value-pair-data",	VPT_TYPE_DATA }
 };
 
 struct cmp {
-	unsigned int attribute;
-	unsigned int otherattr;
+	DICT_ATTR const *attribute;
+	DICT_ATTR const *from;
+	bool	first_only;
 	void *instance; /* module instance */
 	RAD_COMPARE_FUNC compare;
 	struct cmp *next;
@@ -104,13 +59,15 @@ static struct cmp *cmp;
  * Does not call any per-attribute comparison function, but does honour
  * check.operator. Basically does "vp.value check.op check.value".
  *
- * @param request Current request
- * @param check rvalue, and operator
- * @param vp lvalue
+ * @param request Current request.
+ * @param check rvalue, and operator.
+ * @param vp lvalue.
+ * @return 0 if check and vp are equal, -1 if vp value is less than check value, 1 is vp value is more than check
+ *	value, -2 on error.
  */
 int radius_compare_vps(REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *vp)
 {
-	int ret = -2;
+	int ret = 0;
 
 	/*
 	 *      Check for =* and !* and return appropriately
@@ -120,7 +77,7 @@ int radius_compare_vps(REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *vp)
 
 #ifdef HAVE_REGEX_H
 	if (check->op == T_OP_REG_EQ) {
-		int i, compare;
+		int compare;
 		regex_t reg;
 		char value[1024];
 		regmatch_t rxmatch[REQUEST_MAX_REGEX + 1];
@@ -135,63 +92,17 @@ int radius_compare_vps(REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *vp)
 			char buffer[256];
 			regerror(compare, &reg, buffer, sizeof(buffer));
 
-			RDEBUG("Invalid regular expression %s: %s",
-			       check->vp_strvalue, buffer);
-			return -1;
+			RDEBUG("Invalid regular expression %s: %s", check->vp_strvalue, buffer);
+			return -2;
 		}
-		compare = regexec(&reg, value,  REQUEST_MAX_REGEX + 1,
-				  rxmatch, 0);
+
+		memset(&rxmatch, 0, sizeof(rxmatch));	/* regexec does not seem to initialise unused elements */
+		compare = regexec(&reg, value, REQUEST_MAX_REGEX + 1, rxmatch, 0);
 		regfree(&reg);
+		rad_regcapture(request, compare, value, rxmatch);
 
-		/*
-		 *	Add %{0}, %{1}, etc.
-		 */
-		for (i = 0; i <= REQUEST_MAX_REGEX; i++) {
-			char *p;
-			char buffer[sizeof(check->vp_strvalue)];
-
-			/*
-			 *	Didn't match: delete old
-			 *	match, if it existed.
-			 */
-			if ((compare != 0) ||
-			    (rxmatch[i].rm_so == -1)) {
-				p = request_data_get(request, request,
-						     REQUEST_DATA_REGEX | i);
-				if (p) {
-					free(p);
-					continue;
-				}
-
-				/*
-				 *	No previous match
-				 *	to delete, stop.
-				 */
-				break;
-			}
-
-			/*
-			 *	Copy substring into buffer.
-			 */
-			memcpy(buffer, value + rxmatch[i].rm_so,
-			       rxmatch[i].rm_eo - rxmatch[i].rm_so);
-			buffer[rxmatch[i].rm_eo - rxmatch[i].rm_so] = '\0';
-
-			/*
-			 *	Copy substring, and add it to
-			 *	the request.
-			 *
-			 *	Note that we don't check
-			 *	for out of memory, which is
-			 *	the only error we can get...
-			 */
-			p = strdup(buffer);
-			request_data_add(request, request,
-					 REQUEST_DATA_REGEX | i,
-					 p, free);
-		}
-		if (compare == 0) return 0;
-		return -1;
+		ret = (compare == 0) ? 0 : -1;
+		goto finish;
 	}
 
 	if (check->op == T_OP_REG_NE) {
@@ -205,39 +116,44 @@ int radius_compare_vps(REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *vp)
 		/*
 		 *	Include substring matches.
 		 */
-		compare = regcomp(&reg, (char *)check->vp_strvalue,
-				  REG_EXTENDED);
+		compare = regcomp(&reg, check->vp_strvalue, REG_EXTENDED);
 		if (compare != 0) {
 			char buffer[256];
 			regerror(compare, &reg, buffer, sizeof(buffer));
 
-			RDEBUG("Invalid regular expression %s: %s",
-			       check->vp_strvalue, buffer);
-			return -1;
+			RDEBUG("Invalid regular expression %s: %s", check->vp_strvalue, buffer);
+			return -2;
 		}
-		compare = regexec(&reg, value,  REQUEST_MAX_REGEX + 1,
-				  rxmatch, 0);
+		compare = regexec(&reg, value,  REQUEST_MAX_REGEX + 1, rxmatch, 0);
 		regfree(&reg);
 
-		if (compare != 0) return 0;
-		return -1;
-
+		ret = (compare != 0) ? 0 : -1;
 	}
 #endif
+
+	/*
+	 *	Attributes must be of the same type.
+	 *
+	 *	FIXME: deal with type mismatch properly if one side contain
+	 *	ABINARY, OCTETS or STRING by converting the other side to
+	 *	a string
+	 *
+	 */
+	if (vp->da->type != check->da->type) return -1;
 
 	/*
 	 *	Tagged attributes are equal if and only if both the
 	 *	tag AND value match.
 	 */
-	if (check->flags.has_tag) {
-		ret = ((int) vp->flags.tag) - ((int) check->flags.tag);
-		if (ret != 0) return ret;
+	if (check->da->flags.has_tag) {
+		ret = ((int) vp->tag) - ((int) check->tag);
+		goto finish;
 	}
 
 	/*
 	 *	Not a regular expression, compare the types.
 	 */
-	switch(check->type) {
+	switch(check->da->type) {
 #ifdef WITH_ASCEND_BINARY
 		/*
 		 *	Ascend binary attributes can be treated
@@ -255,8 +171,8 @@ int radius_compare_vps(REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *vp)
 			break;
 
 		case PW_TYPE_STRING:
-			ret = strcmp((char *)vp->vp_strvalue,
-				     (char *)check->vp_strvalue);
+			ret = strcmp(vp->vp_strvalue,
+				     check->vp_strvalue);
 			break;
 
 		case PW_TYPE_BYTE:
@@ -315,23 +231,31 @@ int radius_compare_vps(REQUEST *request, VALUE_PAIR *check, VALUE_PAIR *vp)
 			break;
 	}
 
-	return ret;
+	finish:
+	if (ret > 0) {
+		return 1;
+	}
+	if (ret < 0) {
+		return -1;
+	}
+	return 0;
 }
 
 
-/** Compare check and vp. May call the attribute compare function.
+/** Compare check and vp. May call the attribute comparison function.
  *
  * Unlike radius_compare_vps() this function will call any attribute-specific
- * comparison function.
+ * comparison functions registered.
  *
- * @param req Current request
- * @param request value pairs in the reqiest
- * @param check
- * @param check_pairs
- * @param reply_pairs value pairs in the reply
- * @return 
+ * @param request Current request.
+ * @param req list pairs.
+ * @param check item to compare.
+ * @param check_pairs list.
+ * @param reply_pairs list.
+ * @return 0 if check and vp are equal, -1 if vp value is less than check value, 1 is vp value is more than check
+ *	value.
  */
-int radius_callback_compare(REQUEST *req, VALUE_PAIR *request,
+int radius_callback_compare(REQUEST *request, VALUE_PAIR *req,
 			    VALUE_PAIR *check, VALUE_PAIR *check_pairs,
 			    VALUE_PAIR **reply_pairs)
 {
@@ -349,72 +273,75 @@ int radius_callback_compare(REQUEST *req, VALUE_PAIR *request,
 	 *	FIXME: use new RB-Tree code.
 	 */
 	for (c = cmp; c; c = c->next) {
-		if ((c->attribute == check->attribute) &&
-		    (check->vendor == 0)) {
-			return (c->compare)(c->instance, req, request, check,
+		if (c->attribute == check->da) {
+			return (c->compare)(c->instance, request, req, check,
 				check_pairs, reply_pairs);
 		}
 	}
 
-	if (!request) return -1; /* doesn't exist, don't compare it */
+	if (!req) return -1; /* doesn't exist, don't compare it */
 
-	return radius_compare_vps(req, check, request);
+	return radius_compare_vps(request, check, req);
 }
 
 
 /** Find a comparison function for two attributes.
  *
- * @param attribute
+ * @todo this should probably take DA's.
+ * @param attribute to find comparison function for.
+ * @return true if a comparison function was found, else false.
  */
-int radius_find_compare(unsigned int attribute)
+int radius_find_compare(DICT_ATTR const *attribute)
 {
 	struct cmp *c;
 
 	for (c = cmp; c; c = c->next) {
 		if (c->attribute == attribute) {
-			return TRUE;
+			return true;
 		}
 	}
 
-	return FALSE;
+	return false;
 }
 
 
 /** See what attribute we want to compare with.
  *
- * @param attribute
+ * @param attribute to find comparison function for.
+ * @param from reference to compare with
+ * @return true if the comparison callback require a matching attribue in the request, else false.
  */
-static int otherattr(unsigned int attribute)
+static bool otherattr(DICT_ATTR const *attribute, DICT_ATTR const **from)
 {
 	struct cmp *c;
 
 	for (c = cmp; c; c = c->next) {
 		if (c->attribute == attribute) {
-			return c->otherattr;
+			*from = c->from;
+			return c->first_only;
 		}
 	}
 
-	return attribute;
+	*from = attribute;
+	return false;
 }
 
 /** Register a function as compare function.
  *
- * @param attribute
- * @param other_attr we want to compare with. Normally this is the
- *	same as attribute.
- * You can set this to:
- *	- -1	The same as attribute.
- *	- 0	Always call compare function, not tied to request attribute.
- *	- >0	Attribute to compare with. For example, PW_GROUP in a check
- *		item needs to be compared with PW_USER_NAME in the incoming request.
+ * @param attribute to register comparison function for.
+ * @param from the attribute we want to compare with. Normally this is the same as attribute.
+ *  If null call the comparison function on every attributes in the request if first_only is false
+ * @param first_only will decide if we loop over the request attributes or stop on the first one
  * @param func comparison function
  * @param instance argument to comparison function
  * @return 0
  */
-int paircompare_register(unsigned int attribute, int other_attr, 
-			 RAD_COMPARE_FUNC func, void *instance)
+int paircompare_register(DICT_ATTR const *attribute, DICT_ATTR const *from,
+			 bool first_only, RAD_COMPARE_FUNC func, void *instance)
 {
 	struct cmp *c;
+
+	rad_assert(attribute != NULL);
 
 	paircompare_unregister(attribute, func);
 
@@ -422,7 +349,8 @@ int paircompare_register(unsigned int attribute, int other_attr,
 
 	c->compare   = func;
 	c->attribute = attribute;
-	c->otherattr = other_attr;
+	c->from = from;
+	c->first_only = first_only;
 	c->instance  = instance;
 	c->next      = cmp;
 	cmp = c;
@@ -432,11 +360,10 @@ int paircompare_register(unsigned int attribute, int other_attr,
 
 /** Unregister comparison function for an attribute
  *
- * @param attribute attribute to unregister for.
+ * @param attribute dict reference to unregister for.
  * @param func comparison function to remove.
- * @return Void.
  */
-void paircompare_unregister(unsigned int attribute, RAD_COMPARE_FUNC func)
+void paircompare_unregister(DICT_ATTR const *attribute, RAD_COMPARE_FUNC func)
 {
 	struct cmp *c, *last;
 
@@ -459,31 +386,55 @@ void paircompare_unregister(unsigned int attribute, RAD_COMPARE_FUNC func)
 	free(c);
 }
 
+/** Unregister comparison function for a module
+ *
+ *  All paircompare() functions for this module will be unregistered.
+ *
+ * @param instance the module instance
+ */
+void paircompare_unregister_instance(void *instance)
+{
+	struct cmp *c, **tail;
+
+	tail = &cmp;
+	while ((c = *tail) != NULL) {
+		if (c->instance == instance) {
+			*tail = c->next;
+			free(c);
+			continue;
+		}
+
+		tail = &(c->next);
+	}
+}
+
 /** Compare two pair lists except for the password information.
  *
  * For every element in "check" at least one matching copy must be present
  * in "reply".
  *
- * @param req Current request
- * @param request request valuepairs
- * @param check check/control valuepairs
- * @param[in,out] reply reply value pairs
+ * @param[in] request Current request.
+ * @param[in] req_list request valuepairs.
+ * @param[in] check Check/control valuepairs.
+ * @param[in,out] rep_list Reply value pairs.
  *
  * @return 0 on match.
  */
-int paircompare(REQUEST *req, VALUE_PAIR *request, VALUE_PAIR *check,
-		VALUE_PAIR **reply)
+int paircompare(REQUEST *request, VALUE_PAIR *req_list, VALUE_PAIR *check,
+		VALUE_PAIR **rep_list)
 {
+	vp_cursor_t cursor;
 	VALUE_PAIR *check_item;
 	VALUE_PAIR *auth_item;
-	
+	DICT_ATTR const *from;
+
 	int result = 0;
 	int compare;
-	int other;
+	bool first_only;
 
-	for (check_item = check;
-	     check_item != NULL;
-	     check_item = check_item->next) {
+	for (check_item = fr_cursor_init(&cursor, &check);
+	     check_item;
+	     check_item = fr_cursor_next(&cursor)) {
 		/*
 		 *	If the user is setting a configuration value,
 		 *	then don't bother comparing it to any attributes
@@ -494,7 +445,7 @@ int paircompare(REQUEST *req, VALUE_PAIR *request, VALUE_PAIR *check,
 			continue;
 		}
 
-		switch (check_item->attribute) {
+		if (!check_item->da->vendor) switch (check_item->da->attr) {
 			/*
 			 *	Attributes we skip during comparison.
 			 *	These are "server" check items.
@@ -519,11 +470,11 @@ int paircompare(REQUEST *req, VALUE_PAIR *request, VALUE_PAIR *check,
 			 */
 			case PW_USER_PASSWORD:
 				if (check_item->op == T_OP_CMP_EQ) {
-					DEBUG("WARNING: Found User-Password == \"...\".");
-					DEBUG("WARNING: Are you sure you don't mean Cleartext-Password?");
-					DEBUG("WARNING: See \"man rlm_pap\" for more information.");
+					WDEBUG("Found User-Password == \"...\".");
+					WDEBUG("Are you sure you don't mean Cleartext-Password?");
+					WDEBUG("See \"man rlm_pap\" for more information");
 				}
-				if (pairfind(request, PW_USER_PASSWORD, 0, TAG_ANY) == NULL) {
+				if (pairfind(req_list, PW_USER_PASSWORD, 0, TAG_ANY) == NULL) {
 					continue;
 				}
 				break;
@@ -532,15 +483,13 @@ int paircompare(REQUEST *req, VALUE_PAIR *request, VALUE_PAIR *check,
 		/*
 		 *	See if this item is present in the request.
 		 */
-		other = otherattr(check_item->attribute);
+		first_only = otherattr(check_item->da, &from);
 
-		auth_item = request;
+		auth_item = req_list;
 	try_again:
-		if (other >= 0) {
+		if (!first_only) {
 			while (auth_item != NULL) {
-				if ((auth_item->attribute == 
-				    (unsigned int) other) ||
-				    (other == 0)) {
+				if ((auth_item->da == from) || (!from)) {
 					break;
 				}
 				auth_item = auth_item->next;
@@ -575,33 +524,20 @@ int paircompare(REQUEST *req, VALUE_PAIR *request, VALUE_PAIR *check,
 		 *	We've got to xlat the string before doing
 		 *	the comparison.
 		 */
-		if (check_item->flags.do_xlat) {
-			int rcode;
-			char buffer[sizeof(check_item->vp_strvalue)];
-
-			check_item->flags.do_xlat = 0;
-			rcode = radius_xlat(buffer, sizeof(buffer),
-					    check_item->vp_strvalue,
-					    req, NULL, NULL);
-
-			/*
-			 *	Parse the string into a new value.
-			 */
-			pairparsevalue(check_item, buffer);
-		}
+		radius_xlat_do(request, check_item);
 
 		/*
 		 *	OK it is present now compare them.
 		 */
-		compare = radius_callback_compare(req, auth_item, check_item,
-						  check, reply);
+		compare = radius_callback_compare(request, auth_item,
+						  check_item, check, rep_list);
 
 		switch (check_item->op) {
 			case T_OP_EQ:
 			default:
-				radlog(L_INFO,  "Invalid operator for item %s: "
-						"reverting to '=='", check_item->name);
-
+				RWDEBUG("Invalid operator '%s' for item %s: reverting to '=='",
+					fr_int2str(fr_tokens, check_item->op, "<INVALID>"), check_item->da->name);
+				/* FALL-THROUGH */
 			case T_OP_CMP_TRUE:
 			case T_OP_CMP_FALSE:
 			case T_OP_CMP_EQ:
@@ -640,7 +576,7 @@ int paircompare(REQUEST *req, VALUE_PAIR *request, VALUE_PAIR *check,
 		 *	This attribute didn't match, but maybe there's
 		 *	another of the same attribute, which DOES match.
 		 */
-		if ((result != 0) && (other >= 0)) {
+		if ((result != 0) && (!first_only)) {
 			auth_item = auth_item->next;
 			result = 0;
 			goto try_again;
@@ -651,11 +587,49 @@ int paircompare(REQUEST *req, VALUE_PAIR *request, VALUE_PAIR *check,
 	return result;
 }
 
+/** Expands an attribute marked with pairmark_xlat
+ *
+ * Writes the new value to the vp.
+ *
+ * @param request Current request.
+ * @param vp to expand.
+ * @return 0 if successful else -1 (on xlat failure) or -2 (on parse failure).
+ *	On failure pair will still no longer be marked for xlat expansion.
+ */
+int radius_xlat_do(REQUEST *request, VALUE_PAIR *vp)
+{
+	ssize_t len;
+
+	char buffer[1024];
+
+	if (vp->type != VT_XLAT) return 0;
+
+	vp->type = VT_DATA;
+
+	len = radius_xlat(buffer, sizeof(buffer), request, vp->value.xlat, NULL, NULL);
+
+
+	rad_const_free(vp->value.xlat);
+	vp->value.xlat = NULL;
+	if (len < 0) {
+		return -1;
+	}
+
+	/*
+	 *	Parse the string into a new value.
+	 */
+	if (!pairparsevalue(vp, buffer)){
+		return -2;
+	}
+
+	return 0;
+}
+
 /** Move pairs, replacing/over-writing them, and doing xlat.
  *
  * Move attributes from one list to the other if not already present.
  */
-void pairxlatmove(REQUEST *req, VALUE_PAIR **to, VALUE_PAIR **from)
+void radius_xlat_move(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR **from)
 {
 	VALUE_PAIR **tailto, *i, *j, *next;
 	VALUE_PAIR *tailfrom = NULL;
@@ -678,7 +652,7 @@ void pairxlatmove(REQUEST *req, VALUE_PAIR **to, VALUE_PAIR **from)
 		/*
 		 *	Don't move 'fallthrough' over.
 		 */
-		if (i->attribute == PW_FALL_THROUGH) {
+		if (!i->da->vendor && i->da->attr == PW_FALL_THROUGH) {
 			tailfrom = i;
 			continue;
 		}
@@ -687,22 +661,9 @@ void pairxlatmove(REQUEST *req, VALUE_PAIR **to, VALUE_PAIR **from)
 		 *	We've got to xlat the string before moving
 		 *	it over.
 		 */
-		if (i->flags.do_xlat) {
-			int rcode;
-			char buffer[sizeof(i->vp_strvalue)];
+		radius_xlat_do(request, i);
 
-			i->flags.do_xlat = 0;
-			rcode = radius_xlat(buffer, sizeof(buffer),
-					    i->vp_strvalue,
-					    req, NULL, NULL);
-
-			/*
-			 *	Parse the string into a new value.
-			 */
-			pairparsevalue(i, buffer);
-		}
-
-		found = pairfind(*to, i->attribute, i->vendor, TAG_ANY);
+		found = pairfind(*to, i->da->attr, i->da->vendor, TAG_ANY);
 		switch (i->op) {
 
 			/*
@@ -712,11 +673,11 @@ void pairxlatmove(REQUEST *req, VALUE_PAIR **to, VALUE_PAIR **from)
 			case T_OP_SUB:		/* -= */
 				if (found) {
 					if (!i->vp_strvalue[0] ||
-				    	    (strcmp((char *)found->vp_strvalue,
-					    	    (char *)i->vp_strvalue) == 0)) {
-				  		pairdelete(to, found->attribute,
-				  			found->vendor,
-				  			found->flags.tag);
+				    	    (strcmp(found->vp_strvalue,
+					    	    i->vp_strvalue) == 0)) {
+				  		pairdelete(to, found->da->attr,
+				  			found->da->vendor,
+				  			found->tag);
 
 					/*
 					 *	'tailto' may have been
@@ -730,7 +691,6 @@ void pairxlatmove(REQUEST *req, VALUE_PAIR **to, VALUE_PAIR **from)
 			}
 			tailfrom = i;
 			continue;
-			break;
 
 			/*
 			 *	Add it, if it's not already there.
@@ -797,48 +757,29 @@ void pairxlatmove(REQUEST *req, VALUE_PAIR **to, VALUE_PAIR **from)
 	} /* loop over the 'from' list */
 }
 
-/** Create a pair and add it to a particular list of VPs
+/** Create a VALUE_PAIR and add it to a list of VALUE_PAIR s
  *
- * Note that this function ALWAYS returns. If we're OOM, then it causes the
- * server to exit!
+ * @note This function ALWAYS returns. If we're OOM, then it causes the
+ * @note server to exit, so you don't need to check the return value.
+ *
+ * @param[in] ctx Context to allocate VALUE_PAIRs in.
+ * @param[out] vps List to add new VALUE_PAIR to, if NULL will just
+ *	return VALUE_PAIR.
+ * @param[in] attribute number.
+ * @param[in] vendor number.
+ * @return a new VLAUE_PAIR or causes server to exit on error.
  */
-VALUE_PAIR *radius_paircreate(UNUSED REQUEST *request, VALUE_PAIR **vps,
-			      unsigned int attribute, unsigned int vendor, int type)
+VALUE_PAIR *radius_paircreate(TALLOC_CTX *ctx, VALUE_PAIR **vps,
+			      unsigned int attribute, unsigned int vendor)
 {
 	VALUE_PAIR *vp;
 
-	vp = paircreate(attribute, vendor, type);
+	vp = paircreate(ctx, attribute, vendor);
 	if (!vp) {
-		radlog(L_ERR, "No memory!");
+		ERROR("No memory!");
 		rad_assert("No memory" == NULL);
-		_exit(1);
+		fr_exit_now(1);
 	}
-
-	if (vps) pairadd(vps, vp);
-
-	return vp;
-}
-
-/** Create a pair, and add it to a particular list of VPs
- *
- * Note that this function ALWAYS returns.  If we're OOM, then it causes the
- * server to exit!
- *
- * @param[in] request current request.
- * @param[in] vps to modify.
- * @param[in] attribute name.
- * @param[in] value attribute value.
- * @param[in] op fr_tokens value.
- * @return a new VALUE_PAIR.
- */
-VALUE_PAIR *radius_pairmake(UNUSED REQUEST *request, VALUE_PAIR **vps,
-			    const char *attribute, const char *value,
-			    FR_TOKEN op)
-{
-	VALUE_PAIR *vp;
-
-	vp = pairmake(attribute, value, op);
-	if (!vp) return NULL;
 
 	if (vps) pairadd(vps, vp);
 
@@ -862,36 +803,60 @@ void debug_pair(VALUE_PAIR *vp)
  */
 void debug_pair_list(VALUE_PAIR *vp)
 {
+	vp_cursor_t cursor;
 	if (!vp || !debug_flag || !fr_log_fp) return;
 
-	while (vp) {
+	for (vp = fr_cursor_init(&cursor, &vp);
+	     vp;
+	     vp = fr_cursor_next(&cursor)) {
+		/*
+		 *	Take this opportunity to verify all the VALUE_PAIRs are still valid.
+		 */
+		if (!talloc_get_type(vp, VALUE_PAIR)) {
+			ERROR("Expected VALUE_PAIR pointer got \"%s\"", talloc_get_name(vp));
+
+			log_talloc_report(vp);
+			rad_assert(0);
+		}
+
 		vp_print(fr_log_fp, vp);
-		vp = vp->next;
 	}
 	fflush(fr_log_fp);
 }
 
 /** Print a list of valuepairs to the request list.
- * 
+ *
  * @param[in] level Debug level (1-4).
  * @param[in] request to read logging params from.
  * @param[in] vp to print.
  */
 void rdebug_pair_list(int level, REQUEST *request, VALUE_PAIR *vp)
 {
+	vp_cursor_t cursor;
 	char buffer[256];
 	if (!vp || !request || !request->radlog) return;
-	
-	while (vp) {
+
+	for (vp = fr_cursor_init(&cursor, &vp);
+	     vp;
+	     vp = fr_cursor_next(&cursor)) {
+		/*
+		 *	Take this opportunity to verify all the VALUE_PAIRs are still valid.
+		 */
+		if (!talloc_get_type(vp, VALUE_PAIR)) {
+			REDEBUG("Expected VALUE_PAIR pointer got \"%s\"", talloc_get_name(vp));
+
+			log_talloc_report(vp);
+			rad_assert(0);
+		}
+
 		vp_prints(buffer, sizeof(buffer), vp);
-		
+
 		request->radlog(L_DBG, level, request, "\t%s", buffer);
-		vp = vp->next;
-	}	
+	}
 }
 
 /** Resolve attribute pair_lists_t value to an attribute list.
- * 
+ *
  * The value returned is a pointer to the pointer of the HEAD of the list
  * in the REQUEST. If the head of the list changes, the pointer will still
  * be valid.
@@ -901,7 +866,7 @@ void rdebug_pair_list(int level, REQUEST *request, VALUE_PAIR *vp)
  *	Will be NULL if list name couldn't be resolved.
  */
 VALUE_PAIR **radius_list(REQUEST *request, pair_lists_t list)
-{	
+{
 	if (!request) return NULL;
 
 	switch (list) {
@@ -930,14 +895,14 @@ VALUE_PAIR **radius_list(REQUEST *request, pair_lists_t list)
 #ifdef WITH_COA
 		case PAIR_LIST_COA:
 			if (request->coa &&
-			    (request->coa->proxy->code == PW_COA_REQUEST)) {
+			    (request->coa->proxy->code == PW_CODE_COA_REQUEST)) {
 				return &request->coa->proxy->vps;
 			}
 			break;
 
 		case PAIR_LIST_COA_REPLY:
 			if (request->coa && /* match reply with request */
-			    (request->coa->proxy->code == PW_COA_REQUEST) &&
+			    (request->coa->proxy->code == PW_CODE_COA_REQUEST) &&
 			    request->coa->proxy_reply) {
 				return &request->coa->proxy_reply->vps;
 			}
@@ -945,538 +910,26 @@ VALUE_PAIR **radius_list(REQUEST *request, pair_lists_t list)
 
 		case PAIR_LIST_DM:
 			if (request->coa &&
-			    (request->coa->proxy->code == PW_DISCONNECT_REQUEST)) {
+			    (request->coa->proxy->code == PW_CODE_DISCONNECT_REQUEST)) {
 				return &request->coa->proxy->vps;
 			}
 			break;
 
 		case PAIR_LIST_DM_REPLY:
 			if (request->coa && /* match reply with request */
-			    (request->coa->proxy->code == PW_DISCONNECT_REQUEST) &&
+			    (request->coa->proxy->code == PW_CODE_DISCONNECT_REQUEST) &&
 			    request->coa->proxy_reply) {
 			   	return &request->coa->proxy->vps;
 			}
 			break;
 #endif
 	}
-	
-	RDEBUG2("WARNING: List \"%s\" is not available",
+
+	RWDEBUG2("List \"%s\" is not available",
 		fr_int2str(pair_lists, list, "<INVALID>"));
-	
+
 	return NULL;
 }
-
-/** Resolve attribute name to a list.
- *
- * Check the name string for qualifiers that specify a list and return
- * an pair_lists_t value for that list. This value may be passed to
- * radius_list, along with the current request, to get a pointer to the
- * actual list in the request.
- * 
- * If qualifiers were consumed, write a new pointer into name to the
- * char after the last qualifier to be consumed.
- *
- * radius_list_name should be called before passing a name string that
- * may contain qualifiers to dict_attrbyname.
- *
- * @see dict_attrbyname
- *
- * @param[in,out] name of attribute.
- * @param[in] unknown the list to return if no qualifiers were found.
- * @return PAIR_LIST_UNKOWN if qualifiers couldn't be resolved to a list.
- */
-pair_lists_t radius_list_name(const char **name, pair_lists_t unknown)
-{
-	const char *p = *name;
-	const char *q;
-	
-	/* This should never be a NULL pointer or zero length string */
-	rad_assert(name && *name);
-
-	/*
-	 *	We couldn't determine the list if:
-	 *	
-	 * 	A colon delimiter was found, but the next char was a 
-	 *	number, indicating a tag, not a list qualifier.
-	 *
-	 *	No colon was found and the first char was upper case 
-	 *	indicating an attribute.
-	 *
-	 */
-	q = strchr(p, ':');
-	if (((q && (q[1] >= '0') && (q[1] <= '9'))) ||
-	    (!q && isupper((int) *p))) {
-		return unknown;
-	}
-	
-	if (q) {
-		*name = (q + 1);	/* Consume the list and delimiter */
-	} else {
-		q = (p + strlen(p));	/* Consume the entire string */
-		*name = q;
-	}
-	
-	return fr_substr2int(pair_lists, p, PAIR_LIST_UNKNOWN, (q - p));
-}
-
-/** Resolve request to a request.
- * 
- * Resolve name to a current request.
- *
- * @see radius_list
- * @param[in,out] context Base context to use, and to write the result back to.
- * @param[in] name (request) to resolve to.
- * @return 0 if request is valid in this context, else -1.
- */
-int radius_request(REQUEST **context, request_refs_t name)
-{
-	REQUEST *request = *context;
-	
-	switch (name) {
-		case REQUEST_CURRENT:
-			return 0;
-		
-		case REQUEST_PARENT:	/* for future use in request chaining */
-		case REQUEST_OUTER:
-			if (!request->parent) {
-				RDEBUG("WARNING: Specified request \"%s\" is "
-				       "not available in this context",
-				       fr_int2str(request_refs, name,
-		       				  "¿unknown?"));
-				return FALSE;
-			}
-			
-			*context = request->parent;
-			
-			break;
-	
-		case REQUEST_UNKNOWN:
-		default:
-			rad_assert(0);
-			return -1;
-	}
-	
-	return 0;
-}
-
-/** Resolve attribute name to a request.
- * 
- * Check the name string for qualifiers that reference a parent request and
- * write the pointer to this request to 'request'.
- *
- * If qualifiers were consumed, write a new pointer into name to the
- * char after the last qualifier to be consumed.
- *
- * radius_ref_request should be called before radius_list_name.
- *
- * @see radius_list_name
- * @param[in,out] name of attribute.
- * @param[in] unknown Request ref to return if no request qualifier is present.
- * @return one of the REQUEST_* definitions or REQUEST_UNKOWN
- */
-request_refs_t radius_request_name(const char **name, request_refs_t unknown)
-{
-	char *p;
-	int request;
-	
-	p = strchr(*name, '.');
-	if (!p) {
-		return REQUEST_CURRENT;
-	}
-	
-	request = fr_substr2int(request_refs, *name, unknown,
-				p - *name);
-	
-	if (request != REQUEST_UNKNOWN) {
-		*name = p + 1;
-	}
-	
-	return request;
-}
-
-/** Release memory allocated to value pair template.
- *
- * @param[in,out] tmpl to free.
- */
-void radius_tmplfree(value_pair_tmpl_t **tmpl)
-{
-	if (*tmpl == NULL) return;
-	
-	if ((*tmpl)->name) {
-		rad_cfree((*tmpl)->name);
-	}
-	
-	free(*tmpl);
-	
-	*tmpl = NULL;
-}
-
-/** Parse qualifiers to convert attrname into a value_pair_tmpl_t.
- *
- * VPTs are used in various places where we need to pre-parse configuration 
- * sections into attribute mappings.
- *
- * Note: name field is just a copy of the input pointer, if you know that
- * string might be freed before you're done with the vpt use radius_attr2tmpl
- * instead.
- * 
- * @param[in] name attribute name including qualifiers.
- * @param[out] vpt to modify.
- * @param[in] request_def The default request to insert unqualified 
- *	attributes into.
- * @param[in] list_def The default list to insert unqualified attributes into.
- * @return -1 on error or 0 on success.
- */
-int radius_parse_attr(const char *name, value_pair_tmpl_t *vpt,
-		      request_refs_t request_def,
-		      pair_lists_t list_def)
-{
-	char buffer[128];
-	const char *p;
-	size_t len;
-
-	vpt->name = name;
-	p = name;
-	
-	vpt->request = radius_request_name(&p, request_def);
-	len = p - name;
-	if (vpt->request == REQUEST_UNKNOWN) {
-		strlcpy(buffer, name, len < sizeof(buffer) ?
-			len + 1 : sizeof(buffer));
-		
-		radlog(L_ERR, "Invalid request qualifier \"%s\"", buffer);
-		
-		return -1;
-	}
-	name += len;
-	
-	vpt->list = radius_list_name(&p, list_def);
-	if (vpt->list == PAIR_LIST_UNKNOWN) {
-		len = p - name;
-		strlcpy(buffer, name, len < sizeof(buffer) ?
-			len + 1 : sizeof(buffer));
-				
-		radlog(L_ERR, "Invalid list qualifier \"%s\"", buffer);
-		
-		return -1;
-	}
-	
-	if (*p == '\0') {
-		vpt->type = VPT_TYPE_LIST;
-		
-		return 0;
-	}
-	
-	vpt->da = dict_attrbyname(p);
-	if (!vpt->da) {
-		radlog(L_ERR, "Attribute \"%s\" unknown", p);
-	
-		return -1;
-	}
-	
-	vpt->type = VPT_TYPE_ATTR;
-	
-	return 0;
-}
-
-/** Parse qualifiers to convert attrname into a value_pair_tmpl_t.
- *
- * VPTs are used in various places where we need to pre-parse configuration 
- * sections into attribute mappings.
- *
- * @param[in] name attribute name including qualifiers.
- * @param[in] request_def The default request to insert unqualified 
- *	attributes into.
- * @param[in] list_def The default list to insert unqualified attributes into.
- * @return pointer to a value_pair_tmpl_t struct (must be freed with 
- *	radius_tmplfree) or NULL on error.
- */
-value_pair_tmpl_t *radius_attr2tmpl(const char *name,
-				    request_refs_t request_def,
-				    pair_lists_t list_def)
-{
-	value_pair_tmpl_t *vpt;
-	const char *copy = strdup(name);
-	
-	vpt = rad_calloc(sizeof(value_pair_tmpl_t));
-	
-	if (radius_parse_attr(copy, vpt, request_def, list_def) < 0) {
-		radius_tmplfree(&vpt);
-		return NULL;
-	}
-	
-	return vpt;
-}
-
-/** Convert module specific attribute id to value_pair_tmpl_t.
- *
- * @param[in] name string to convert.
- * @param[in] type Type of quoting around value.
- * @return pointer to new VPT.
- */
-value_pair_tmpl_t *radius_str2tmpl(const char *name, FR_TOKEN type)
-{
-	value_pair_tmpl_t *vpt;
-	
-	vpt = rad_calloc(sizeof(value_pair_tmpl_t));
-	vpt->name = strdup(name);
-	
-	switch (type)
-	{
-		case T_BARE_WORD:
-		case T_SINGLE_QUOTED_STRING:
-			vpt->type = VPT_TYPE_LITERAL;
-			break;
-		case T_DOUBLE_QUOTED_STRING:
-			vpt->type = VPT_TYPE_XLAT;	
-			break;
-		case T_BACK_QUOTED_STRING:
-			vpt->type = VPT_TYPE_EXEC;
-			break;
-		default:
-			rad_assert(0);
-			return NULL;
-	}
-	
-	return vpt;
-}
-
-/** Release memory used by a map linked list.
- *
- * @param map Head of the map linked list.
- */
-void radius_mapfree(value_pair_map_t **map)
-{
-	value_pair_map_t *next, *vpm;
-	
-	if (!map) return;
-	
-	vpm = *map; 
-	 
-	while (vpm != NULL) {
-		next = vpm->next;
-		
-		radius_tmplfree(&((*map)->dst));
-		radius_tmplfree(&((*map)->src));
-		
-		free(vpm);
-		vpm = next;
-	}
-	
-	*map = NULL;
-}
-
-/** Convert CONFIG_PAIR (which may contain refs) to value_pair_map_t.
- *
- * Treats the left operand as an attribute reference
- * @verbatim<request>.<list>.<attribute>@endverbatim 
- *
- * Treatment of left operand depends on quotation, barewords are treated as
- * attribute references, double quoted values are treated as expandable strings,
- * single quoted values are treated as literal strings.
- *
- * Return must be freed with radius_mapfree.
- *
- * @param[in] cp to convert to map.
- * @param[in] dst_request_def The default request to insert unqualified
- *	attributes into.
- * @param[in] dst_list_def The default list to insert unqualified attributes
- *	into.
- * @param[in] src_request_def The default request to resolve attribute
- *	references in.
- * @param[in] src_list_def The default list to resolve unqualified attributes
- *	in.
- * @return value_pair_map_t if successful or NULL on error.
- */
-value_pair_map_t *radius_cp2map(CONF_PAIR *cp,
-				request_refs_t dst_request_def,
-				pair_lists_t dst_list_def,
-				request_refs_t src_request_def,
-				pair_lists_t src_list_def)
-{
-	value_pair_map_t *map;
-	const char *attr;
-	const char *value;
-	FR_TOKEN type;
-	CONF_ITEM *ci = cf_pairtoitem(cp); 
-	
-	if (!cp) return NULL;
-	
-	map = rad_calloc(sizeof(value_pair_map_t));
-
-	attr = cf_pair_attr(cp);
-	value = cf_pair_value(cp);
-	if (!value) {
-		cf_log_err(ci, "Missing attribute value");
-		
-		goto error;
-	}
-	
-	map->dst = radius_attr2tmpl(attr, dst_request_def, dst_list_def);
-	if (!map->dst){
-		goto error;
-	}
-
-	/*
-	 *	Bare words always mean attribute references.
-	 */
-	type = cf_pair_value_type(cp);
-	map->src = type == T_BARE_WORD ?
-		   radius_attr2tmpl(value, src_request_def, src_list_def) :
-		   radius_str2tmpl(value, type);
-
-	if (!map->src) {
-		goto error;
-	}
-
-	map->op = cf_pair_operator(cp);
-	map->ci = ci;
-	
-	/*
-	 *	Lots of sanity checks for insane people...
-	 */
-	 
-	/*
-	 *	We don't support implicit type conversion
-	 */
-	if (map->dst->da && map->src->da &&
-	    (map->src->da->type != map->dst->da->type)) {
-		cf_log_err(ci, "Attribute type mismatch");
-		
-		goto error;
-	}
-	
-	/*
-	 *	What exactly where you expecting to happen here?
-	 */
-	if ((map->dst->type == VPT_TYPE_ATTR) &&
-	    (map->src->type == VPT_TYPE_LIST)) {
-		cf_log_err(ci, "Can't copy list into an attribute");
-		
-		goto error;
-	}
-
-	switch (map->src->type) 
-	{
-	
-		/*
-		 *	Only += and -= operators are supported for list copy.
-		 */
-		case VPT_TYPE_LIST:
-			switch (map->op) {
-			case T_OP_SUB:
-			case T_OP_ADD:
-				break;
-			
-			default:
-				cf_log_err(ci, "Operator \"%s\" not allowed "
-					   "for list copy",
-					   fr_int2str(fr_tokens, map->op,
-						      "¿unknown?"));
-				goto error;
-			}
-		break;
-		/*
-		 *	@todo add support for exec expansion.
-		 */
-		case VPT_TYPE_EXEC:
-			cf_log_err(ci, "Exec values are not allowed");
-			break;
-		default:
-			break;
-	}
-	
-	return map;
-	
-	error:
-		radius_mapfree(&map);
-		return NULL;
-}
-
-/** Convert an 'update' config section into an attribute map.
- *
- * Uses 'name2' of section to set default request and lists.
- *
- * @param[in] parent to convert to map.
- * @param[out] head Where to store the head of the map.
- * @param[in] dst_list_def The default destination list, usually dictated by 
- * 	the section the module is being called in.
- * @param[in] src_list_def The default source list, usually dictated by the
- *	section the module is being called in.
- * @param[in] max number of mappings to process.
- * @return -1 on error, else 0.
- */
-int radius_attrmap(CONF_SECTION *parent, value_pair_map_t **head,
-		   pair_lists_t dst_list_def, pair_lists_t src_list_def,
-		   unsigned int max)
-{
-	const char *cs_list, *p;
-
-	request_refs_t request_def = REQUEST_CURRENT;
-
-	CONF_SECTION *cs;
-	CONF_ITEM *ci = cf_sectiontoitem(cs);
-	CONF_PAIR *cp;
-
-	unsigned int total = 0;
-	value_pair_map_t **tail, *map;
-	*head = NULL;
-	tail = head;
-	
-	if (!parent) return 0;
-	
-	cs = cf_section_sub_find(parent, "update");
-	if (!cs) return 0;
-	
-	cs_list = p = cf_section_name2(cs);
-	if (cs_list) {
-		request_def = radius_request_name(&p, REQUEST_UNKNOWN);
-		if (request_def == REQUEST_UNKNOWN) {
-			cf_log_err(ci, "Default request specified "
-				   "in mapping section is invalid");
-			return -1;
-		}
-		
-		dst_list_def = fr_str2int(pair_lists, p, PAIR_LIST_UNKNOWN);
-		if (dst_list_def == PAIR_LIST_UNKNOWN) {
-			cf_log_err(ci, "Default list \"%s\" specified "
-				   "in mapping section is invalid", p);
-			return -1;
-		}
-	}
-
-	for (ci = cf_item_find_next(cs, NULL);
-	     ci != NULL;
-	     ci = cf_item_find_next(cs, ci)) {
-	     	if (total++ == max) {
-	     		cf_log_err(ci, "Map size exceeded");
-	     		goto error;
-	     	}
-	     	
-		if (!cf_item_is_pair(ci)) {
-			cf_log_err(ci, "Entry is not in \"attribute = "
-				       "value\" format");
-			goto error;
-		}
-	
-		cp = cf_itemtopair(ci);
-		map = radius_cp2map(cp, request_def, dst_list_def,
-				    REQUEST_CURRENT, src_list_def);
-		if (!map) {
-			goto error;
-		}
-		
-		*tail = map;
-		tail = &(map->next);
-	}
-
-	return 0;
-	
-	error:
-		radius_mapfree(head);
-		return -1;
-}
-
 
 /** Convert value_pair_map_t to VALUE_PAIR(s) and add them to a REQUEST.
  *
@@ -1488,108 +941,528 @@ int radius_attrmap(CONF_SECTION *parent, value_pair_map_t **head,
  * @param request The current request.
  * @param map specifying destination attribute and location and src identifier.
  * @param func to retrieve module specific values and convert them to
- *	VLAUE_PAIRS.
+ *	VALUE_PAIRS.
  * @param ctx to be passed to func.
  * @param src name to be used in debugging if different from map value.
- * @return -1 if either attribute or qualifier weren't valid in this context
- *	or callback returned NULL pointer, else 0.
+ * @return -1 if the operation failed, -2 in the source attribute wasn't valid, 0 on success.
  */
-int radius_map2request(REQUEST *request, const value_pair_map_t *map,
-		       const char *src, radius_tmpl_getvalue_t func, void *ctx)
+int radius_map2request(REQUEST *request, value_pair_map_t const *map,
+		       UNUSED char const *src, radius_tmpl_getvalue_t func, void *ctx)
 {
-	VALUE_PAIR **list, *vp, *head;
-	char buffer[MAX_STRING_LEN];
-	
-	if (radius_request(&request, map->dst->request) < 0) {
-		RDEBUG("WARNING: Mapping \"%s\" -> \"%s\" "
-		       "invalid in this context, skipping!",
-		       map->src->name, map->dst->name);
-		
-		return -1;
+	int rcode;
+	vp_cursor_t cursor;
+	VALUE_PAIR **list, *vp, *head = NULL;
+	REQUEST *context;
+	char buffer[1024];
+
+	context = request;
+	if (radius_request(&context, map->dst->request) < 0) {
+		REDEBUG("Mapping \"%s\" -> \"%s\" invalid in this context", map->src->name, map->dst->name);
+
+		return -2;
 	}
-	
-	list = radius_list(request, map->dst->list);
+
+	list = radius_list(context, map->dst->list);
 	if (!list) {
-		RDEBUG("WARNING: Mapping \"%s\" -> \"%s\" "
-		       "invalid in this context, skipping!",
-		       map->src->name, map->dst->name);
-		       
-		return -1;
+		REDEBUG("Mapping \"%s\" -> \"%s\" invalid in this context", map->src->name, map->dst->name);
+
+		return -2;
 	}
-	
-	head = func(request, map, ctx);
-	if (head == NULL) {
-		return -1;
+
+
+	/*
+	 *	The callback should either return -1 to signify operations error, -2 when it can't find the
+	 *	attribute or list being referenced, or 0 to signify success.
+	 *	It may return "sucess", but still have no VPs to work with.
+	 *	Only if it returned an error code should it not write anything to the head pointer.
+	 */
+	rcode = func(&head, request, map, ctx);
+	if (rcode < 0) {
+		rad_assert(!head);
+
+		return rcode;
 	}
-	
-	for (vp = head; vp != NULL; vp = vp->next) {
-		vp->op = map->op;
-		
-		if (debug_flag) {
-			vp_prints_value(buffer, sizeof(buffer), vp, 1);
-			
-			RDEBUG("\t%s %s %s (%s)", map->dst->name,
-			       fr_int2str(fr_tokens, vp->op, "¿unknown?"), 
-			       buffer, src ? src : map->src->name);
+
+	if (!head) return 0;
+
+	VERIFY_VP(head);
+
+	if (debug_flag) for (vp = fr_cursor_init(&cursor, &head); vp; vp = fr_cursor_next(&cursor)) {
+		char *value;
+
+		switch (map->src->type) {
+			/*
+			 *	Just print the value being assigned
+			 */
+			default:
+
+			case VPT_TYPE_LITERAL:
+				vp_prints_value(buffer, sizeof(buffer), vp, '\'');
+				value = buffer;
+				break;
+			case VPT_TYPE_XLAT:
+				vp_prints_value(buffer, sizeof(buffer), vp, '"');
+				value = buffer;
+				break;
+			case VPT_TYPE_DATA:
+				vp_prints_value(buffer, sizeof(buffer), vp, 0);
+				value = buffer;
+				break;
+			/*
+			 *	Just printing the value doesn't make sense, but we still
+			 *	want to know what it was...
+			 */
+			case VPT_TYPE_LIST:
+				vp_prints_value(buffer, sizeof(buffer), vp, '\'');
+				value = talloc_asprintf(request, "&%s%s -> %s", map->src->name, vp->da->name, buffer);
+				break;
+			case VPT_TYPE_ATTR:
+				vp_prints_value(buffer, sizeof(buffer), vp, '\'');
+				value = talloc_asprintf(request, "&%s -> %s", map->src->name, buffer);
+				break;
 		}
+
+
+		RDEBUG("\t\t%s %s %s", map->dst->name, fr_int2str(fr_tokens, vp->op, "<INVALID>"), value);
+
+		if (value != buffer) talloc_free(value);
 	}
-	
+
 	/*
 	 *	Use pairmove so the operator is respected
 	 */
-	radius_pairmove(request, list, head);
-	pairfree(&vp); /* Free the VP if for some reason it wasn't moved */
-	
+	radius_pairmove(context, list, head);
 	return 0;
 }
 
-/** Return a VP from the specified request.
+/** Process map which has exec as a src
  *
- * @param request current request.
- * @param name attribute name including qualifiers.
- * @param vp_p where to write the pointer to the resolved VP. 
- *	Will be NULL if the attribute couldn't be resolved.
- * @return -1 if either the attribute or qualifier were invalid, else 0
+ * Evaluate maps which specify exec as a src. This may be used by various sorts of update sections, and so
+ * has been broken out into it's own function.
+ *
+ * @param[out] out Where to write the VALUE_PAIR(s).
+ * @param[in] request structure (used only for talloc).
+ * @param[in] map the map. The LHS (dst) must be VPT_TYPE_ATTR or VPT_TYPE_LIST. The RHS (src) must be VPT_TYPE_EXEC.
+ * @return -1 on failure, 0 on success.
  */
-int radius_get_vp(REQUEST *request, const char *name, VALUE_PAIR **vp_p)
+int radius_mapexec(VALUE_PAIR **out, REQUEST *request, value_pair_map_t const *map)
 {
-	value_pair_tmpl_t vpt;
-	VALUE_PAIR **vps;
+	int result;
+	char *expanded = NULL;
+	char answer[1024];
+	VALUE_PAIR **input_pairs = NULL;
+	VALUE_PAIR **output_pairs = NULL;
 
-	*vp_p = NULL;
-	
-	if (radius_parse_attr(name, &vpt, REQUEST_CURRENT,
-	    PAIR_LIST_REQUEST) < 0) {
+	*out = NULL;
+
+	rad_assert(map->src->type == VPT_TYPE_EXEC);
+	rad_assert((map->dst->type == VPT_TYPE_ATTR) || (map->dst->type == VPT_TYPE_LIST));
+
+	/*
+	 *	We always put the request pairs into the environment
+	 */
+	input_pairs = radius_list(request, PAIR_LIST_REQUEST);
+
+	/*
+	 *	Automagically switch output type depending on our destination
+	 *	If dst is a list, then we create attributes from the output of the program
+	 *	if dst is an attribute, then we create an attribute of that type and then
+	 *	call pairparsevalue on the output of the script.
+	 */
+	out[0] = '\0';
+	result = radius_exec_program(request, map->src->name, true, true,
+				     answer, sizeof(answer), EXEC_TIMEOUT,
+				     input_pairs ? *input_pairs : NULL,
+				     (map->dst->type == VPT_TYPE_LIST) ? output_pairs : NULL);
+	talloc_free(expanded);
+	if (result != 0) {
+		REDEBUG("%s", answer);
+		talloc_free(output_pairs);
 		return -1;
 	}
-	
-	if (radius_request(&request, vpt.request) < 0) {
+
+	switch (map->dst->type) {
+	case VPT_TYPE_LIST:
+		if (!output_pairs) {
+			return -2;
+		}
+		*out = *output_pairs;
+
+		return 0;
+	case VPT_TYPE_ATTR:
+		{
+			VALUE_PAIR *vp;
+
+			vp = pairalloc(request, map->dst->da);
+			if (!vp) return -1;
+			vp->op = map->op;
+			if (!pairparsevalue(vp, answer)) {
+				pairfree(&vp);
+				return -2;
+			}
+			*out = vp;
+
+			return 0;
+		}
+	default:
+		rad_assert(0);
+	}
+
+	return -1;
+}
+
+/** Convert a map to a VALUE_PAIR.
+ *
+ * @param[out] out Where to write the VALUE_PAIR(s).
+ * @param[in] request structure (used only for talloc)
+ * @param[in] map the map. The LHS (dst) has to be VPT_TYPE_ATTR or VPT_TYPE_LIST.
+ * @param[in] ctx unused
+ * @return 0 on success, -1 on failure, -2 on attribute not found/equivalent
+ */
+int radius_map2vp(VALUE_PAIR **out, REQUEST *request, value_pair_map_t const *map, UNUSED void *ctx)
+{
+	int rcode = 0;
+	VALUE_PAIR *vp = NULL, *found, **from = NULL;
+	DICT_ATTR const *da;
+	REQUEST *context;
+	vp_cursor_t cursor;
+
+	rad_assert(request != NULL);
+	rad_assert(map != NULL);
+
+	*out = NULL;
+
+	/*
+	 *	Special case for !*, we don't need to parse the value, just allocate an attribute with
+	 *	the right operator.
+	 */
+	if (map->op == T_OP_CMP_FALSE) {
+		vp = pairalloc(request, map->dst->da);
+		if (!vp) return -1;
+		vp->op = map->op;
+		*out = vp;
+
 		return 0;
 	}
-	
-	vps = radius_list(request, vpt.list);
-	if (!vps) {    
+
+	/*
+	 *	List to list found, this is a special case because we don't need
+	 *	to allocate any attributes, just found the current list, and change
+	 *	the op.
+	 */
+	if ((map->dst->type == VPT_TYPE_LIST) && (map->src->type == VPT_TYPE_LIST)) {
+		from = radius_list(request, map->src->list);
+		if (!from) return -2;
+
+		found = paircopy(request, *from);
+		/*
+		 *	List to list copy is invalid if the src list has no attributes.
+		 */
+		if (!found) return -2;
+
+		for (vp = fr_cursor_init(&cursor, &found);
+		     vp;
+		     vp = fr_cursor_next(&cursor)) {
+		 	vp->op = T_OP_ADD;
+		}
+
+		*out = found;
+
 		return 0;
 	}
-	
-	switch (vpt.type)
-	{
+
+	/*
+	 *	Deal with all non-list founding operations.
+	 */
+	da = map->dst->da ? map->dst->da : map->src->da;
+
+	switch (map->src->type) {
+	case VPT_TYPE_XLAT:
+	case VPT_TYPE_LITERAL:
+	case VPT_TYPE_DATA:
+		vp = pairalloc(request, da);
+		if (!vp) return -1;
+		vp->op = map->op;
+		break;
+	default:
+		break;
+	}
+
+
+	/*
+	 *	And parse the RHS
+	 */
+	switch (map->src->type) {
+	case VPT_TYPE_XLAT:
+		rad_assert(map->dst->da);	/* Need to know where were going to write the new attribute */
+		/*
+		 *	Don't call unnecessary expansions
+		 */
+		if (strchr(map->src->name, '%') != NULL) {
+			ssize_t slen;
+			char *str = NULL;
+
+			slen = radius_axlat(&str, request, map->src->name, NULL, NULL);
+			if (slen < 0) {
+				rcode = slen;
+				goto error;
+			}
+			rcode = pairparsevalue(vp, str);
+			talloc_free(str);
+			if (!rcode) {
+				pairfree(&vp);
+				rcode = -1;
+				goto error;
+			}
+
+			break;
+		}
+		/* FALL-THROUGH */
+
+	case VPT_TYPE_LITERAL:
+		if (!pairparsevalue(vp, map->src->name)) {
+			rcode = -2;
+			goto error;
+		}
+		break;
+
+	case VPT_TYPE_ATTR:
+		rad_assert(!map->dst->da ||
+			   (map->src->da->type == map->dst->da->type) ||
+			   (map->src->da->type == PW_TYPE_OCTETS) ||
+			   (map->dst->da->type == PW_TYPE_OCTETS));
+		context = request;
+
+		if (radius_request(&context, map->src->request) == 0) {
+			from = radius_list(context, map->src->list);
+		}
+
+		/*
+		 *	Can't add the attribute if the list isn't
+		 *	valid.
+		 */
+		if (!from) {
+			rcode = -2;
+			goto error;
+		}
+
+		/*
+		 *	Special case, destination is a list, found all instance of an attribute.
+		 */
+		if (map->dst->type == VPT_TYPE_LIST) {
+			found = paircopy2(request, *from, map->src->da->attr, map->src->da->vendor, TAG_ANY);
+			if (!found) {
+				REDEBUG("Attribute \"%s\" not found in request", map->src->name);
+				rcode = -2;
+				goto error;
+			}
+
+			for (vp = fr_cursor_init(&cursor, &found);
+			     vp;
+			     vp = fr_cursor_next(&cursor)) {
+				vp->op = T_OP_ADD;
+			}
+
+			*out = found;
+			return 0;
+		}
+
+		/*
+		 *	FIXME: allow tag references?
+		 */
+		found = pairfind(*from, map->src->da->attr, map->src->da->vendor, TAG_ANY);
+		if (!found) {
+			REDEBUG("Attribute \"%s\" not found in request", map->src->name);
+			rcode = -2;
+			goto error;
+		}
+
+		/*
+		 *	Copy the data over verbatim, assuming it's
+		 *	actually data.
+		 */
+//		rad_assert(found->type == VT_DATA);
+		vp = paircopyvpdata(request, da, found);
+		if (!vp) {
+			return -1;
+		}
+		vp->op = map->op;
+
+		break;
+
+	case VPT_TYPE_DATA:
+		rad_assert(map->src->da->type == map->dst->da->type);
+		memcpy(&vp->data, map->src->vpd, sizeof(vp->data));
+		vp->length = map->src->length;
+		break;
+
+	/*
+	 *	This essentially does the same as rlm_exec xlat, except it's non-configurable.
+	 *	It's only really here as a convenience for people who expect the contents of
+	 *	backticks to be executed in a shell.
+	 *
+	 *	exec string is xlat expanded and arguments are shell escaped.
+	 */
+	case VPT_TYPE_EXEC:
+		return radius_mapexec(out, request, map);
+	default:
+		rad_assert(0);	/* Should of been caught at parse time */
+	error:
+		pairfree(&vp);
+		return rcode;
+	}
+
+	*out = vp;
+	return 0;
+}
+
+
+/** Convert a valuepair string to VALUE_PAIR and insert it into a list
+ *
+ * Takes a valuepair string with list and request qualifiers, converts it into a VALUE_PAIR
+ * and inserts it into the appropriate list.
+ *
+ * @param request Current request.
+ * @param raw string to parse.
+ * @param dst_request_def to use if attribute isn't qualified.
+ * @param dst_list_def to use if attribute isn't qualified.
+ * @param src_request_def to use if attribute isn't qualified.
+ * @param src_list_def to use if attribute isn't qualified.
+ * @return 0 on success, < 0 on error.
+ */
+int radius_str2vp(REQUEST *request, char const *raw,
+		  request_refs_t dst_request_def, pair_lists_t dst_list_def,
+		  request_refs_t src_request_def, pair_lists_t src_list_def)
+{
+	char const *p = raw;
+	FR_TOKEN ret;
+	int rcode;
+
+	VALUE_PAIR_RAW tokens;
+	value_pair_map_t *map;
+
+	ret = pairread(&p, &tokens);
+	if (ret != T_EOL) {
+		REDEBUG("Failed tokenising attribute string: %s", fr_strerror());
+		return -1;
+	}
+
+	map = radius_str2map(request, tokens.l_opand, T_BARE_WORD, tokens.op, tokens.r_opand, tokens.quote,
+		       	     dst_request_def, dst_list_def, src_request_def, src_list_def);
+	if (!map) {
+		REDEBUG("Failed parsing attribute string: %s", fr_strerror());
+		return -1;
+	}
+
+	rcode = radius_map2request(request, map, NULL, radius_map2vp, NULL);
+	talloc_free(map);
+	return rcode;
+}
+
+/** Return a VP from a value_pair_tmpl_t
+ *
+ * @param out where to write the retrieved vp.
+ * @param request current request.
+ * @param vpt the value pair template
+ * @return -1 if VP could not be found, -2 if list could not be found, -3 if context could not be found.
+ */
+int radius_vpt_get_vp(VALUE_PAIR **out, REQUEST *request, value_pair_tmpl_t const *vpt)
+{
+	VALUE_PAIR **vps, *vp;
+
+	if (out) *out = NULL;
+
+	if (radius_request(&request, vpt->request) < 0) {
+		return -3;
+	}
+
+	vps = radius_list(request, vpt->list);
+	if (!vps) {
+		return -2;
+	}
+
+	switch (vpt->type) {
 	/*
 	 *	May not may not be found, but it *is* a known name.
 	 */
 	case VPT_TYPE_ATTR:
-		*vp_p = pairfind(*vps, vpt.da->attr, vpt.da->vendor, TAG_ANY);
+		vp = pairfind(*vps, vpt->da->attr, vpt->da->vendor, TAG_ANY);
+		if (!vp) {
+			return -1;
+		}
 		break;
-		
+
 	case VPT_TYPE_LIST:
-		*vp_p = *vps;
+		vp = *vps;
 		break;
-		
+
 	default:
-		rad_assert(0);
+		/*
+		 *	literal, xlat, regex, exec, data.
+		 *	no attribute.
+		 */
 		return -1;
-		break;
+	}
+
+	if (out) {
+		*out = vp;
 	}
 
 	return 0;
+}
+
+
+
+/** Return a VP from the specified request.
+ *
+ * @param out where to write the pointer to the resolved VP.
+ *	Will be NULL if the attribute couldn't be resolved.
+ * @param request current request.
+ * @param name attribute name including qualifiers.
+ * @return -4 if either the attribute or qualifier were invalid, and the same error codes as radius_vpt_get_vp for other
+ *	error conditions.
+ */
+int radius_get_vp(VALUE_PAIR **out, REQUEST *request, char const *name)
+{
+	value_pair_tmpl_t vpt;
+
+	*out = NULL;
+
+	if (radius_parse_attr(name, &vpt, REQUEST_CURRENT, PAIR_LIST_REQUEST) < 0) {
+		return -4;
+	}
+
+	return radius_vpt_get_vp(out, request, &vpt);
+}
+
+/** Add a module failure message VALUE_PAIR to the request
+ */
+void module_failure_msg(REQUEST *request, char const *fmt, ...)
+{
+	va_list ap;
+	char *p;
+	VALUE_PAIR *vp;
+
+	if (!fmt || !request->packet) {
+		va_start(ap, fmt);
+		va_end(ap);
+		return;
+	}
+
+	va_start(ap, fmt);
+	vp = paircreate(request->packet, PW_MODULE_FAILURE_MESSAGE, 0);
+	if (!vp) {
+		va_end(ap);
+		return;
+	}
+
+	p = talloc_vasprintf(vp, fmt, ap);
+
+	if (request->module && *request->module) {
+		pairsprintf(vp, "%s: %s", request->module, p);
+	} else {
+		pairsprintf(vp, "%s", p);
+	}
+	talloc_free(p);
+	pairadd(&request->packet->vps, vp);
 }

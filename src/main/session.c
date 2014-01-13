@@ -20,7 +20,6 @@
  * Copyright 2000,2006  The FreeRADIUS server project
  */
 
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include	<freeradius-devel/radiusd.h>
@@ -36,8 +35,8 @@ RCSID("$Id$")
  *	End a session by faking a Stop packet to all accounting modules.
  */
 int session_zap(REQUEST *request, uint32_t nasaddr, unsigned int port,
-		const char *user,
-		const char *sessionid, uint32_t cliaddr, char proto,
+		char const *user,
+		char const *sessionid, uint32_t cliaddr, char proto,
 		int session_time)
 {
 	REQUEST *stopreq;
@@ -45,32 +44,31 @@ int session_zap(REQUEST *request, uint32_t nasaddr, unsigned int port,
 	int ret;
 
 	stopreq = request_alloc_fake(request);
-	stopreq->packet->code = PW_ACCOUNTING_REQUEST; /* just to be safe */
+	stopreq->packet->code = PW_CODE_ACCOUNTING_REQUEST; /* just to be safe */
 	stopreq->listener = request->listener;
 	rad_assert(stopreq != NULL);
 
 	/* Hold your breath */
-#define PAIR(n,v,t,e) do { \
-		if(!(vp = paircreate(n, 0, t))) {	\
+#define PAIR(n,v,e) do { \
+		if(!(vp = paircreate(stopreq->packet,n, 0))) {	\
 			request_free(&stopreq); \
-			radlog(L_ERR|L_CONS, "no memory"); \
+			ERROR("no memory"); \
 			pairfree(&(stopreq->packet->vps)); \
 			return 0; \
 		} \
 		vp->e = v; \
 		pairadd(&(stopreq->packet->vps), vp); \
 	} while(0)
-#define INTPAIR(n,v) PAIR(n,v,PW_TYPE_INTEGER,vp_integer)
-#define IPPAIR(n,v) PAIR(n,v,PW_TYPE_IPADDR,vp_ipaddr)
+#define INTPAIR(n,v) PAIR(n,v,vp_integer)
+#define IPPAIR(n,v) PAIR(n,v,vp_ipaddr)
 #define STRINGPAIR(n,v) do { \
-	if(!(vp = paircreate(n, 0, PW_TYPE_STRING))) {	\
+	  if(!(vp = paircreate(stopreq->packet,n, 0))) {	\
 		request_free(&stopreq); \
-		radlog(L_ERR|L_CONS, "no memory"); \
+		ERROR("no memory"); \
 		pairfree(&(stopreq->packet->vps)); \
 		return 0; \
 	} \
-	strlcpy((char *)vp->vp_strvalue, v, sizeof vp->vp_strvalue); \
-	vp->length = strlen(v); \
+	pairstrcpy(vp, v);	\
 	pairadd(&(stopreq->packet->vps), vp); \
 	} while(0)
 
@@ -121,8 +119,8 @@ int session_zap(REQUEST *request, uint32_t nasaddr, unsigned int port,
  *		1 The user is logged in.
  *		2 Some error occured.
  */
-int rad_check_ts(uint32_t nasaddr, unsigned int portnum, const char *user,
-		 const char *session_id)
+int rad_check_ts(uint32_t nasaddr, unsigned int portnum, char const *user,
+		 char const *session_id)
 {
 	pid_t	pid, child_pid;
 	int	status;
@@ -148,10 +146,10 @@ int rad_check_ts(uint32_t nasaddr, unsigned int portnum, const char *user,
 	}
 
 	/*
-	 *  No nastype, or nas type 'other', trust radutmp.
+	 *  No nas_type, or nas type 'other', trust radutmp.
 	 */
-	if (!cl->nastype || (cl->nastype[0] == '\0') ||
-	    (strcmp(cl->nastype, "other") == 0)) {
+	if (!cl->nas_type || (cl->nas_type[0] == '\0') ||
+	    (strcmp(cl->nas_type, "other") == 0)) {
 		DEBUG2("checkrad: No NAS type, or type \"other\" not checking");
 		return 1;
 	}
@@ -160,7 +158,7 @@ int rad_check_ts(uint32_t nasaddr, unsigned int portnum, const char *user,
 	 *	Fork.
 	 */
 	if ((pid = rad_fork()) < 0) { /* do wait for the fork'd result */
-		radlog(L_ERR, "Accounting: Failed in fork(): Cannot run checkrad\n");
+		ERROR("Accounting: Failed in fork(): Cannot run checkrad\n");
 		return 2;
 	}
 
@@ -174,12 +172,12 @@ int rad_check_ts(uint32_t nasaddr, unsigned int portnum, const char *user,
 		 *	happens to it now.
 		 */
 		if (child_pid == 0) {
-			radlog(L_ERR, "Check-TS: timeout waiting for checkrad");
+			ERROR("Check-TS: timeout waiting for checkrad");
 			return 2;
 		}
 
 		if (child_pid < 0) {
-			radlog(L_ERR, "Check-TS: unknown error in waitpid()");
+			ERROR("Check-TS: unknown error in waitpid()");
 			return 2;
 		}
 
@@ -203,13 +201,13 @@ int rad_check_ts(uint32_t nasaddr, unsigned int portnum, const char *user,
 	/* OS/2 can't directly execute scripts then we call the command
 	   processor to execute checkrad
 	*/
-	execl(getenv("COMSPEC"), "", "/C","checkrad", cl->nastype, address, port,
+	execl(getenv("COMSPEC"), "", "/C","checkrad", cl->nas_type, address, port,
 		user, session_id, NULL);
 #else
-	execl(mainconfig.checkrad, "checkrad", cl->nastype, address, port,
+	execl(mainconfig.checkrad, "checkrad", cl->nas_type, address, port,
 		user, session_id, NULL);
 #endif
-	radlog(L_ERR, "Check-TS: exec %s: %s", mainconfig.checkrad, strerror(errno));
+	ERROR("Check-TS: exec %s: %s", mainconfig.checkrad, fr_syserror(errno));
 
 	/*
 	 *	Exit - 2 means "some error occured".
@@ -219,9 +217,9 @@ int rad_check_ts(uint32_t nasaddr, unsigned int portnum, const char *user,
 }
 #else
 int rad_check_ts(UNUSED uint32_t nasaddr, UNUSED unsigned int portnum,
-		 UNUSED const char *user, UNUSED const char *session_id)
+		 UNUSED char const *user, UNUSED char const *session_id)
 {
-	radlog(L_ERR, "Simultaneous-Use is not supported");
+	ERROR("Simultaneous-Use is not supported");
 	return 2;
 }
 #endif
@@ -230,17 +228,17 @@ int rad_check_ts(UNUSED uint32_t nasaddr, UNUSED unsigned int portnum,
 /* WITH_SESSION_MGMT */
 
 int session_zap(UNUSED REQUEST *request, UNUSED uint32_t nasaddr, UNUSED unsigned int port,
-		UNUSED const char *user,
-		UNUSED const char *sessionid, UNUSED uint32_t cliaddr, UNUSED char proto,
+		UNUSED char const *user,
+		UNUSED char const *sessionid, UNUSED uint32_t cliaddr, UNUSED char proto,
 		UNUSED int session_time)
 {
 	return RLM_MODULE_FAIL;
 }
 
 int rad_check_ts(UNUSED uint32_t nasaddr, UNUSED unsigned int portnum,
-		 UNUSED const char *user, UNUSED const char *session_id)
+		 UNUSED char const *user, UNUSED char const *session_id)
 {
-	radlog(L_ERR, "Simultaneous-Use is not supported");
+	ERROR("Simultaneous-Use is not supported");
 	return 2;
 }
 #endif

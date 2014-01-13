@@ -20,18 +20,18 @@
  * Copyright 2000,2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modpriv.h>
 #include <freeradius-devel/modcall.h>
+#include <freeradius-devel/parser.h>
 #include <freeradius-devel/rad_assert.h>
 
 
 /* mutually-recursive static functions need a prototype up front */
 static modcallable *do_compile_modgroup(modcallable *,
-					int, CONF_SECTION *,
+					rlm_components_t, CONF_SECTION *,
 					int, int);
 
 /* Actions may be a positive integer (the highest one returned in the group
@@ -43,32 +43,38 @@ static modcallable *do_compile_modgroup(modcallable *,
 #define MOD_ACTION_REJECT  (-2)
 
 /* Here are our basic types: modcallable, modgroup, and modsingle. For an
- * explanation of what they are all about, see ../../doc/README.failover */
+ * explanation of what they are all about, see doc/configurable_failover.rst */
 struct modcallable {
 	modcallable *parent;
 	struct modcallable *next;
-	const char *name;
+	char const *name;
 	enum { MOD_SINGLE = 1, MOD_GROUP, MOD_LOAD_BALANCE, MOD_REDUNDANT_LOAD_BALANCE,
 #ifdef WITH_UNLANG
 	       MOD_IF, MOD_ELSE, MOD_ELSIF, MOD_UPDATE, MOD_SWITCH, MOD_CASE,
 	       MOD_FOREACH, MOD_BREAK,
 #endif
 	       MOD_POLICY, MOD_REFERENCE, MOD_XLAT } type;
-	int method;
+	rlm_components_t method;
 	int actions[RLM_MODULE_NUMCODES];
 };
 
-#define GROUPTYPE_SIMPLE	0
-#define GROUPTYPE_REDUNDANT	1
-#define GROUPTYPE_APPEND	2
-#define GROUPTYPE_COUNT		3
+#define MOD_LOG_OPEN_BRACE(_name) RDEBUG2("%.*s%s %s {", depth + 1, modcall_spaces, _name ? _name : "", c->name)
+#define MOD_LOG_CLOSE_BRACE() RDEBUG2("%.*s} # %s %s = %s", depth + 1, modcall_spaces, \
+				      cf_section_name1(g->cs) ? cf_section_name1(g->cs) : "", c->name ? c->name : "", \
+				      fr_int2str(mod_rcode_table, result, "<invalid>"))
 
 typedef struct {
-	modcallable mc;		/* self */
-	int grouptype;	/* after mc */
-	modcallable *children;
-	CONF_SECTION *cs;
-	VALUE_PAIR *vps;
+	modcallable		mc;		/* self */
+	enum {
+		GROUPTYPE_SIMPLE = 0,
+		GROUPTYPE_REDUNDANT,
+		GROUPTYPE_APPEND,
+		GROUPTYPE_COUNT
+	} grouptype;				/* after mc */
+	modcallable		*children;
+	CONF_SECTION		*cs;
+	value_pair_map_t	*map;		/* update */
+	fr_cond_t		*cond;		/* if/elsif */
 } modgroup;
 
 typedef struct {
@@ -78,7 +84,7 @@ typedef struct {
 
 typedef struct {
 	modcallable mc;
-	const char *ref_name;
+	char const *ref_name;
 	CONF_SECTION *ref_cs;
 } modref;
 
@@ -147,6 +153,8 @@ static void add_child(modgroup *g, modcallable *c)
 
 	if (!c) return;
 
+	(void) talloc_steal(g, c);
+
 	while (node) {
 		last = &node->next;
 		node = node->next;
@@ -159,15 +167,15 @@ static void add_child(modgroup *g, modcallable *c)
 
 /* Here's where we recognize all of our keywords: first the rcodes, then the
  * actions */
-static const FR_NAME_NUMBER rcode_table[] = {
+const FR_NAME_NUMBER mod_rcode_table[] = {
 	{ "reject",     RLM_MODULE_REJECT       },
-	{ "fail",       RLM_MODULE_FAIL         },
-	{ "ok",         RLM_MODULE_OK           },
+	{ "fail",       RLM_MODULE_FAIL	 },
+	{ "ok",	 	RLM_MODULE_OK	   },
 	{ "handled",    RLM_MODULE_HANDLED      },
 	{ "invalid",    RLM_MODULE_INVALID      },
 	{ "userlock",   RLM_MODULE_USERLOCK     },
 	{ "notfound",   RLM_MODULE_NOTFOUND     },
-	{ "noop",       RLM_MODULE_NOOP         },
+	{ "noop",       RLM_MODULE_NOOP	 },
 	{ "updated",    RLM_MODULE_UPDATED      },
 	{ NULL, 0 }
 };
@@ -179,7 +187,7 @@ static const FR_NAME_NUMBER rcode_table[] = {
 static int compile_action(modcallable *c, CONF_PAIR *cp)
 {
 	int action;
-	const char *attr, *value;
+	char const *attr, *value;
 
 	attr = cf_pair_attr(cp);
 	value = cf_pair_value(cp);
@@ -202,7 +210,7 @@ static int compile_action(modcallable *c, CONF_PAIR *cp)
 		 */
 		if (action == 0) return 0;
 	} else {
-		cf_log_err(cf_pairtoitem(cp), "Unknown action '%s'.\n",
+		cf_log_err_cp(cp, "Unknown action '%s'.\n",
 			   value);
 		return 0;
 	}
@@ -210,9 +218,9 @@ static int compile_action(modcallable *c, CONF_PAIR *cp)
 	if (strcasecmp(attr, "default") != 0) {
 		int rcode;
 
-		rcode = fr_str2int(rcode_table, attr, -1);
+		rcode = fr_str2int(mod_rcode_table, attr, -1);
 		if (rcode < 0) {
-			cf_log_err(cf_pairtoitem(cp),
+			cf_log_err_cp(cp,
 				   "Unknown module rcode '%s'.\n",
 				   attr);
 			return 0;
@@ -231,7 +239,7 @@ static int compile_action(modcallable *c, CONF_PAIR *cp)
 }
 
 /* Some short names for debugging output */
-static const char * const comp2str[] = {
+static char const * const comp2str[] = {
 	"authenticate",
 	"authorize",
 	"preacct",
@@ -273,7 +281,7 @@ static void safe_unlock(module_instance_t *instance)
 #define safe_unlock(foo)
 #endif
 
-static int call_modsingle(int component, modsingle *sp, REQUEST *request)
+static int call_modsingle(rlm_components_t component, modsingle *sp, REQUEST *request)
 {
 	int myresult;
 	int blocked;
@@ -313,8 +321,7 @@ static int call_modsingle(int component, modsingle *sp, REQUEST *request)
 	 */
 	blocked = (request->master_state == REQUEST_STOP_PROCESSING);
 	if (blocked) {
-		radlog(L_INFO, "WARNING: Module %s became unblocked for request %u",
-		       sp->modinst->entry->name, request->number);
+		RWARN("Module %s became unblocked for request %u", sp->modinst->entry->name, request->number);
 	}
 
  fail:
@@ -324,7 +331,6 @@ static int call_modsingle(int component, modsingle *sp, REQUEST *request)
 
 	return myresult;
 }
-
 
 static int default_component_results[RLM_COMPONENT_COUNT] = {
 	RLM_MODULE_REJECT,	/* AUTH */
@@ -343,7 +349,7 @@ static int default_component_results[RLM_COMPONENT_COUNT] = {
 };
 
 
-static const char *group_name[] = {
+static char const *group_name[] = {
 	"",
 	"single",
 	"group",
@@ -364,7 +370,7 @@ static const char *group_name[] = {
 	"xlat"
 };
 
-static const char *modcall_spaces = "                              ";
+static char const *modcall_spaces = "                                                                ";
 
 #define MODCALL_STACK_MAX (32)
 
@@ -372,604 +378,698 @@ static const char *modcall_spaces = "                              ";
  *	Don't call the modules recursively.  Instead, do them
  *	iteratively, and manage the call stack ourselves.
  */
-typedef struct modcall_stack {
-	int pointer;
-
-	int priority[MODCALL_STACK_MAX];
-	int result[MODCALL_STACK_MAX];
-	modcallable *children[MODCALL_STACK_MAX];
-	modcallable *start[MODCALL_STACK_MAX];
-} modcall_stack;
+typedef struct modcall_stack_entry_t {
+	int result;
+	int priority;
+	int unwind;		/* unwind to this one if it exists */
+	modcallable *c;
+} modcall_stack_entry_t;
 
 
-#ifdef WITH_UNLANG
-static void pairfree_wrapper(void *data)
-{
-	VALUE_PAIR **vp = (VALUE_PAIR **) data;
-	pairfree(vp);
-}
-#endif
+static bool modcall_recurse(REQUEST *request, rlm_components_t component, int depth,
+			    modcall_stack_entry_t *entry);
 
-/**
- * @brief Call a module, iteratively, with a local stack, rather than
- *	recursively.  What did Paul Graham say about Lisp...?
+/*
+ *	Call a child of a block.
  */
-int modcall(int component, modcallable *c, REQUEST *request)
+static void modcall_child(REQUEST *request, rlm_components_t component, int depth,
+			  modcall_stack_entry_t *entry, modcallable *c,
+			  int *result)
 {
-	int myresult;
-	modcall_stack stack;
-	modcallable *parent, *child;
-	modsingle *sp;
-	int if_taken, was_if;
+	modcall_stack_entry_t *next;
 
-	if ((component < 0) || (component >= RLM_COMPONENT_COUNT)) {
-		return RLM_MODULE_FAIL;
+	if (depth >= MODCALL_STACK_MAX) {
+		ERROR("Internal sanity check failed: module stack is too deep");
+		fr_exit(1);
 	}
 
-	stack.pointer = 0;
-	stack.priority[0] = 0;
-	stack.children[0] = c;
-	stack.start[0] = NULL;
-	myresult = stack.result[0] = default_component_results[component];
-	was_if = if_taken = FALSE;
+	/*
+	 *	Initialize the childs stack frame.
+	 */
+	next = entry + 1;
+	next->c = c;
+	next->result = entry->result;
+	next->priority = 0;
+	next->unwind = 0;
 
-	while (1) {
-		/*
-		 *	A module has taken too long to process the request,
-		 *	and we've been told to stop processing it.
-		 */
-		if ((request->master_state == REQUEST_STOP_PROCESSING) ||
-		    (request->parent &&
-		     (request->parent->master_state == REQUEST_STOP_PROCESSING))) {
-			myresult = RLM_MODULE_FAIL;
-			break;
-		}
+	if (!modcall_recurse(request, component,
+			     depth, next)) {
+		*result = RLM_MODULE_FAIL;
+		 return;
+	}
 
-		child = stack.children[stack.pointer];
-		if (!child) {
-			myresult = stack.result[stack.pointer];
-			break;
-		}
-		parent = child->parent;
+	/*
+	 *	Unwind back up the stack
+	 */
+	if (next->unwind != 0) {
+		entry->unwind = next->unwind;
+	}
+
+	*result = next->result;
+
+	return;
+}
+
+/*
+ *	Interpret the various types of blocks.
+ */
+static bool modcall_recurse(REQUEST *request, rlm_components_t component, int depth,
+			    modcall_stack_entry_t *entry)
+{
+	bool if_taken, was_if;
+	modcallable *c;
+	int result, priority;
+
+	was_if = if_taken = false;
+	result = RLM_MODULE_UNKNOWN;
+
+redo:
+	priority = -1;
+	c = entry->c;
+
+	/*
+	 *	Nothing more to do.  Return the code and priority
+	 *	which was set by the caller.
+	 */
+	if (!c) return true;
+
+	/*
+	 *	We've been asked to stop.  Do so.
+	 */
+	if ((request->master_state == REQUEST_STOP_PROCESSING) ||
+	    (request->parent &&
+	     (request->parent->master_state == REQUEST_STOP_PROCESSING))) {
+		entry->result = RLM_MODULE_FAIL;
+		entry->priority = 9999;
+		return true;
+	}
 
 #ifdef WITH_UNLANG
-		if ((child->type == MOD_ELSE) || (child->type == MOD_ELSIF)) {
-			myresult = stack.result[stack.pointer];
+	/*
+	 *	Handle "if" conditions.
+	 */
+	if (c->type == MOD_IF) {
+		int condition;
+		modgroup *g;
 
-			if (!was_if) { /* error */
-				RDEBUG2("%.*s ... skipping %s for request %d: No preceding \"if\"",
-				       stack.pointer + 1, modcall_spaces,
-				       group_name[child->type],
-				       request->number);
-				goto unroll;
-			}
-			if (if_taken) {
-				RDEBUG2("%.*s ... skipping %s for request %d: Preceding \"if\" was taken",
-				       stack.pointer + 1, modcall_spaces,
-				       group_name[child->type],
-				       request->number);
-				goto unroll;
-			}
-		}
+	mod_if:
+		g = mod_callabletogroup(c);
+		rad_assert(g->cond != NULL);
 
-		/*
-		 *	"if" or "elsif".  Evaluate the condition.
-		 */
-		if ((child->type == MOD_IF) || (child->type == MOD_ELSIF)) {
-			int condition = TRUE;
-			const char *p = child->name;
+		RDEBUG2("%.*s? %s %s", depth + 1, modcall_spaces,
+			group_name[c->type], c->name);
 
-			RDEBUG2("%.*s? %s %s",
-			       stack.pointer + 1, modcall_spaces,
-			       (child->type == MOD_IF) ? "if" : "elsif",
-			       child->name);
-
-			if (radius_evaluate_condition(request, myresult,
-						      0, &p, TRUE, &condition)) {
-				RDEBUG2("%.*s? %s %s -> %s",
-				       stack.pointer + 1, modcall_spaces,
-				       (child->type == MOD_IF) ? "if" : "elsif",
-				       child->name, (condition != FALSE) ? "TRUE" : "FALSE");
-			} else {
-				/*
-				 *	This should never happen, the
-				 *	condition is checked when the
-				 *	module section is loaded.
-				 */
-				condition = FALSE;
-			}
-
-			if (!condition) {
-				stack.result[stack.pointer] = myresult;
-				stack.children[stack.pointer] = NULL;
-				was_if = TRUE;
-				if_taken = FALSE;
-				goto next_section;
-			} /* else process it as a simple group */
-		}
-
-		if (child->type == MOD_UPDATE) {
-			int rcode;
-			modgroup *g = mod_callabletogroup(child);
-
-			RDEBUG2("%.*supdate %s {",
-				stack.pointer + 1, modcall_spaces,
-				child->name);
-
-			rcode = radius_update_attrlist(request, g->cs,
-						       g->vps, child->name);
-			if (rcode != RLM_MODULE_UPDATED) {
-				myresult = rcode;
-			} else {
-				/*
-				 *	FIXME: Set priority based on
-				 *	previous priority, so that we
-				 *	don't stop on reject when the
-				 *	default priority was to
-				 *	continue...
-				 *	
-				 */
-			}
-			goto handle_result;
-		}
-
-		if (child->type == MOD_BREAK) {
-			int i;
-			VALUE_PAIR **copy_p;
-
-			for (i = 8; i >= 0; i--) {
-				copy_p = request_data_get(request,
-							  radius_get_vp, i);
-				if (copy_p) {
-						RDEBUG2("%.*s #  BREAK Foreach-Variable-%d", stack.pointer + 1, modcall_spaces, i);
-					pairfree(copy_p);
-					break;
-				}
-			}
-
-			myresult = RLM_MODULE_NOOP;
-			goto handle_result;
-		}
-
-		if (child->type == MOD_FOREACH) {
-			int i, depth = -1;
-			VALUE_PAIR *vp;
-			modgroup *g = mod_callabletogroup(child);
-
-			for (i = 0; i < 8; i++) {
-				if (!request_data_reference(request,
-							    radius_get_vp, i)) {
-					depth = i;
-					break;
-				}
-			}
-
-			if (depth < 0) {
-				RDEBUG("ERROR: foreach Nesting too deep!");
-				myresult = RLM_MODULE_FAIL;
-				goto handle_result;
-			}
-
-			if (!(radius_get_vp(request, child->name, &vp) < 0)) {
-				RDEBUG2("%.*sforeach %s {",
-					stack.pointer + 1, modcall_spaces,
-					child->name);
-				while (vp) {
-					VALUE_PAIR *copy = NULL, **copy_p;
-
-#ifndef NDEBUG
-					if (fr_debug_flag >= 2) {
-						char buffer[1024];
-
-						vp_prints_value(buffer, sizeof(buffer), vp, 1);
-						RDEBUG2("%.*s #  Foreach-Variable-%d = %s", stack.pointer + 1, modcall_spaces, depth, buffer);
-					}
-#endif
-
-					copy = paircopy(vp);
-					copy_p = &copy;
-
-					request_data_add(request, radius_get_vp,
-							 depth, copy_p,
-							 pairfree_wrapper);
-
-				 	myresult = modcall(component,
-							   g->children,
-							   request);
-					if (myresult == MOD_ACTION_RETURN) {
-						break;
-					}
-					vp = pairfind(vp->next, vp->attribute, vp->vendor, TAG_ANY);
-
-					/*
-					 *	Delete the cached attribute,
-					 *	if it exists.
-					 */
-					if (copy) {
-						request_data_get(request,
-								 radius_get_vp,
-								 depth);
-						pairfree(&copy);
-					} else {
-						break;
-					}
-				} /* loop over VPs */
-			}  /* if the VP exists */
-
-			myresult = RLM_MODULE_OK;
-			goto handle_result;
-		}
-#endif
-	
-		if (child->type == MOD_REFERENCE) {
-			modref *mr = mod_callabletoref(child);
-			const char *server = request->server;
-
-			if (server == mr->ref_name) {
-				RDEBUG("WARNING: Suppressing recursive call to server %s", server);
-				myresult = RLM_MODULE_NOOP;
-				goto handle_result;
-			}
-			
-			request->server = mr->ref_name;
-			RDEBUG("server %s { # nested call", mr->ref_name);
-			myresult = indexed_modcall(component, 0, request);
-			RDEBUG("} # server %s with nested call", mr->ref_name);
-			request->server = server;
-			goto handle_result;
-		}
-
-		if (child->type == MOD_XLAT) {
-			modxlat *mx = mod_callabletoxlat(child);
-			char buffer[128];
-
-			if (!mx->exec) {
-				radius_xlat(buffer, sizeof(buffer),
-					    mx->xlat_name, request, NULL, NULL);
-			} else {
-				RDEBUG("`%s`", mx->xlat_name);
-				radius_exec_program(mx->xlat_name, request,
-						    0, NULL, 0,
-						    request->packet->vps,
-						    NULL, 1);
-			}
-					    
-			goto handle_result;
-		}
-
-		/*
-		 *	Child is a group that has children of it's own.
-		 */
-		if (child->type != MOD_SINGLE) {
-			int count = 1;
-			modcallable *p, *q;
-#ifdef WITH_UNLANG
-			modcallable *null_case;
-#endif
-			modgroup *g = mod_callabletogroup(child);
-
-			stack.pointer++;
-
-			/*
-			 *	Catastrophic error.  This SHOULD have
-			 *	been caught when we were reading in the
-			 *	conf files.
-			 *
-			 *	FIXME: Do so.
-			 */
-			if (stack.pointer >= MODCALL_STACK_MAX) {
-				radlog(L_ERR, "Internal sanity check failed: module stack is too deep");
-				exit(1);
-			}
-
-			stack.priority[stack.pointer] = 0;
-			stack.result[stack.pointer] = default_component_results[component];
-
-			RDEBUG2("%.*s%s %s {",
-				stack.pointer + 1, modcall_spaces,
-				group_name[child->type], child->name);
-
-			switch (child->type) {
-#ifdef WITH_UNLANG
-				char buffer[1024];
-
-			case MOD_IF:
-			case MOD_ELSE:
-			case MOD_ELSIF:
-			case MOD_CASE:
-			case MOD_FOREACH:
-#endif
-			case MOD_GROUP:
-			case MOD_POLICY: /* same as MOD_GROUP */
-				stack.children[stack.pointer] = g->children;
+		condition = radius_evaluate_cond(request, result, 0, g->cond);
+		if (condition < 0) {
+			switch (condition) {
+			case -2:
+				REDEBUG("Condition evaluation failed because a referenced attribute "
+					"was not found in the request");
 				break;
-
-				/*
-				 *	See the "camel book" for why
-				 *	this works.
-				 *
-				 *	If (rand(0..n) < 1), pick the
-				 *	current realm.  We add a scale
-				 *	factor of 65536, to avoid
-				 *	floating point.
-				 */
-			case MOD_LOAD_BALANCE:
-			case MOD_REDUNDANT_LOAD_BALANCE:
-				q = NULL;
-				for(p = g->children; p; p = p->next) {
-					if (!q) {
-						q = p;
-						count = 1;
-						continue;
-					}
-
-					count++;
-
-					if ((count * (fr_rand() & 0xffff)) < (uint32_t) 0x10000) {
-						q = p;
-					}
-				}
-				stack.children[stack.pointer] = q;
-				break;
-
-#ifdef WITH_UNLANG
-			case MOD_SWITCH:
-				if (!strchr(child->name, '%')) {
-					VALUE_PAIR *vp = NULL;
-
-					radius_get_vp(request, child->name,
-						      &vp);
-					if (vp) {
-						vp_prints_value(buffer,
-								sizeof(buffer),
-								vp, 0);
-					} else {
-						*buffer = '\0';
-					}
-				} else {
-					radius_xlat(buffer, sizeof(buffer),
-						    child->name, request, NULL, NULL);
-				}
-				null_case = q = NULL;
-				for(p = g->children; p; p = p->next) {
-					if (!p->name) {
-						if (!null_case) null_case = p;
-						continue;
-					}
-					if (strcmp(buffer, p->name) == 0) {
-						q = p;
-						break;
-					}
-				}
-
-				if (!q) q = null_case;
-
-				stack.children[stack.pointer] = q;
-				break;
-#endif
-
 			default:
-				RDEBUG2("Internal sanity check failed in modcall %d", child->type);
-				exit(1); /* internal sanity check failure */
+			case -1:
+				REDEBUG("Condition evaluation failed because the value of an operand "
+					"could not be determined");
 				break;
 			}
-
-
-			stack.start[stack.pointer] = stack.children[stack.pointer];
-
-			RDEBUG2("%.*s- entering %s %s {...}",
-			       stack.pointer, modcall_spaces,
-			       group_name[child->type],
-			       child->name ? child->name : "");
-
-			/*
-			 *	Catch the special case of a NULL group.
-			 */
-			if (!stack.children[stack.pointer]) {
-				/*
-				 *	Print message for NULL group
-				 */
-				RDEBUG2("%.*s- %s %s = %s",
-				       stack.pointer + 1, modcall_spaces,
-				       group_name[child->type],
-				       child->name ? child->name : "",
-				       fr_int2str(rcode_table,
-						    stack.result[stack.pointer],
-						    "??"));
-				goto do_return;
-			}
-
-			/*
-			 *	The child may be a group, so we want to
-			 *	recurse into it's children, rather than
-			 *	falling through to the code below.
-			 */
-			continue;
+			condition = 0;
+		} else {
+			RDEBUG2("%.*s? %s %s -> %s", depth + 1, modcall_spaces,
+				group_name[c->type],
+				c->name, condition ? "TRUE" : "FALSE");
 		}
+
+		/*
+		 *	Didn't pass.  Remember that.
+		 */
+		if (!condition) {
+			was_if = true;
+			if_taken = false;
+			goto next_sibling;
+		}
+
+		/*
+		 *	We took the "if".  Go recurse into its' children.
+		 */
+		was_if = true;
+		if_taken = true;
+		goto do_children;
+	} /* MOD_IF */
+
+	/*
+	 *	"else" if the previous "if" was taken.
+	 *	"if" if the previous if wasn't taken.
+	 */
+	if (c->type == MOD_ELSIF) {
+		if (!was_if) goto elsif_error;
+
+		/*
+		 *	Like MOD_ELSE, but allow for a later "else"
+		 */
+		if (if_taken) {
+			RDEBUG2("%.*s ... skipping %s for request %d: Preceding \"if\" was taken",
+				depth + 1, modcall_spaces,
+				group_name[c->type], request->number);
+			was_if = true;
+			if_taken = true;
+			goto next_sibling;
+		}
+
+		/*
+		 *	Check the "if" condition.
+		 */
+		goto mod_if;
+	} /* MOD_ELSIF */
+
+	/*
+	 *	"else" for a preceding "if".
+	 */
+	if (c->type == MOD_ELSE) {
+		if (!was_if) { /* error */
+		elsif_error:
+			RDEBUG2("%.*s ... skipping %s for request %d: No preceding \"if\"",
+				depth + 1, modcall_spaces,
+				group_name[c->type], request->number);
+			goto next_sibling;
+		}
+
+		if (if_taken) {
+			RDEBUG2("%.*s ... skipping %s for request %d: Preceding \"if\" was taken",
+				depth + 1, modcall_spaces,
+				group_name[c->type], request->number);
+			was_if = false;
+			if_taken = false;
+			goto next_sibling;
+		}
+
+		/*
+		 *	We need to process it.  Go do that.
+		 */
+		was_if = false;
+		if_taken = false;
+		goto do_children;
+	} /* MOD_ELSE */
+
+	/*
+	 *	We're no longer processing if/else/elsif.  Reset the
+	 *	trackers for those conditions.
+	 */
+	was_if = false;
+	if_taken = false;
+#endif	/* WITH_UNLANG */
+
+	if (c->type == MOD_SINGLE) {
+		modsingle *sp;
 
 		/*
 		 *	Process a stand-alone child, and fall through
 		 *	to dealing with it's parent.
 		 */
-		sp = mod_callabletosingle(child);
+		sp = mod_callabletosingle(c);
 
-		myresult = call_modsingle(child->method, sp, request);
-		RDEBUG2("%.*s[%s] = %s",
-			stack.pointer + 1, modcall_spaces,
-			child->name ? child->name : "",
-			fr_int2str(rcode_table, myresult, "??"));
-		
+		result = call_modsingle(c->method, sp, request);
+		RDEBUG2("%.*s[%s] = %s", depth + 1, modcall_spaces, c->name ? c->name : "",
+			fr_int2str(mod_rcode_table, result, "<invalid>"));
+		goto calculate_result;
+	} /* MOD_SINGLE */
+
 #ifdef WITH_UNLANG
-		if (0) {
-		handle_result:
-			if (child->type != MOD_BREAK) {
-				RDEBUG2("%.*s} # %s %s = %s",
-					stack.pointer + 1, modcall_spaces,
-					group_name[child->type], child->name ? child->name : "",
-					fr_int2str(rcode_table, myresult, "??"));
+	/*
+	 *	Update attribute(s)
+	 */
+	if (c->type == MOD_UPDATE) {
+		int rcode;
+		modgroup *g = mod_callabletogroup(c);
+		value_pair_map_t *map;
+
+
+		MOD_LOG_OPEN_BRACE("update");
+		for (map = g->map; map != NULL; map = map->next) {
+			rcode = radius_map2request(request, map, "update", radius_map2vp, NULL);
+			if (rcode < 0) {
+				result = (rcode == -2) ? RLM_MODULE_INVALID : RLM_MODULE_FAIL;
+				MOD_LOG_CLOSE_BRACE();
+				goto calculate_result;
 			}
 		}
-#else
-		handle_result:
-#endif
-		
-		/*
-		 *	This is a bit of a hack...
-		 */
-		if (component != RLM_COMPONENT_SESS) request->simul_max = myresult;
 
-		/*
-		 *	FIXME: Allow modules to push a modcallable
-		 *	onto this stack.  This should simplify
-		 *	configuration a LOT!
-		 *
-		 *	Once we do that, we can't do load-time
-		 *	checking of the maximum stack depth, and we've
-		 *	got to cache the stack pointer before storing
-		 *	myresult.
-		 *
-		 *	Also, if the stack changed, we need to set
-		 *	children[ptr] to NULL, and process the next
-		 *	entry on the stack, rather than falling
-		 *	through to finalize the processing of this
-		 *	entry.
-		 *
-		 *	Don't put "myresult" on the stack here,
-		 *	we have to do so with priority.
-		 */
+		result = RLM_MODULE_NOOP;
+		MOD_LOG_CLOSE_BRACE();
+		goto calculate_result;
+	} /* MOD_IF */
 
-		/*
-		 *	We roll back up the stack at this point.
-		 */
-	unroll:
-		/*
-		 *	The child's action says return.  Do so.
-		 */
-		if (child->actions[myresult] == MOD_ACTION_RETURN) {
-			stack.result[stack.pointer] = myresult;
-			stack.children[stack.pointer] = NULL;
-			goto do_return;
+	/*
+	 *	Loop over a set of attributes.
+	 */
+	if (c->type == MOD_FOREACH) {
+		int i, foreach_depth = -1;
+		VALUE_PAIR *vp;
+		modcall_stack_entry_t *next = NULL;
+		vp_cursor_t cursor;
+		modgroup *g = mod_callabletogroup(c);
+
+		if (depth >= MODCALL_STACK_MAX) {
+			ERROR("Internal sanity check failed: module stack is too deep");
+			fr_exit(1);
 		}
 
 		/*
-		 *	If "reject", break out of the loop and return
-		 *	reject.
+		 *	Figure out how deep we are in nesting by looking at request_data
+		 *	stored previously.
 		 */
-		if (child->actions[myresult] == MOD_ACTION_REJECT) {
-			stack.children[stack.pointer] = NULL;
-			stack.result[stack.pointer] = RLM_MODULE_REJECT;
-			goto do_return;
-		}
-
-		/*
-		 *	Otherwise, the action is a number, the
-		 *	preference level of this return code. If no
-		 *	higher preference has been seen yet, remember
-		 *	this one.
-		 */
-		if (child->actions[myresult] >= stack.priority[stack.pointer]) {
-			stack.result[stack.pointer] = myresult;
-			stack.priority[stack.pointer] = child->actions[myresult];
-		}
-
-
-#ifdef WITH_UNLANG
-	next_section:
-#endif
-		/*
-		 *	No parent, we must be done.
-		 */
-		if (!parent) {
- 			rad_assert(stack.pointer == 0);
-			myresult = stack.result[0];
-			break;
-		}
-
-		rad_assert(child != NULL);
-
-		/*
-		 *	Go to the "next" child, whatever that is.
-		 */
-		switch (parent->type) {
-#ifdef WITH_UNLANG
-			case MOD_IF:
-			case MOD_ELSE:
-			case MOD_ELSIF:
-			case MOD_CASE:
-			case MOD_FOREACH:
-#endif
-			case MOD_GROUP:
-			case MOD_POLICY: /* same as MOD_GROUP */
-				stack.children[stack.pointer] = child->next;
+		for (i = 0; i < 8; i++) {
+			if (!request_data_reference(request,
+						    radius_get_vp, i)) {
+				foreach_depth = i;
 				break;
-
-#ifdef WITH_UNLANG
-			case MOD_SWITCH:
-#endif
-			case MOD_LOAD_BALANCE:
-				stack.children[stack.pointer] = NULL;
-				break;
-
-			case MOD_REDUNDANT_LOAD_BALANCE:
-				if (child->next) {
-					stack.children[stack.pointer] = child->next;
-				} else {
-					modgroup *g = mod_callabletogroup(parent);
-
-					stack.children[stack.pointer] = g->children;
-				}
-				if (stack.children[stack.pointer] == stack.start[stack.pointer]) {
-					stack.children[stack.pointer] = NULL;
-				}
-				break;
-			default:
-				RDEBUG2("Internal sanity check failed in modcall  next %d", child->type);
-				exit(1);
+			}
 		}
 
-		/*
-		 *	No child, we're done this group, and we return
-		 *	"myresult" to the caller by pushing it back up
-		 *	the stack.
-		 */
-		if (!stack.children[stack.pointer]) {
-		do_return:
-			myresult = stack.result[stack.pointer];
-			if (stack.pointer == 0) break;
-			stack.pointer--;
-			if (stack.pointer == 0) break;
+		if (foreach_depth < 0) {
+			REDEBUG("foreach Nesting too deep!");
+			result = RLM_MODULE_FAIL;
+			goto calculate_result;
+		}
 
-			RDEBUG2("%.*s- %s %s returns %s",
-			       stack.pointer + 1, modcall_spaces,
-			       group_name[parent->type],
-			       parent->name ? parent->name : "",
-			       fr_int2str(rcode_table, myresult, "??"));
+		if (radius_get_vp(&vp, request, c->name) < 0) {
+			RDEBUG("Unknown Attribute \"%s\"", c->name);
+			result = RLM_MODULE_FAIL;
+			goto calculate_result;
+		}
 
-#ifdef WITH_UNLANG
-			if ((parent->type == MOD_IF) ||
-			    (parent->type == MOD_ELSIF)) {
-				if_taken = was_if = TRUE;
-			} else {
-				if_taken = was_if = FALSE;
+		if (!vp) {	/* nothing to loop over */
+			MOD_LOG_OPEN_BRACE("foreach");
+			result = RLM_MODULE_NOOP;
+			MOD_LOG_CLOSE_BRACE();
+			goto calculate_result;
+		}
+
+		RDEBUG2("%.*sforeach %s ", depth + 1, modcall_spaces,
+			c->name);
+
+		fr_cursor_init(&cursor, &vp);
+		/* Prime the cursor. */
+		cursor.found = cursor.current;
+		while (vp) {
+			VALUE_PAIR *copy = NULL, **copy_p;
+
+#ifndef NDEBUG
+			if (fr_debug_flag >= 2) {
+				char buffer[1024];
+
+				vp_prints_value(buffer, sizeof(buffer), vp, '"');
+				RDEBUG2("%.*s #  Foreach-Variable-%d = %s", depth + 1,
+					modcall_spaces, foreach_depth, buffer);
 			}
 #endif
 
 			/*
-			 *	Unroll the stack.
+			 *	Copy only the one VP we care about.
 			 */
-			child = stack.children[stack.pointer];
-			parent = child->parent;
-			goto unroll;
+			copy = paircopyvp(request, vp);
+			copy_p = &copy;
+
+			/*
+			 *	@fixme: The old code freed copy on
+			 *	request_data_add or request_data_get.
+			 *	There's no way to easily do that now.
+			 *	The foreach code should be audited for
+			 *	possible memory leaks, though it's not
+			 *	a huge priority as any leaked memory
+			 *	will be freed on request free.
+			 */
+			request_data_add(request, radius_get_vp, foreach_depth, copy_p, false);
+
+			/*
+			 *	Initialize the childs stack frame.
+			 */
+			next = entry + 1;
+			next->c = g->children;
+			next->result = entry->result;
+			next->priority = 0;
+			next->unwind = 0;
+
+			if (!modcall_recurse(request, component, depth + 1, next)) {
+				request_data_get(request, radius_get_vp, foreach_depth);
+				pairfree(&copy);
+				break;
+			}
+
+			vp = fr_cursor_next_by_num(&cursor, vp->da->attr, vp->da->vendor, TAG_ANY);
+
+			/*
+			 *	Delete the cached attribute, if it exists.
+			 */
+			if (copy) {
+				request_data_get(request, radius_get_vp, foreach_depth);
+				pairfree(&copy);
+			} else {
+				break;
+			}
+
+			/*
+			 *	If we've been told to stop processing
+			 *	it, do so.
+			 */
+			if (entry->unwind == MOD_FOREACH) {
+				entry->unwind = 0;
+				break;
+			}
+		} /* loop over VPs */
+
+		result = next->result;
+		priority = next->priority;
+		MOD_LOG_CLOSE_BRACE();
+		goto calculate_result;
+	} /* MOD_FOREACH */
+
+	/*
+	 *	Break out of a "foreach" loop.
+	 */
+	if (c->type == MOD_BREAK) {
+		int i;
+		VALUE_PAIR **copy_p;
+
+		for (i = 8; i >= 0; i--) {
+			copy_p = request_data_get(request,
+						  radius_get_vp, i);
+			if (copy_p) {
+				RDEBUG2("%.*s # break Foreach-Variable-%d", depth + 1,
+					modcall_spaces, i);
+				pairfree(copy_p);
+				break;
+			}
 		}
 
-	} /* loop until done */
+		/*
+		 *	Leave result / priority on the stack, and stop processing the section.
+		 */
+		entry->unwind = MOD_FOREACH;
+		return true;
+	} /* MOD_BREAK */
+#endif	  /* WITH_PROXY */
 
-	return myresult;
+	/*
+	 *	Child is a group that has children of it's own.
+	 */
+	if ((c->type == MOD_GROUP) || (c->type == MOD_POLICY)
+#ifdef WITH_UNLANG
+	    || (c->type == MOD_CASE)
+#endif
+		) {
+		modgroup *g;
+
+#ifdef WITH_UNLANG
+	do_children:
+#endif
+		g = mod_callabletogroup(c);
+
+		/*
+		 *	This should really have been caught in the
+		 *	compiler, and the node never generated.  But
+		 *	doing that requires changing it's API so that
+		 *	it returns a flag instead of the compiled
+		 *	MOD_GROUP.
+		 */
+		if (!g->children) {
+			RDEBUG2("%.*s%s %s { ... } # empty sub-section is ignored",
+				depth + 1, modcall_spaces, cf_section_name1(g->cs), c->name);
+			goto next_sibling;
+		}
+
+		MOD_LOG_OPEN_BRACE(cf_section_name1(g->cs));
+		modcall_child(request, component,
+			      depth + 1, entry, g->children,
+			      &result);
+		MOD_LOG_CLOSE_BRACE();
+		goto calculate_result;
+	} /* MOD_GROUP */
+
+#ifdef WITH_UNLANG
+	if (c->type == MOD_SWITCH) {
+		modcallable *this, *found, *null_case;
+		modgroup *g;
+		char buffer[1024];
+
+		MOD_LOG_OPEN_BRACE("switch");
+
+		/*
+		 *	If there's no %, it refers to an attribute.
+		 *	Otherwise, expand it.
+		 */
+		if (!strchr(c->name, '%')) {
+			VALUE_PAIR *vp = NULL;
+
+			radius_get_vp(&vp, request, c->name);
+			if (vp) {
+				vp_prints_value(buffer,
+						sizeof(buffer),
+						vp, 0);
+			} else {
+				*buffer = '\0';
+			}
+		} else {
+			radius_xlat(buffer, sizeof(buffer),
+				    request, c->name, NULL, NULL);
+		}
+
+		/*
+		 *	Find either the exact matching name, or the
+		 *	"case {...}" statement.
+		 */
+		g = mod_callabletogroup(c);
+		null_case = found = NULL;
+		for (this = g->children; this; this = this->next) {
+			if (!this->name) {
+				if (!null_case) null_case = this;
+				continue;
+			}
+			if (strcmp(buffer, this->name) == 0) {
+				found = this;
+				break;
+			}
+		}
+
+		if (!found) found = null_case;
+
+		MOD_LOG_OPEN_BRACE(group_name[c->type]);
+		modcall_child(request, component,
+			      depth + 1, entry, found,
+			      &result);
+		MOD_LOG_CLOSE_BRACE();
+		goto calculate_result;
+	} /* MOD_SWITCH */
+#endif
+
+	if ((c->type == MOD_LOAD_BALANCE) ||
+	    (c->type == MOD_REDUNDANT_LOAD_BALANCE)) {
+		int count = 0;
+		modcallable *this, *found;
+		modgroup *g;
+
+		MOD_LOG_OPEN_BRACE("load-balance");
+
+		g = mod_callabletogroup(c);
+		found = NULL;
+		for (this = g->children; this; this = this->next) {
+			if (!found) {
+				found = this;
+				count = 1;
+				continue;
+			}
+			count++;
+
+			if ((count * (fr_rand() & 0xffff)) < (uint32_t) 0x10000) {
+				found = this;
+			}
+		}
+
+		MOD_LOG_OPEN_BRACE(group_name[c->type]);
+
+		if (c->type == MOD_LOAD_BALANCE) {
+			modcall_child(request, component,
+				      depth + 1, entry, found,
+				      &result);
+		} else {
+			int i;
+
+			/*
+			 *	Loop over all children in this
+			 *	section.  If we get FAIL, then
+			 *	continue.  Otherwise, stop.
+			 */
+			for (i = 1; i < count; i++) {
+				modcall_child(request, component,
+					      depth + 1, entry, found,
+					      &result);
+				if (c->actions[result] == MOD_ACTION_RETURN) {
+					priority = -1;
+					break;
+				}
+			}
+		}
+		MOD_LOG_CLOSE_BRACE();
+		goto calculate_result;
+	} /* MOD_LOAD_BALANCE */
+
+	/*
+	 *	Reference another virtual server.
+	 *
+	 *	This should really be deleted, and replaced with a
+	 *	more abstracted / functional version.
+	 */
+	if (c->type == MOD_REFERENCE) {
+		modref *mr = mod_callabletoref(c);
+		char const *server = request->server;
+
+		if (server == mr->ref_name) {
+			RWDEBUG("Suppressing recursive call to server %s", server);
+			goto next_sibling;
+		}
+
+		request->server = mr->ref_name;
+		RDEBUG("server %s { # nested call", mr->ref_name);
+		result = indexed_modcall(component, 0, request);
+		RDEBUG("} # server %s with nested call", mr->ref_name);
+		request->server = server;
+		goto calculate_result;
+	} /* MOD_REFERENCE */
+
+	/*
+	 *	xlat a string without doing anything else
+	 *
+	 *	This should really be deleted, and replaced with a
+	 *	more abstracted / functional version.
+	 */
+	if (c->type == MOD_XLAT) {
+		modxlat *mx = mod_callabletoxlat(c);
+		char buffer[128];
+
+		if (!mx->exec) {
+			radius_xlat(buffer, sizeof(buffer), request, mx->xlat_name, NULL, NULL);
+		} else {
+			RDEBUG("`%s`", mx->xlat_name);
+			radius_exec_program(request, mx->xlat_name, false, true, NULL, 0,
+					    EXEC_TIMEOUT, request->packet->vps, NULL);
+		}
+
+		goto next_sibling;
+	} /* MOD_XLAT */
+
+	/*
+	 *	Add new module types here.
+	 */
+
+calculate_result:
+#if 0
+	RDEBUG("(%s, %d) ? (%s, %d)",
+	       fr_int2str(mod_rcode_table, result, "<invalid>"),
+	       priority,
+	       fr_int2str(mod_rcode_table, entry->result, "<invalid>"),
+	       entry->priority);
+#endif
+
+
+	rad_assert(result != RLM_MODULE_UNKNOWN);
+
+	/*
+	 *	The child's action says return.  Do so.
+	 */
+	if ((c->actions[result] == MOD_ACTION_RETURN) &&
+	    (priority <= 0)) {
+		entry->result = result;
+		return true;
+	}
+
+	/*
+	 *	If "reject", break out of the loop and return
+	 *	reject.
+	 */
+	if (c->actions[result] == MOD_ACTION_REJECT) {
+		entry->result = RLM_MODULE_REJECT;
+		return true;
+	}
+
+	/*
+	 *	The array holds a default priority for this return
+	 *	code.  Grab it in preference to any unset priority.
+	 */
+	if (priority < 0) {
+		priority = c->actions[result];
+	}
+
+	/*
+	 *	We're higher than any previous priority, remember this
+	 *	return code and priority.
+	 */
+	if (priority > entry->priority) {
+		entry->result = result;
+		entry->priority = priority;
+	}
+
+#ifdef WITH_UNLANG
+	/*
+	 *	If we're processing a "case" statement, we return once
+	 *	it's done, rather than going to the next "case" statement.
+	 */
+	if (c->type == MOD_CASE) return true;
+#endif
+
+	/*
+	 *	If we've been told to stop processing
+	 *	it, do so.
+	 */
+	if (entry->unwind != 0) {
+		RDEBUG2("%.*s # unwind to enclosing %s", depth + 1, modcall_spaces,
+			group_name[entry->unwind]);
+		entry->unwind = 0;
+		return true;
+	}
+
+next_sibling:
+	entry->c = entry->c->next;
+
+	if (entry->c) goto redo;
+
+	/*
+	 *	And we're done!
+	 */
+	return true;
+}
+
+
+/**
+ * @brief Call a module, iteratively, with a local stack, rather than
+ *	recursively.  What did Paul Graham say about Lisp...?
+ */
+int modcall(rlm_components_t component, modcallable *c, REQUEST *request)
+{
+	modcall_stack_entry_t stack[MODCALL_STACK_MAX];
+
+	/*
+	 *	Set up the initial stack frame.
+	 */
+	stack[0].c = c;
+	stack[0].result = default_component_results[component];
+	stack[0].priority = 0;
+	stack[0].unwind = 0;
+
+	/*
+	 *	Call the main handler.
+	 */
+	if (!modcall_recurse(request, component, 0, &stack[0])) {
+		return RLM_MODULE_FAIL;
+	}
+
+	/*
+	 *	Return the result.
+	 */
+	return stack[0].result;
 }
 
 
 #if 0
-static const char *action2str(int action)
+static char const *action2str(int action)
 {
 	static char buf[32];
 	if(action==MOD_ACTION_RETURN)
@@ -991,25 +1091,25 @@ static void dump_mc(modcallable *c, int indent)
 		modsingle *single = mod_callabletosingle(c);
 		DEBUG("%.*s%s {", indent, "\t\t\t\t\t\t\t\t\t\t\t",
 			single->modinst->name);
-	} else {
+	} else if ((c->type > MOD_SINGLE) && (c->type <= MOD_POLICY)) {
 		modgroup *g = mod_callabletogroup(c);
 		modcallable *p;
 		DEBUG("%.*s%s {", indent, "\t\t\t\t\t\t\t\t\t\t\t",
 		      group_name[c->type]);
 		for(p = g->children;p;p = p->next)
 			dump_mc(p, indent+1);
-	}
+	} /* else ignore it for now */
 
 	for(i = 0; i<RLM_MODULE_NUMCODES; ++i) {
 		DEBUG("%.*s%s = %s", indent+1, "\t\t\t\t\t\t\t\t\t\t\t",
-		      fr_int2str(rcode_table, i, "??"),
+		      fr_int2str(mod_rcode_table, i, "<invalid>"),
 		      action2str(c->actions[i]));
 	}
 
 	DEBUG("%.*s}", indent, "\t\t\t\t\t\t\t\t\t\t\t");
 }
 
-static void dump_tree(int comp, modcallable *c)
+static void dump_tree(rlm_components_t comp, modcallable *c)
 {
 	DEBUG("[%s]", comp2str[comp]);
 	dump_mc(c, 0);
@@ -1421,159 +1521,87 @@ defaultactions[RLM_COMPONENT_COUNT][GROUPTYPE_COUNT][RLM_MODULE_NUMCODES] =
 
 
 #ifdef WITH_UNLANG
-static modcallable *do_compile_modupdate(modcallable *parent,
-					 int component, CONF_SECTION *cs,
-					 const char *name2)
+static modcallable *do_compile_modupdate(modcallable *parent, UNUSED rlm_components_t component,
+					 CONF_SECTION *cs, char const *name2)
 {
-	int i, ok = FALSE;
-	const char *vp_name;
+	int rcode;
 	modgroup *g;
 	modcallable *csingle;
-	CONF_ITEM *ci;
-	VALUE_PAIR *head, **tail;
-
-	static const char *attrlist_names[] = {
-		"request", "reply", "proxy-request", "proxy-reply",
-		"config", "control",
-		"coa", "coa-reply", "disconnect", "disconnect-reply",
-		NULL
-	};
-
-	component = component;	/* -Wunused */
-
-	if (!cf_section_name2(cs)) {
-		cf_log_err(cf_sectiontoitem(cs),
-			   "Require list name for 'update'.\n");
-		return NULL;
-	}
-
-	vp_name = name2;
-	if (strncmp(vp_name, "outer.", 6) == 0) {
-		vp_name += 6;
-	} 
-
-	for (i = 0; attrlist_names[i] != NULL; i++) {
-		if (strcmp(vp_name, attrlist_names[i]) == 0) {
-			ok = TRUE;
-			break;
-		}
-	}
-
-	if (!ok) {
-		cf_log_err(cf_sectiontoitem(cs),
-			   "Unknown attribute list \"%s\"",
-			   name2);
-		return NULL;
-	}
-
-	head = NULL;
-	tail = &head;
+	value_pair_map_t *map, *head;
 
 	/*
-	 *	Walk through the children of the update section,
-	 *	ensuring that they're all known attributes.
+	 *	This looks at cs->name2 to determine which list to update
 	 */
-	for (ci=cf_item_find_next(cs, NULL);
-	     ci != NULL;
-	     ci=cf_item_find_next(cs, ci)) {
-		CONF_PAIR *cp;
-		VALUE_PAIR *vp;
+	rcode = radius_attrmap(cs, &head, PAIR_LIST_REQUEST, PAIR_LIST_REQUEST, 128);
+	if (rcode < 0) return NULL; /* message already printed */
 
-		if (cf_item_is_section(ci)) {
-			cf_log_err(ci, "\"update\" sections cannot have subsections");
-			return NULL;
-		}
+	if (!head) {
+		cf_log_err_cs(cs, "'update' sections cannot be empty");
+		return NULL;
+	}
 
-		if (!cf_item_is_pair(ci)) continue;
+	for (map = head; map != NULL; map = map->next) {
+		if ((map->dst->type == VPT_TYPE_ATTR) && (map->src->type == VPT_TYPE_LITERAL)) {
+			/*
+			 *	If LHS is an attribute, and RHS is a literal, we can
+			 *	check that the format is correct.
+			 */
+			VALUE_PAIR *vp;
+			bool ret;
 
-		cp = cf_itemtopair(ci);	/* can't return NULL */
-		vp = cf_pairtovp(cp);
-		if (!vp) {
-			pairfree(&head);
-			cf_log_err(ci, "ERROR: %s", fr_strerror());
-			return NULL;
-		}
+			MEM(vp = pairalloc(NULL, map->dst->da));
+			vp->op = map->op;
 
-		if ((vp->op != T_OP_EQ) &&
-		    (vp->op != T_OP_CMP_EQ) &&
-		    (vp->op != T_OP_ADD) &&
-		    (vp->op != T_OP_SUB) &&
-		    (vp->op != T_OP_LE) &&
-		    (vp->op != T_OP_GE) &&
-		    (vp->op != T_OP_CMP_FALSE) &&
-		    (vp->op != T_OP_SET)) {
-			pairfree(&head);
-			pairfree(&vp);
-			cf_log_err(ci, "Invalid operator for attribute");
-			return NULL;
-		}
-
-		/*
-		 *	A few more sanity checks.  The enforcement of
-		 *	<= or >= can only happen for integer
-		 *	attributes.
-		 */
-		if ((vp->op == T_OP_LE) ||
-		    (vp->op == T_OP_GE)) {
-			if ((vp->type != PW_TYPE_BYTE) &&
-			    (vp->type != PW_TYPE_SHORT) &&
-			    (vp->type != PW_TYPE_INTEGER) &&
-			    (vp->type != PW_TYPE_SIGNED) &&
-			    (vp->type != PW_TYPE_INTEGER64)) {
-				pairfree(&head);
-				pairfree(&vp);
-				cf_log_err(ci, "Enforcment of <= or >= is possible only for integer attributes");
+			ret = pairparsevalue(vp, map->src->name);
+			talloc_free(vp);
+			if (!ret) {
+				talloc_free(head);
+				cf_log_err(map->ci, "%s", fr_strerror());
 				return NULL;
 			}
 		}
-
-		*tail = vp;
-		tail = &(vp->next);
 	}
 
-	if (!head) {
-		cf_log_err(cf_sectiontoitem(cs),
-			   "ERROR: update %s section cannot be empty",
-			   name2);
-		return NULL;
-	}
-
-	g = rad_malloc(sizeof(*g)); /* never fails */
-	memset(g, 0, sizeof(*g));
+	g = talloc_zero(parent, modgroup);
 	csingle = mod_grouptocallable(g);
-	
+
 	csingle->parent = parent;
 	csingle->next = NULL;
-	csingle->name = name2;
+
+	if (name2) {
+		csingle->name = name2;
+	} else {
+		csingle->name = "";
+	}
 	csingle->type = MOD_UPDATE;
 	csingle->method = component;
-	
+
+	memcpy(csingle->actions, defaultactions[component][GROUPTYPE_SIMPLE],
+	       sizeof(csingle->actions));
+
 	g->grouptype = GROUPTYPE_SIMPLE;
 	g->children = NULL;
 	g->cs = cs;
-	g->vps = head;
+	g->map = talloc_steal(g, head);
 
 	return csingle;
 }
 
 
-static modcallable *do_compile_modswitch(modcallable *parent,
-					 int component, CONF_SECTION *cs)
+static modcallable *do_compile_modswitch(modcallable *parent, UNUSED rlm_components_t component, CONF_SECTION *cs)
 {
 	modcallable *csingle;
 	CONF_ITEM *ci;
-	int had_seen_default = FALSE;
-
-	component = component;	/* -Wunused */
+	int had_seen_default = false;
 
 	if (!cf_section_name2(cs)) {
-		cf_log_err(cf_sectiontoitem(cs),
-			   "You must specify a variable to switch over for 'switch'.");
+		cf_log_err_cs(cs,
+			   "You must specify a variable to switch over for 'switch'");
 		return NULL;
 	}
 
 	if (!cf_item_find_next(cs, NULL)) {
-		cf_log_err(cf_sectiontoitem(cs), "'switch' statements cannot be empty.");
+		cf_log_err_cs(cs, "'switch' statements cannot be empty");
 		return NULL;
 	}
 
@@ -1585,7 +1613,7 @@ static modcallable *do_compile_modswitch(modcallable *parent,
 	     ci != NULL;
 	     ci=cf_item_find_next(cs, ci)) {
 		CONF_SECTION *subcs;
-		const char *name1, *name2;
+		char const *name1, *name2;
 
 		if (!cf_item_is_section(ci)) {
 			if (!cf_item_is_pair(ci)) continue;
@@ -1604,7 +1632,7 @@ static modcallable *do_compile_modswitch(modcallable *parent,
 
 		name2 = cf_section_name2(subcs);
 		if (!name2 && !had_seen_default) {
-			had_seen_default = TRUE;
+			had_seen_default = true;
 			continue;
 		}
 
@@ -1614,29 +1642,26 @@ static modcallable *do_compile_modswitch(modcallable *parent,
 		}
 	}
 
-	csingle= do_compile_modgroup(parent, component, cs,
-				     GROUPTYPE_SIMPLE, GROUPTYPE_SIMPLE);
+	csingle = do_compile_modgroup(parent, component, cs, GROUPTYPE_SIMPLE, GROUPTYPE_SIMPLE);
 	if (!csingle) return NULL;
 	csingle->type = MOD_SWITCH;
 	return csingle;
 }
 
 static modcallable *do_compile_modforeach(modcallable *parent,
-					  int component, CONF_SECTION *cs,
-					  const char *name2)
+					  UNUSED rlm_components_t component, CONF_SECTION *cs,
+					  char const *name2)
 {
 	modcallable *csingle;
 
-	component = component;	/* -Wunused */
-
 	if (!cf_section_name2(cs)) {
-		cf_log_err(cf_sectiontoitem(cs),
-			   "You must specify an attribute to loop over in 'foreach'.");
+		cf_log_err_cs(cs,
+			   "You must specify an attribute to loop over in 'foreach'");
 		return NULL;
 	}
 
 	if (!cf_item_find_next(cs, NULL)) {
-		cf_log_err(cf_sectiontoitem(cs), "'foreach' blocks cannot be empty.");
+		cf_log_err_cs(cs, "'foreach' blocks cannot be empty");
 		return NULL;
 	}
 
@@ -1648,15 +1673,27 @@ static modcallable *do_compile_modforeach(modcallable *parent,
 	return csingle;
 }
 
-static modcallable *do_compile_modbreak(modcallable *parent, int component)
+static modcallable *do_compile_modbreak(modcallable *parent,
+					rlm_components_t component, CONF_ITEM const *ci)
 {
 	modcallable *csingle;
+	CONF_SECTION const *cs = NULL;
 
-	component = component;	/* -Wunused */
+	for (cs = cf_item_parent(ci);
+	     cs != NULL;
+	     cs = cf_item_parent(cf_sectiontoitem(cs))) {
+		if (strcmp(cf_section_name1(cs), "foreach") == 0) {
+			break;
+		}
+	}
 
+	if (!cs) {
+		cf_log_err(ci, "'break' can only be used in a 'foreach' section");
+		return NULL;
+	}
 
-	csingle= do_compile_modgroup(parent, component, NULL,
-				     GROUPTYPE_SIMPLE, GROUPTYPE_SIMPLE);
+	csingle = do_compile_modgroup(parent, component, NULL,
+				      GROUPTYPE_SIMPLE, GROUPTYPE_SIMPLE);
 	if (!csingle) return NULL;
 	csingle->name = "";
 	csingle->type = MOD_BREAK;
@@ -1665,10 +1702,10 @@ static modcallable *do_compile_modbreak(modcallable *parent, int component)
 #endif
 
 static modcallable *do_compile_modserver(modcallable *parent,
-					 int component, CONF_ITEM *ci,
-					 const char *name,
+					 rlm_components_t component, CONF_ITEM *ci,
+					 char const *name,
 					 CONF_SECTION *cs,
-					 const char *server)
+					 char const *server)
 {
 	modcallable *csingle;
 	CONF_SECTION *subcs;
@@ -1681,8 +1718,7 @@ static modcallable *do_compile_modserver(modcallable *parent,
 		return NULL;
 	}
 
-	mr = rad_malloc(sizeof(*mr));
-	memset(mr, 0, sizeof(*mr));
+	mr = talloc_zero(parent, modref);
 
 	csingle = mod_reftocallable(mr);
 	csingle->parent = parent;
@@ -1693,7 +1729,7 @@ static modcallable *do_compile_modserver(modcallable *parent,
 
 	memcpy(csingle->actions, defaultactions[component][GROUPTYPE_SIMPLE],
 	       sizeof(csingle->actions));
-	
+
 	mr->ref_name = strdup(server);
 	mr->ref_cs = cs;
 
@@ -1701,13 +1737,12 @@ static modcallable *do_compile_modserver(modcallable *parent,
 }
 
 static modcallable *do_compile_modxlat(modcallable *parent,
-				       int component, const char *fmt)
+				       rlm_components_t component, char const *fmt)
 {
 	modcallable *csingle;
 	modxlat *mx;
 
-	mx = rad_malloc(sizeof(*mx));
-	memset(mx, 0, sizeof(*mx));
+	mx = talloc_zero(parent, modxlat);
 
 	csingle = mod_xlattocallable(mx);
 	csingle->parent = parent;
@@ -1718,11 +1753,11 @@ static modcallable *do_compile_modxlat(modcallable *parent,
 
 	memcpy(csingle->actions, defaultactions[component][GROUPTYPE_SIMPLE],
 	       sizeof(csingle->actions));
-	
+
 	mx->xlat_name = strdup(fmt);
 	if (fmt[0] != '%') {
 		char *p;
-		mx->exec = TRUE;
+		mx->exec = true;
 
 		strcpy(mx->xlat_name, fmt + 1);
 		p = strrchr(mx->xlat_name, '`');
@@ -1735,7 +1770,7 @@ static modcallable *do_compile_modxlat(modcallable *parent,
 /*
  *	redundant, etc. can refer to modules or groups, but not much else.
  */
-static int all_children_are_modules(CONF_SECTION *cs, const char *name)
+static int all_children_are_modules(CONF_SECTION *cs, char const *name)
 {
 	CONF_ITEM *ci;
 
@@ -1751,7 +1786,7 @@ static int all_children_are_modules(CONF_SECTION *cs, const char *name)
 		 */
 		if (cf_item_is_section(ci)) {
 			CONF_SECTION *subcs = cf_itemtosection(ci);
-			const char *name1 = cf_section_name1(subcs);
+			char const *name1 = cf_section_name1(subcs);
 
 			if ((strcmp(name1, "if") == 0) ||
 			    (strcmp(name1, "else") == 0) ||
@@ -1784,26 +1819,23 @@ static int all_children_are_modules(CONF_SECTION *cs, const char *name)
  *	Compile one entry of a module call.
  */
 static modcallable *do_compile_modsingle(modcallable *parent,
-					 int component, CONF_ITEM *ci,
+					 rlm_components_t component, CONF_ITEM *ci,
 					 int grouptype,
-					 const char **modname)
+					 char const **modname)
 {
-#ifdef WITH_UNLANG
-	int result;
-#endif
-	const char *modrefname;
+	char const *modrefname;
 	modsingle *single;
 	modcallable *csingle;
 	module_instance_t *this;
 	CONF_SECTION *cs, *subcs, *modules;
 
 	if (cf_item_is_section(ci)) {
-		const char *name2;
+		char const *name2;
 
 		cs = cf_itemtosection(ci);
 		modrefname = cf_section_name1(cs);
 		name2 = cf_section_name2(cs);
-		if (!name2) name2 = "_UnNamedGroup";
+		if (!name2) name2 = "";
 
 		/*
 		 *	group{}, redundant{}, or append{} may appear
@@ -1864,8 +1896,10 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 
 #ifdef WITH_UNLANG
 		} else 	if (strcmp(modrefname, "if") == 0) {
+			modgroup *g;
+
 			if (!cf_section_name2(cs)) {
-				cf_log_err(ci, "'if' without condition.");
+				cf_log_err(ci, "'if' without condition");
 				return NULL;
 			}
 
@@ -1875,26 +1909,26 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 						     grouptype);
 			if (!csingle) return NULL;
 			csingle->type = MOD_IF;
-
-			if (!radius_evaluate_condition(NULL, 0, 0, modname,
-						       FALSE, &result)) {
-				modcallable_free(&csingle);
-				return NULL;
-			}
 			*modname = name2;
+
+			g = mod_callabletogroup(csingle);
+			g->cond = cf_data_find(g->cs, "if");
+			rad_assert(g->cond != NULL);
 
 			return csingle;
 
 		} else 	if (strcmp(modrefname, "elsif") == 0) {
+			modgroup *g;
+
 			if (parent &&
 			    ((parent->type == MOD_LOAD_BALANCE) ||
 			     (parent->type == MOD_REDUNDANT_LOAD_BALANCE))) {
-				cf_log_err(ci, "'elsif' cannot be used in this section section.");
+				cf_log_err(ci, "'elsif' cannot be used in this section");
 				return NULL;
 			}
 
 			if (!cf_section_name2(cs)) {
-				cf_log_err(ci, "'elsif' without condition.");
+				cf_log_err(ci, "'elsif' without condition");
 				return NULL;
 			}
 
@@ -1904,13 +1938,11 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 						     grouptype);
 			if (!csingle) return NULL;
 			csingle->type = MOD_ELSIF;
-
-			if (!radius_evaluate_condition(NULL, 0, 0, modname,
-						       FALSE, &result)) {
-				modcallable_free(&csingle);
-				return NULL;
-			}
 			*modname = name2;
+
+			g = mod_callabletogroup(csingle);
+			g->cond = cf_data_find(g->cs, "if");
+			rad_assert(g->cond != NULL);
 
 			return csingle;
 
@@ -1918,12 +1950,12 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 			if (parent &&
 			    ((parent->type == MOD_LOAD_BALANCE) ||
 			     (parent->type == MOD_REDUNDANT_LOAD_BALANCE))) {
-				cf_log_err(ci, "'else' cannot be used in this section section.");
+				cf_log_err(ci, "'else' cannot be used in this section section");
 				return NULL;
 			}
 
 			if (cf_section_name2(cs)) {
-				cf_log_err(ci, "Cannot have conditions on 'else'.");
+				cf_log_err(ci, "Cannot have conditions on 'else'");
 				return NULL;
 			}
 
@@ -1957,10 +1989,6 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 
 			*modname = name2;
 
-			/*
-			 *	FIXME: How to tell that the parent can only
-			 *	be a "switch" statement?
-			 */
 			if (!parent) {
 				cf_log_err(ci, "\"case\" statements may only appear within a \"switch\" section");
 				return NULL;
@@ -2033,7 +2061,7 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 		if (!subcs &&
 		    (cs = cf_section_find("policy")) != NULL) {
 			char buffer[256];
-			
+
 			snprintf(buffer, sizeof(buffer), "%s.%s",
 				 modrefname, comp2str[component]);
 
@@ -2062,8 +2090,8 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 		}
 
 		if (subcs) {
-			DEBUG2(" Module: Loading virtual module %s",
-			       modrefname);
+			cf_log_module(cs, "Loading virtual module %s",
+				      modrefname);
 
 			/*
 			 *	redundant foo {} is a single.
@@ -2089,7 +2117,7 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 
 #ifdef WITH_UNLANG
 	if (strcmp(modrefname, "break") == 0) {
-		return do_compile_modbreak(parent, component);
+		return do_compile_modbreak(parent, component, ci);
 	}
 #endif
 
@@ -2099,14 +2127,39 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 	modules = cf_section_find("modules");
 	this = NULL;
 
-	if (modules && cf_section_sub_find_name2(modules, NULL, modrefname)) {
-		this = find_module_instance(modules, modrefname, 1);
+	if (modules) {
+		/*
+		 *	Try to load the optional module.
+		 */
+		char const *realname = modrefname;
+		if (realname[0] == '-') realname++;
+
+		/*
+		 *	As of v3, only known modules are in the
+		 *	"modules" section.
+		 */
+		if (cf_section_sub_find_name2(modules, NULL, realname)) {
+			this = find_module_instance(modules, realname, 1);
+			if (!this && (realname != modrefname)) {
+				return NULL;
+			}
+
+		} else {
+			/*
+			 *	We were asked to MAYBE load it and it
+			 *	doesn't exist.  Return a soft error.
+			 */
+			if (realname != modrefname) {
+				*modname = modrefname;
+				return NULL;
+			}
+		}
 	}
 
 	if (!this) do {
 		int i;
 		char *p;
-	  
+
 		/*
 		 *	Maybe it's module.method
 		 */
@@ -2120,8 +2173,8 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 				strlcpy(buffer, modrefname, sizeof(buffer));
 				buffer[p - modrefname] = '\0';
 				component = i;
-				
-				this = find_module_instance(cf_section_find("modules"), buffer, 1);
+
+				this = find_module_instance(modules, buffer, 1);
 				if (this &&
 				    !this->entry->module->methods[i]) {
 					*modname = NULL;
@@ -2133,6 +2186,9 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 		}
 		if (this) break;
 
+		/*
+		 *	Call a server.  This should really be deleted...
+		 */
 		if (strncmp(modrefname, "server[", 7) == 0) {
 			char buffer[256];
 
@@ -2149,18 +2205,9 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 				cf_log_err(ci, "No such server \"%s\".", buffer);
 				return NULL;
 			}
-			
+
 			return do_compile_modserver(parent, component, ci,
 						    modrefname, cs, buffer);
-		}
-
-		/*
-		 *	We tried to load the module, but it doesn't exist.
-		 *	Give a silent error.
-		 */
-		if (modrefname[0] == '-') {
-			*modname = modrefname;
-			return NULL;
 		}
 
 		*modname = NULL;
@@ -2172,8 +2219,7 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 	 *	We know it's all OK, allocate the structures, and fill
 	 *	them in.
 	 */
-	single = rad_malloc(sizeof(*single));
-	memset(single, 0, sizeof(*single));
+	single = talloc_zero(parent, modsingle);
 	csingle = mod_singletocallable(single);
 	csingle->parent = parent;
 	csingle->next = NULL;
@@ -2197,7 +2243,7 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 	 */
 	if (cf_item_is_section(ci)) {
 		CONF_ITEM *csi;
-		
+
 		cs = cf_itemtosection(ci);
 		for (csi=cf_item_find_next(cs, NULL);
 		     csi != NULL;
@@ -2205,14 +2251,14 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 
 			if (cf_item_is_section(csi)) {
 				cf_log_err(csi, "Subsection of module instance call not allowed");
-				modcallable_free(&csingle);
+				talloc_free(csingle);
 				return NULL;
 			}
 
 			if (!cf_item_is_pair(csi)) continue;
 
 			if (!compile_action(csingle, cf_itemtopair(csi))) {
-				modcallable_free(&csingle);
+				talloc_free(csingle);
 				return NULL;
 			}
 		}
@@ -2225,7 +2271,7 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 	if (!this->entry->module->methods[component]) {
 		cf_log_err(ci, "\"%s\" modules aren't allowed in '%s' sections -- they have no such method.", this->entry->module->name,
 		       comp2str[component]);
-		modcallable_free(&csingle);
+		talloc_free(csingle);
 		return NULL;
 	}
 
@@ -2235,8 +2281,8 @@ static modcallable *do_compile_modsingle(modcallable *parent,
 }
 
 modcallable *compile_modsingle(modcallable *parent,
-			       int component, CONF_ITEM *ci,
-			       const char **modname)
+			       rlm_components_t component, CONF_ITEM *ci,
+			       char const **modname)
 {
 	modcallable *ret = do_compile_modsingle(parent, component, ci,
 						GROUPTYPE_SIMPLE,
@@ -2250,7 +2296,7 @@ modcallable *compile_modsingle(modcallable *parent,
  *	Internal compile group code.
  */
 static modcallable *do_compile_modgroup(modcallable *parent,
-					int component, CONF_SECTION *cs,
+					rlm_components_t component, CONF_SECTION *cs,
 					int grouptype, int parentgrouptype)
 {
 	int i;
@@ -2258,10 +2304,10 @@ static modcallable *do_compile_modgroup(modcallable *parent,
 	modcallable *c;
 	CONF_ITEM *ci;
 
-	g = rad_malloc(sizeof(*g));
-	memset(g, 0, sizeof(*g));
+	g = talloc_zero(parent, modgroup);
 	g->grouptype = grouptype;
 	g->children = NULL;
+	g->cs = cs;
 
 	c = mod_grouptocallable(g);
 	c->parent = parent;
@@ -2302,7 +2348,7 @@ static modcallable *do_compile_modgroup(modcallable *parent,
 		 *	to modules with updated return codes.
 		 */
 		if (cf_item_is_section(ci)) {
-			const char *junk = NULL;
+			char const *junk = NULL;
 			modcallable *single;
 			CONF_SECTION *subcs = cf_itemtosection(ci);
 
@@ -2311,7 +2357,7 @@ static modcallable *do_compile_modgroup(modcallable *parent,
 			if (!single) {
 				cf_log_err(ci, "Failed to parse \"%s\" subsection.",
 				       cf_section_name1(subcs));
-				modcallable_free(&c);
+				talloc_free(c);
 				return NULL;
 			}
 			add_child(g, single);
@@ -2320,7 +2366,7 @@ static modcallable *do_compile_modgroup(modcallable *parent,
 			continue;
 
 		} else {
-			const char *attr, *value;
+			char const *attr, *value;
 			CONF_PAIR *cp = cf_itemtopair(ci);
 
 			attr = cf_pair_attr(cp);
@@ -2333,7 +2379,7 @@ static modcallable *do_compile_modgroup(modcallable *parent,
 			 */
 			if (!value) {
 				modcallable *single;
-				const char *junk = NULL;
+				char const *junk = NULL;
 
 				single = do_compile_modsingle(c,
 							      component,
@@ -2341,10 +2387,15 @@ static modcallable *do_compile_modgroup(modcallable *parent,
 							      grouptype,
 							      &junk);
 				if (!single) {
+					if (cf_item_is_pair(ci) &&
+					    cf_pair_attr(cf_itemtopair(ci))[0] == '-') {
+						continue;
+					}
+
 					cf_log_err(ci,
 						   "Failed to parse \"%s\" entry.",
 						   attr);
-					modcallable_free(&c);
+					talloc_free(c);
 					return NULL;
 				}
 				add_child(g, single);
@@ -2353,7 +2404,7 @@ static modcallable *do_compile_modgroup(modcallable *parent,
 				 *	Or a module instance with action.
 				 */
 			} else if (!compile_action(c, cp)) {
-				modcallable_free(&c);
+				talloc_free(c);
 				return NULL;
 			} /* else it worked */
 		}
@@ -2381,7 +2432,7 @@ set_codes:
 }
 
 modcallable *compile_modgroup(modcallable *parent,
-			      int component, CONF_SECTION *cs)
+			      rlm_components_t component, CONF_SECTION *cs)
 {
 	modcallable *ret = do_compile_modgroup(parent, component, cs,
 					       GROUPTYPE_SIMPLE,
@@ -2390,8 +2441,8 @@ modcallable *compile_modgroup(modcallable *parent,
 	return ret;
 }
 
-void add_to_modcallable(modcallable **parent, modcallable *this,
-			int component, const char *name)
+void add_to_modcallable(TALLOC_CTX *ctx, modcallable **parent, modcallable *this,
+			rlm_components_t component, char const *name)
 {
 	modgroup *g;
 
@@ -2400,8 +2451,7 @@ void add_to_modcallable(modcallable **parent, modcallable *this,
 	if (*parent == NULL) {
 		modcallable *c;
 
-		g = rad_malloc(sizeof *g);
-		memset(g, 0, sizeof(*g));
+		g = talloc_zero(ctx, modgroup);
 		g->grouptype = GROUPTYPE_SIMPLE;
 		c = mod_grouptocallable(g);
 		c->next = NULL;
@@ -2422,21 +2472,180 @@ void add_to_modcallable(modcallable **parent, modcallable *this,
 	add_child(g, this);
 }
 
-void modcallable_free(modcallable **pc)
-{
-	modcallable *c, *loop, *next;
-	c = *pc;
-	if (c->type != MOD_SINGLE) {
-		modgroup *g = mod_callabletogroup(c);
 
-		for(loop = g->children;
-		    loop ;
-		    loop = next) {
-			next = loop->next;
-			modcallable_free(&loop);
+#ifdef WITH_UNLANG
+static bool pass2_callback(UNUSED void *ctx, fr_cond_t *c)
+{
+	value_pair_map_t *map;
+
+	/*
+	 *	Maps have a paircompare fixup applied to them.
+	 *	Others get ignored.
+	 */
+	if (c->pass2_fixup == PASS2_FIXUP_NONE) {
+		if (c->type == COND_TYPE_MAP) {
+			map = c->data.map;
+			goto check_paircmp;
 		}
-		pairfree(&g->vps);
+		return true;
 	}
-	free(c);
-	*pc = NULL;
+
+	map = c->data.map;	/* shorter */
+
+	/*
+	 *	Auth-Type := foo
+	 *
+	 *	Where "foo" is dynamically defined.
+	 */
+	if (c->pass2_fixup == PASS2_FIXUP_TYPE) {
+		if (!dict_valbyname(map->dst->da->attr,
+				    map->dst->da->vendor,
+				    map->src->name)) {
+			cf_log_err(map->ci, "Invalid reference to non-existent %s %s { ... }",
+				   map->dst->da->name,
+				   map->src->name);
+			return false;
+		}
+
+		/*
+		 *	These guys can't have a paircompare fixup applied.
+		 */
+		c->pass2_fixup = PASS2_FIXUP_NONE;
+		return true;
+	}
+
+	if (c->pass2_fixup == PASS2_FIXUP_ATTR) {
+		value_pair_map_t *old;
+		value_pair_tmpl_t vpt;
+
+		/*
+		 *	It's still not an attribute.  Ignore it.
+		 */
+		if (radius_parse_attr(map->dst->name, &vpt, REQUEST_CURRENT, PAIR_LIST_REQUEST) < 0) {
+			c->pass2_fixup = PASS2_FIXUP_NONE;
+			return true;
+		}
+
+		/*
+		 *	Re-parse the LHS as an attribute.
+		 */
+		old = c->data.map;
+		map = radius_str2map(c, old->dst->name, T_BARE_WORD, old->op,
+				     old->src->name, T_BARE_WORD,
+				     REQUEST_CURRENT, PAIR_LIST_REQUEST,
+				     REQUEST_CURRENT, PAIR_LIST_REQUEST);
+		if (!map) {
+			cf_log_err(map->ci, "Failed parsing condition");
+			return false;
+		}
+		map->ci = old->ci;
+		talloc_free(old);
+		c->data.map = map;
+		c->pass2_fixup = PASS2_FIXUP_NONE;
+	}
+
+check_paircmp:
+	/*
+	 *	Just in case someone adds a new fixup later.
+	 */
+	rad_assert(c->pass2_fixup == PASS2_FIXUP_NONE);
+
+	/*
+	 *	Only attributes can have a paircompare registered, and
+	 *	they can only be with the current REQUEST, and only
+	 *	with the request pairs.
+	 */
+	if ((map->dst->type != VPT_TYPE_ATTR) ||
+	    (map->dst->request != REQUEST_CURRENT) ||
+	    (map->dst->list != PAIR_LIST_REQUEST)) {
+		return true;
+	}
+
+	if (!radius_find_compare(map->dst->da)) return true;
+
+	if (map->src->type == VPT_TYPE_ATTR) {
+		cf_log_err(map->ci, "Cannot compare virtual attribute %s to another attribute",
+			   map->dst->name);
+		return false;
+	}
+
+	if (map->src->type == VPT_TYPE_REGEX) {
+		cf_log_err(map->ci, "Cannot compare virtual attribute %s via a regex",
+			   map->dst->name);
+		return false;
+	}
+
+	if (c->cast) {
+		cf_log_err(map->ci, "Cannot cast virtual attribute %s",
+			   map->dst->name);
+		return false;
+	}
+
+	if (map->op != T_OP_CMP_EQ) {
+		cf_log_err(map->ci, "Must use '==' for comparisons with virtual attribute %s",
+			   map->dst->name);
+		return false;
+	}
+
+	/*
+	 *	Mark it as requiring a paircompare() call, instead of
+	 *	paircmp().
+	 */
+	c->pass2_fixup = PASS2_PAIRCOMPARE;
+
+	return true;
+}
+#endif
+
+/*
+ *	Do a second-stage pass on compiling the modules.
+ */
+bool modcall_pass2(modcallable *mc)
+{
+	modcallable *this;
+	modgroup *g;
+
+	for (this = mc; this != NULL; this = this->next) {
+		switch (this->type) {
+		default:
+			rad_assert(0 == 1);
+			break;
+
+		case MOD_SINGLE:
+#ifdef WITH_UNLANG
+		case MOD_UPDATE: /* @todo: pre-parse xlat's */
+		case MOD_XLAT:   /* @todo: pre-parse xlat's */
+		case MOD_BREAK:
+		case MOD_REFERENCE:
+#endif
+			break;	/* do nothing */
+
+#ifdef WITH_UNLANG
+		case MOD_IF:
+		case MOD_ELSIF:
+			g = mod_callabletogroup(this);
+			if (!fr_condition_walk(g->cond, pass2_callback, NULL)) {
+				return false;
+			}
+			/* FALL-THROUGH */
+#endif
+
+		case MOD_GROUP:
+		case MOD_LOAD_BALANCE:
+		case MOD_REDUNDANT_LOAD_BALANCE:
+
+#ifdef WITH_UNLANG
+		case MOD_ELSE:
+		case MOD_SWITCH:
+		case MOD_CASE:
+		case MOD_FOREACH:
+		case MOD_POLICY:
+#endif
+			g = mod_callabletogroup(this);
+			if (!modcall_pass2(g->children)) return false;
+			break;
+		}
+	}
+
+	return true;
 }

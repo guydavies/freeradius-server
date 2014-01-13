@@ -21,41 +21,40 @@
  * Copyright 2007  Alan DeKok <aland@deployingradius.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
+#include <freeradius-devel/parser.h>
 #include <freeradius-devel/rad_assert.h>
 
 #include <ctype.h>
 
-#ifdef HAVE_PCREPOSIX_H
-#include <pcreposix.h>
-#else
-#ifdef HAVE_REGEX_H
-#include <regex.h>
-
-/*
- *  For POSIX Regular expressions.
- *  (0) Means no extended regular expressions.
- *  REG_EXTENDED means use extended regular expressions.
- */
-#ifndef REG_EXTENDED
-#define REG_EXTENDED (0)
-#endif
-
-#ifndef REG_NOSUB
-#define REG_NOSUB (0)
-#endif
-#endif
-#endif
-
 #ifdef WITH_UNLANG
 
-static int all_digits(const char *string)
+#ifdef WITH_EVAL_DEBUG
+#define EVAL_DEBUG(fmt, ...) printf("EVAL: ");printf(fmt, ## __VA_ARGS__);printf("\n");fflush(stdout)
+#else
+#define EVAL_DEBUG(...)
+#endif
+
+static const FR_NAME_NUMBER modreturn_table[] = {
+	{ "reject",     RLM_MODULE_REJECT       },
+	{ "fail",       RLM_MODULE_FAIL	 	},
+	{ "ok",		RLM_MODULE_OK	   	},
+	{ "handled",    RLM_MODULE_HANDLED      },
+	{ "invalid",    RLM_MODULE_INVALID      },
+	{ "userlock",   RLM_MODULE_USERLOCK     },
+	{ "notfound",   RLM_MODULE_NOTFOUND     },
+	{ "noop",       RLM_MODULE_NOOP	 	},
+	{ "updated",    RLM_MODULE_UPDATED      },
+	{ NULL, 0 }
+};
+
+
+static int all_digits(char const *string)
 {
-	const char *p = string;
+	char const *p = string;
 
 	if (*p == '-') p++;
 
@@ -64,723 +63,600 @@ static int all_digits(const char *string)
 	return (*p == '\0');
 }
 
-static const char *filler = "????????????????????????????????????????????????????????????????";
-
-static const char *expand_string(char *buffer, size_t sizeof_buffer,
-				 REQUEST *request,
-				 FR_TOKEN value_type, const char *value)
+/** Expand the RHS of a template
+ *
+ * @note Length of expanded string can be found with talloc_array_length(*out) - 1
+ *
+ * @param out where to write a pointer to the newly allocated buffer.
+ * @param request Current request.
+ * @param vpt to evaluate.
+ * @return -1 on error, else 0.
+ */
+static int radius_expand_tmpl(char **out, REQUEST *request, value_pair_tmpl_t const *vpt)
 {
-	int result;
-	char *p;
+	VALUE_PAIR *vp;
+	*out = NULL;
 
-	switch (value_type) {
+	rad_assert(vpt->type != VPT_TYPE_LIST);
+
+	switch (vpt->type) {
+	case VPT_TYPE_LITERAL:
+		EVAL_DEBUG("TMPL LITERAL");
+		*out = talloc_strdup(request, vpt->name);
+		break;
+
+	case VPT_TYPE_EXEC:
+		EVAL_DEBUG("TMPL EXEC");
+		*out = talloc_array(request, char, 1024);
+		if (radius_exec_program(request, vpt->name, true, false, *out, 1024, EXEC_TIMEOUT, NULL, NULL) != 0) {
+			TALLOC_FREE(*out);
+			return -1;
+		}
+		break;
+
+	case VPT_TYPE_REGEX:
+		EVAL_DEBUG("TMPL REGEX");
+		if (strchr(vpt->name, '%') == NULL) {
+			*out = talloc_strdup(request, vpt->name);
+			break;
+		}
+		/* FALL-THROUGH */
+
+	case VPT_TYPE_XLAT:
+		EVAL_DEBUG("TMPL XLAT");
+		/* Error in expansion, this is distinct from zero length expansion */
+		if (radius_axlat(out, request, vpt->name, NULL, NULL) < 0) {
+			rad_assert(!*out);
+			return -1;
+		}
+		break;
+
+	case VPT_TYPE_ATTR:
+		EVAL_DEBUG("TMPL ATTR");
+		if (radius_vpt_get_vp(&vp, request, vpt) < 0) {
+			return -2;
+		}
+		*out = vp_aprint(request, vp);
+		if (!*out) {
+			return -1;
+		}
+		break;
+
+	case VPT_TYPE_DATA:
+		rad_assert(0 == 1);
+		/* FALL-THROUGH */
+
 	default:
-	case T_BARE_WORD:
-	case T_SINGLE_QUOTED_STRING:
-		return value;
-
-	case T_BACK_QUOTED_STRING:
-		result = radius_exec_program(value, request, 1,
-					     buffer, sizeof_buffer, NULL,
-					     NULL, 0);
-		if (result != 0) {
-			return NULL;
-		}
-
-		/*
-		 *	The result should be ASCII.
-		 */
-		for (p = buffer; *p != '\0'; p++) {
-			if (*p < ' ' ) {
-				*p = '\0';
-				return buffer;
-			}
-		}
-		return buffer;
-
-	case T_DOUBLE_QUOTED_STRING:
-		if (!strchr(value, '%')) return value;
-
-		radius_xlat(buffer, sizeof_buffer, value, request, NULL, NULL);
-		return buffer;
+		break;
 	}
 
-	return NULL;
+	EVAL_DEBUG("Expand tmpl --> %s", *out);
+	return 0;
 }
 
-#ifdef HAVE_REGEX_H
-static FR_TOKEN getregex(const char **ptr, char *buffer, size_t buflen,
-			 int *pcflags)
+/** Evaluate a template
+ *
+ * @param[in] request the REQUEST
+ * @param[in] modreturn the previous module return code
+ * @param[in] depth of the recursion (only used for debugging)
+ * @param[in] vpt the template to evaluate
+ * @return -1 on error, 0 for "no match", 1 for "match".
+ */
+int radius_evaluate_tmpl(REQUEST *request, int modreturn, UNUSED int depth,
+			 value_pair_tmpl_t const *vpt)
 {
-	const char *p = *ptr;
-	char *q = buffer;
+	int rcode;
+	int modcode;
+	char *buffer;
 
-	if (*p != '/') return T_OP_INVALID;
-
-	*pcflags = REG_EXTENDED;
-
-	p++;
-	while (*p) {
-		if (buflen <= 1) break;
-
-		if (*p == '/') {
-			p++;
-
-			/*
-			 *	Check for case insensitivity
-			 */
-			if (*p == 'i') {
-				p++;
-				*pcflags |= REG_ICASE;
-			}
-
+	switch (vpt->type) {
+	case VPT_TYPE_LITERAL:
+		modcode = fr_str2int(modreturn_table, vpt->name, RLM_MODULE_UNKNOWN);
+		if (modcode != RLM_MODULE_UNKNOWN) {
+			rcode = (modcode == modreturn);
 			break;
 		}
 
-		if (*p == '\\') {
-			int x;
-			
-			switch (p[1]) {
-			case 'r':
-				*q++ = '\r';
-				break;
-			case 'n':
-				*q++ = '\n';
-				break;
-			case 't':
-				*q++ = '\t';
-				break;
-			case '"':
-				*q++ = '"';
-				break;
-			case '\'':
-				*q++ = '\'';
-				break;
-			case '`':
-				*q++ = '`';
-				break;
-				
-				/*
-				 *	FIXME: add 'x' and 'u'
-				 */
+		/*
+		 *	Else it's a literal string.  Empty string is
+		 *	false, non-empty string is true.
+		 *
+		 *	@todo: Maybe also check for digits?
+		 *
+		 *	The VPT *doesn't* have a "bare word" type,
+		 *	which arguably it should.
+		 */
+		rcode = (vpt->name != '\0');
+		break;
 
-			default:
-				if ((p[1] >= '0') && (p[1] <= '9') &&
-				    (sscanf(p + 1, "%3o", &x) == 1)) {
-					*q++ = x;
-					p += 2;
-				} else {
-					*q++ = p[1];
-				}
-				break;
-			}
-			p += 2;
-			buflen--;
-			continue;
+	case VPT_TYPE_ATTR:
+	case VPT_TYPE_LIST:
+		if (radius_vpt_get_vp(NULL, request, vpt) == 0) {
+			rcode = true;
+		} else {
+			rcode = false;
 		}
+		break;
 
-		*(q++) = *(p++);
-		buflen--;
+		/*
+		 *	FIXME: expand the strings
+		 *	if not empty, return!
+		 */
+	case VPT_TYPE_XLAT:
+	case VPT_TYPE_EXEC:
+		if (!*vpt->name) return false;
+		rcode = radius_expand_tmpl(&buffer, request, vpt);
+		if (rcode < 0) {
+			EVAL_DEBUG("FAIL %d", __LINE__);
+			return -1;
+		}
+		rcode = (buffer && (*buffer != '\0'));
+		talloc_free(buffer);
+		break;
+
+		/*
+		 *	Can't have a bare ... (/foo/) ...
+		 */
+	case VPT_TYPE_REGEX:
+		EVAL_DEBUG("FAIL %d", __LINE__);
+		rad_assert(0 == 1);
+		/* FALL-THROUGH */
+
+	default:
+		rcode = -1;
+		break;
 	}
-	*q = '\0';
-	*ptr = p;
 
-	return T_DOUBLE_QUOTED_STRING;
+	return rcode;
 }
-#endif
 
-static const FR_NAME_NUMBER modreturn_table[] = {
-	{ "reject",     RLM_MODULE_REJECT       },
-	{ "fail",       RLM_MODULE_FAIL         },
-	{ "ok",         RLM_MODULE_OK           },
-	{ "handled",    RLM_MODULE_HANDLED      },
-	{ "invalid",    RLM_MODULE_INVALID      },
-	{ "userlock",   RLM_MODULE_USERLOCK     },
-	{ "notfound",   RLM_MODULE_NOTFOUND     },
-	{ "noop",       RLM_MODULE_NOOP         },
-	{ "updated",    RLM_MODULE_UPDATED      },
-	{ NULL, 0 }
-};
 
+static int do_regex(REQUEST *request, char const *lhs, char const *rhs, bool iflag)
+{
+	int compare;
+	int cflags = REG_EXTENDED;
+	regex_t reg;
+	regmatch_t rxmatch[REQUEST_MAX_REGEX + 1];
+
+	if (iflag) cflags |= REG_ICASE;
+
+	/*
+	 *	Include substring matches.
+	 */
+	compare = regcomp(&reg, rhs, cflags);
+	if (compare != 0) {
+		if (debug_flag) {
+			char errbuf[128];
+
+			regerror(compare, &reg, errbuf, sizeof(errbuf));
+			EDEBUG("Failed compiling regular expression: %s", errbuf);
+		}
+		EVAL_DEBUG("FAIL %d", __LINE__);
+		return -1;
+	}
+
+	memset(&rxmatch, 0, sizeof(rxmatch));	/* regexec does not seem to initialise unused elements */
+	compare = regexec(&reg, lhs, REQUEST_MAX_REGEX + 1, rxmatch, 0);
+	regfree(&reg);
+	rad_regcapture(request, compare, lhs, rxmatch);
+
+	return (compare == 0);
+}
 
 /*
- *	*presult is "did comparison match or not"
+ *	Expand a template to a string, parse it as type of "cast", and
+ *	create a VP from the data.
  */
-static int radius_do_cmp(REQUEST *request, int *presult,
-			 FR_TOKEN lt, const char *pleft, FR_TOKEN token,
-			 FR_TOKEN rt, const char *pright,
-			 int cflags, int modreturn)
+static int get_cast_vp(VALUE_PAIR **out, REQUEST *request, value_pair_tmpl_t const *vpt, DICT_ATTR const *cast)
 {
-	int result;
-	uint32_t lint, rint;
-	VALUE_PAIR *vp = NULL;
-#ifdef HAVE_REGEX_H
-	char buffer[8192];
-#else
-	cflags = cflags;	/* -Wunused */
-#endif
+	int rcode;
+	VALUE_PAIR *vp;
+	char *str;
 
-	rt = rt;		/* -Wunused */
+	*out = NULL;
 
-	if (lt == T_BARE_WORD) {
-		/*
-		 *	Maybe check the last return code.
-		 */
-		if (token == T_OP_CMP_TRUE) {
-			int isreturn;
-
-			/*
-			 *	Looks like a return code, treat is as such.
-			 */
-			isreturn = fr_str2int(modreturn_table, pleft, -1);
-			if (isreturn != -1) {
-				*presult = (modreturn == isreturn);
-				return TRUE;
-			}
-		}
-
-		/*
-		 *	Bare words on the left can be attribute names.
-		 */
-		if (!(radius_get_vp(request, pleft, &vp) < 0)) {
-			VALUE_PAIR myvp;
-
-			/*
-			 *	VP exists, and that's all we're looking for.
-			 */
-			if (token == T_OP_CMP_TRUE) {
-				*presult = (vp != NULL);
-				return TRUE;
-			}
-
-			if (!vp) {
-				DICT_ATTR *da;
-				
-				/*
-				 *	The attribute on the LHS may
-				 *	have been a dynamically
-				 *	registered callback.  i.e. it
-				 *	doesn't exist as a VALUE_PAIR.
-				 *	If so, try looking for it.
-				 */
-				da = dict_attrbyname(pleft);
-				if (da && (da->vendor == 0) && radius_find_compare(da->attr)) {
-					VALUE_PAIR *check = pairmake(pleft, pright, token);
-					*presult = (radius_callback_compare(request, NULL, check, NULL, NULL) == 0);
-					RDEBUG3("  Callback returns %d",
-						*presult);
-					pairfree(&check);
-					return TRUE;
-				}
-				
-				RDEBUG2("    (Attribute %s was not found)",
-				       pleft);
-				*presult = 0;
-				return TRUE;
-			}
-
-#ifdef HAVE_REGEX_H
-			/*
-			 * 	Regex comparisons treat everything as
-			 *	strings.
-			 */
-			if ((token == T_OP_REG_EQ) ||
-			    (token == T_OP_REG_NE)) {
-				vp_prints_value(buffer, sizeof(buffer), vp, 0);
-				pleft = buffer;
-				goto do_checks;
-			}
-#endif
-
-			memcpy(&myvp, vp, sizeof(myvp));
-			if (!pairparsevalue(&myvp, pright)) {
-				RDEBUG2("Failed parsing \"%s\": %s",
-				       pright, fr_strerror());
-				return FALSE;
-			}
-
-			myvp.op = token;
-			*presult = paircmp(&myvp, vp);
-			RDEBUG3("  paircmp -> %d", *presult);
-			return TRUE;
-		} /* else it's not a VP in a list */
+	vp = pairalloc(request, cast);
+	if (!vp) {
+		return -1;
 	}
 
-#ifdef HAVE_REGEX_H
-	do_checks:
-#endif
-	switch (token) {
-	case T_OP_GE:
-	case T_OP_GT:
-	case T_OP_LE:
-	case T_OP_LT:
-		if (!all_digits(pright)) {
-			RDEBUG2("    (Right field is not a number at: %s)", pright);
-			return FALSE;
-		}
-		rint = strtoul(pright, NULL, 0);
-		if (!all_digits(pleft)) {
-			RDEBUG2("    (Left field is not a number at: %s)", pleft);
-			return FALSE;
-		}
-		lint = strtoul(pleft, NULL, 0);
-		break;
-		
-	default:
-		lint = rint = 0;  /* quiet the compiler */
-		break;
+	if (vpt->type == VPT_TYPE_DATA) {
+		rad_assert(vp->da->type == vpt->da->type);
+		memcpy(&vp->data, vpt->vpd, sizeof(vp->data));
+		vp->length = vpt->length;
+		goto finish;
 	}
-	
-	switch (token) {
-	case T_OP_CMP_TRUE:
-		/*
-		 *	Check for truth or falsehood.
-		 */
-		if (all_digits(pleft)) {
-			lint = strtoul(pleft, NULL, 0);
-			result = (lint != 0);
-			
-		} else {
-			result = (*pleft != '\0');
-		}
-		break;
-		
 
-	case T_OP_CMP_EQ:
-		result = (strcmp(pleft, pright) == 0);
-		break;
-		
-	case T_OP_NE:
-		result = (strcmp(pleft, pright) != 0);
-		break;
-		
-	case T_OP_GE:
-		result = (lint >= rint);
-		break;
-		
-	case T_OP_GT:
-		result = (lint > rint);
-		break;
-		
-	case T_OP_LE:
-		result = (lint <= rint);
-		break;
-		
-	case T_OP_LT:
-		result = (lint < rint);
-		break;
-
-#ifdef HAVE_REGEX_H
-	case T_OP_REG_EQ: {
-		int i, compare;
-		regex_t reg;
-		regmatch_t rxmatch[REQUEST_MAX_REGEX + 1];
-		
-		/*
-		 *	Include substring matches.
-		 */
-		compare = regcomp(&reg, pright, cflags);
-		if (compare != 0) {
-			if (debug_flag) {
-				char errbuf[128];
-
-				regerror(compare, &reg, errbuf, sizeof(errbuf));
-				DEBUG("ERROR: Failed compiling regular expression: %s", errbuf);
-			}
-			return FALSE;
-		}
-
-		compare = regexec(&reg, pleft,
-				  REQUEST_MAX_REGEX + 1,
-				  rxmatch, 0);
-		regfree(&reg);
-		
-		/*
-		 *	Add new %{0}, %{1}, etc.
-		 */
-		if (compare == 0) for (i = 0; i <= REQUEST_MAX_REGEX; i++) {
-			char *r;
-
-			free(request_data_get(request, request,
-					      REQUEST_DATA_REGEX | i));
-
-			/*
-			 *	No %{i}, skip it.
-			 *	We MAY have %{2} without %{1}.
-			 */
-			if (rxmatch[i].rm_so == -1) continue;
-			
-			/*
-			 *	Copy substring into allocated buffer
-			 */
-			r = rad_malloc(rxmatch[i].rm_eo -rxmatch[i].rm_so + 1);
-			memcpy(r, pleft + rxmatch[i].rm_so,
-			       rxmatch[i].rm_eo - rxmatch[i].rm_so);
-			r[rxmatch[i].rm_eo - rxmatch[i].rm_so] = '\0';
-
-			request_data_add(request, request,
-					 REQUEST_DATA_REGEX | i,
-					 r, free);
-		}
-		result = (compare == 0);
+	rcode = radius_expand_tmpl(&str, request, vpt);
+	if (rcode < 0) {
+		pairfree(&vp);
+		return rcode;
 	}
-		break;
-		
-	case T_OP_REG_NE: {
-		int compare;
-		regex_t reg;
-		regmatch_t rxmatch[REQUEST_MAX_REGEX + 1];
-		
-		/*
-		 *	Include substring matches.
-		 */
-		compare = regcomp(&reg, pright, cflags);
-		if (compare != 0) {
-			if (debug_flag) {
-				char errbuf[128];
 
-				regerror(compare, &reg, errbuf, sizeof(errbuf));
-				DEBUG("ERROR: Failed compiling regular expression: %s", errbuf);
-			}
-			return FALSE;
-		}
+	if (!pairparsevalue(vp, str)) {
+		talloc_free(str);
+		pairfree(&vp);
+		return -1;
+	}
 
-		compare = regexec(&reg, pleft,
-				  REQUEST_MAX_REGEX + 1,
-				  rxmatch, 0);
-		regfree(&reg);
-		
-		result = (compare != 0);
-	}
-		break;
-#endif
-		
-	default:
-		DEBUG("ERROR: Comparison operator %s is not supported",
-		      fr_token_name(token));
-		result = FALSE;
-		break;
-	}
-	
-	*presult = result;
-	return TRUE;
+	finish:
+	*out = vp;
+	return 0;
 }
 
-
-int radius_evaluate_condition(REQUEST *request, int modreturn, int depth,
-			      const char **ptr, int evaluate_it, int *presult)
+/** Evaluate a map
+ *
+ * @param[in] request the REQUEST
+ * @param[in] modreturn the previous module return code
+ * @param[in] depth of the recursion (only used for debugging)
+ * @param[in] c the condition to evaluate
+ * @return -1 on error, 0 for "no match", 1 for "match".
+ */
+int radius_evaluate_map(REQUEST *request, UNUSED int modreturn, UNUSED int depth,
+			fr_cond_t const *c)
 {
-	int found_condition = FALSE;
-	int result = TRUE;
-	int invert = FALSE;
-	int evaluate_next_condition = evaluate_it;
-	const char *p;
-	const char *q, *start;
-	FR_TOKEN token, lt, rt;
-	char left[1024], right[1024], comp[4];
-	const char *pleft, *pright;
-	char  xleft[1024], xright[1024];
-	int cflags = 0;
-	
-	if (!ptr || !*ptr || (depth >= 64)) {
-		radlog(L_ERR, "Internal sanity check failed in evaluate condition");
-		return FALSE;
+	int rcode;
+	char *lhs, *rhs;
+	value_pair_map_t *map;
+
+	rad_assert(c->type == COND_TYPE_MAP);
+	map = c->data.map;
+
+	rad_assert(map->dst->type != VPT_TYPE_UNKNOWN);
+	rad_assert(map->src->type != VPT_TYPE_UNKNOWN);
+	rad_assert(map->dst->type != VPT_TYPE_LIST);
+	rad_assert(map->src->type != VPT_TYPE_LIST);
+	rad_assert(map->dst->type != VPT_TYPE_REGEX);
+
+	/*
+	 *	Verify regexes.
+	 */
+	if (map->src->type == VPT_TYPE_REGEX) {
+		rad_assert(map->op == T_OP_REG_EQ);
+	} else {
+		rad_assert(!((map->op == T_OP_REG_EQ) || (map->op == T_OP_REG_NE)));
 	}
 
 	/*
-	 *	Horrible parser.
+	 *	They're both attributes.  Do attribute-specific work.
+	 *
+	 *	LHS is DST.  RHS is SRC <sigh>
 	 */
-	p =  *ptr;
-	while (*p) {
-		while ((*p == ' ') || (*p == '\t')) p++;
+	if (!c->cast && (map->src->type == VPT_TYPE_ATTR) && (map->dst->type == VPT_TYPE_ATTR)) {
+		VALUE_PAIR *lhs_vp, *rhs_vp;
 
-		/*
-		 *	! EXPR
-		 */
-		if (!found_condition && (*p == '!')) {
-			/*
-			 *	Don't change the results if we're not
-			 *	evaluating the condition.
-			 */
-			if (evaluate_next_condition) {
-				RDEBUG4(">>> INVERT");
-				invert = TRUE;
-			}
-			p++;
-
-			while ((*p == ' ') || (*p == '\t')) p++;
+		EVAL_DEBUG("ATTR to ATTR");
+		if ((radius_vpt_get_vp(&lhs_vp, request, map->dst) < 0) ||
+		    (radius_vpt_get_vp(&rhs_vp, request, map->src) < 0)) {
+		    return -2;
 		}
 
-		/*
-		 *	( EXPR ) 
-		 */
-		if (!found_condition && (*p == '(')) {
-			const char *end = p + 1;
-
-			/*
-			 *	Evaluate the condition, bailing out on
-			 *	parse error.
-			 */
-			RDEBUG4(">>> RECURSING WITH ... %s", end);
-			if (!radius_evaluate_condition(request, modreturn,
-						       depth + 1, &end,
-						       evaluate_next_condition,
-						       &result)) {
-				return FALSE;
-			}
-
-			if (invert) {
-				if (evaluate_next_condition) {
-					RDEBUG2("%.*s Converting !%s -> %s",
-						depth, filler,
-						(result != FALSE) ? "TRUE" : "FALSE",
-						(result == FALSE) ? "TRUE" : "FALSE");
-					result = (result == FALSE);
-				}
-				invert = FALSE;
-			}
-
-			/*
-			 *	Start from the end of the previous
-			 *	condition
-			 */
-			p = end;
-			RDEBUG4(">>> AFTER RECURSION ... %s", end);
-
-			while ((*p == ' ') || (*p == '\t')) p++;
-
-			if (!*p) {
-				radlog(L_ERR, "No closing brace");
-				return FALSE;
-			}
-
-			if (*p == ')') p++; /* eat closing brace */
-			found_condition = TRUE;
-
-			while ((*p == ' ') || (*p == '\t')) p++;
-		}
-
-		/*
-		 *	At EOL or closing brace, update && return.
-		 */
-		if (found_condition && (!*p || (*p == ')'))) break;
-
-		/*
-		 *	Now it's either:
-		 *
-		 *	WORD
-		 *	WORD1 op WORD2
-		 *	&& EXPR
-		 *	|| EXPR
-		 */
-		if (found_condition) {
-			/*
-			 *	(A && B) means "evaluate B
-			 *	only if A was true"
-			 */
-			if ((p[0] == '&') && (p[1] == '&')) {
-				if (!result) evaluate_next_condition = FALSE;
-				p += 2;
-				found_condition = FALSE;
-				continue; /* go back to the start */
-			}
-
-			/*
-			 *	(A || B) means "evaluate B
-			 *	only if A was false"
-			 */
-			if ((p[0] == '|') && (p[1] == '|')) {
-				if (result) evaluate_next_condition = FALSE;
-				p += 2;
-				found_condition = FALSE;
-				continue;
-			}
-
-			/*
-			 *	It must be:
-			 *
-			 *	WORD
-			 *	WORD1 op WORD2
-			 */
-		}
-
-		if (found_condition) {
-			radlog(L_ERR, "Consecutive conditions at %s", p);
-			return FALSE;
-		}
-
-		RDEBUG4(">>> LOOKING AT %s", p);
-		start = p;
-
-		/*
-		 *	Look for common errors.
-		 */
-		if ((p[0] == '%') && (p[1] == '{')) {
-			radlog(L_ERR, "Bare %%{...} is invalid in condition at: %s", p);
-			return FALSE;
-		}
-
-		/*
-		 *	Look for WORD1 op WORD2
-		 */
-		lt = gettoken(&p, left, sizeof(left));
-		if ((lt != T_BARE_WORD) &&
-		    (lt != T_DOUBLE_QUOTED_STRING) &&
-		    (lt != T_SINGLE_QUOTED_STRING) &&
-		    (lt != T_BACK_QUOTED_STRING)) {
-			radlog(L_ERR, "Expected string or numbers at: %s", p);
-			return FALSE;
-		}
-
-		pleft = left;
-		if (evaluate_next_condition) {
-			pleft = expand_string(xleft, sizeof(xleft), request,
-					      lt, left);
-			if (!pleft) {
-				radlog(L_ERR, "Failed expanding string at: %s",
-				       left);
-				return FALSE;
-			}
-		}
-
-		/*
-		 *	Peek ahead, to see if it's:
-		 *
-		 *	WORD
-		 *
-		 *	or something else, such as
-		 *
-		 *	WORD1 op WORD2
-		 *	WORD )
-		 *	WORD && EXPR
-		 *	WORD || EXPR
-		 */
-		q = p;
-		while ((*q == ' ') || (*q == '\t')) q++;
-
-		/*
-		 *	If the next thing is:
-		 *
-		 *	EOL
-		 *	end of condition
-		 *      &&
-		 *	||
-		 *
-		 *	Then WORD is just a test for existence.
-		 *	Remember that and skip ahead.
-		 */
-		if (!*q || (*q == ')') ||
-		    ((q[0] == '&') && (q[1] == '&')) ||
-		    ((q[0] == '|') && (q[1] == '|'))) {
-			token = T_OP_CMP_TRUE;
-			rt = T_OP_INVALID;
-			pright = NULL;
-			goto do_cmp;
-		}
-
-		/*
-		 *	Otherwise, it's:
-		 *
-		 *	WORD1 op WORD2
-		 */
-		token = gettoken(&p, comp, sizeof(comp));
-		if ((token < T_OP_NE) || (token > T_OP_CMP_EQ) ||
-		    (token == T_OP_CMP_TRUE)) {
-			radlog(L_ERR, "Expected comparison at: %s", comp);
-			return FALSE;
-		}
-		
-		/*
-		 *	Look for common errors.
-		 */
-		if ((p[0] == '%') && (p[1] == '{')) {
-			radlog(L_ERR, "Bare %%{...} is invalid in condition at: %s", p);
-			return FALSE;
-		}
-		
-		/*
-		 *	Validate strings.
-		 */
-#ifdef HAVE_REGEX_H
-		if ((token == T_OP_REG_EQ) ||
-		    (token == T_OP_REG_NE)) {
-			rt = getregex(&p, right, sizeof(right), &cflags);
-			if (rt != T_DOUBLE_QUOTED_STRING) {
-				radlog(L_ERR, "Expected regular expression at: %s", p);
-				return FALSE;
-			}
-		} else
-#endif
-			rt = gettoken(&p, right, sizeof(right));
-
-		if ((rt != T_BARE_WORD) &&
-		    (rt != T_DOUBLE_QUOTED_STRING) &&
-		    (rt != T_SINGLE_QUOTED_STRING) &&
-		    (rt != T_BACK_QUOTED_STRING)) {
-			radlog(L_ERR, "Expected string or numbers at: %s", p);
-			return FALSE;
-		}
-		
-		pright = right;
-		if (evaluate_next_condition) {
-			pright = expand_string(xright, sizeof(xright), request,
-					       rt, right);
-			if (!pright) {
-				radlog(L_ERR, "Failed expanding string at: %s",
-				       right);
-				return FALSE;
-			}
-		}
-		
-		RDEBUG4(">>> %d:%s %d %d:%s",
-		       lt, pleft, token, rt, pright);
-		
-	do_cmp:
-		if (evaluate_next_condition) {
-			/*
-			 *	More parse errors.
-			 */
-			if (!radius_do_cmp(request, &result, lt, pleft, token,
-					   rt, pright, cflags, modreturn)) {
-				return FALSE;
-			}
-			RDEBUG4(">>> Comparison returned %d", result);
-
-			if (invert) {
-				RDEBUG4(">>> INVERTING result");
-				result = (result == FALSE);
-			}
-
-			RDEBUG2("%.*s Evaluating %s(%.*s) -> %s",
-			       depth, filler,
-			       invert ? "!" : "", p - start, start,
-			       (result != FALSE) ? "TRUE" : "FALSE");
-
-			invert = FALSE;
-			RDEBUG4(">>> GOT result %d", result);
-
-			/*
-			 *	Not evaluating it.  We may be just
-			 *	parsing it.
-			 */
-		} else if (request) {
-			RDEBUG2("%.*s Skipping %s(%.*s)",
-			       depth, filler,
-			       invert ? "!" : "", p - start, start);
-		}
-
-		found_condition = TRUE;
-	} /* loop over the input condition */
-
-	if (!found_condition) {
-		radlog(L_ERR, "Syntax error.  Expected condition at %s", p);
-		return FALSE;
+		return paircmp_op(lhs_vp, map->op, rhs_vp);
 	}
 
-	RDEBUG4(">>> AT EOL -> %d", result);
-	*ptr = p;
-	if (evaluate_it) *presult = result;
-	return TRUE;
+	/*
+	 *	LHS is a cast.  Do type-specific comparisons, as if
+	 *	the LHS was a real attribute.
+	 */
+	if (c->cast) {
+		VALUE_PAIR *lhs_vp, *rhs_vp;
+
+		rcode = get_cast_vp(&lhs_vp, request, map->dst, c->cast);
+		if (rcode < 0) {
+			return rcode;
+		}
+		rad_assert(lhs_vp);
+
+		/*
+		 *	Get either a real VP, or parse the RHS into a
+		 *	VP, and return that.
+		 */
+		if (map->src->type == VPT_TYPE_ATTR) {
+			if (radius_vpt_get_vp(&rhs_vp, request, map->src) < 0) {
+				return -2;
+			}
+		} else {
+			rcode = get_cast_vp(&rhs_vp, request, map->src, c->cast);
+			if (rcode < 0) {
+				return rcode;
+			}
+			rad_assert(rhs_vp);
+		}
+		if (!rhs_vp) return -2;
+
+		EVAL_DEBUG("CAST to ...");
+
+		rcode = paircmp_op(lhs_vp, map->op, rhs_vp);
+		pairfree(&lhs_vp);
+		if (map->src->type != VPT_TYPE_ATTR) {
+			pairfree(&rhs_vp);
+		}
+		return rcode;
+	}
+
+	/*
+	 *	Might be a virtual comparison
+	 */
+	if ((map->dst->type == VPT_TYPE_ATTR) &&
+	    (map->src->type != VPT_TYPE_REGEX) &&
+	    (c->pass2_fixup == PASS2_PAIRCOMPARE)) {
+	    	int ret;
+		VALUE_PAIR *lhs_vp;
+
+		EVAL_DEBUG("virtual ATTR to DATA");
+
+		rcode = get_cast_vp(&lhs_vp, request, map->src, map->dst->da);
+		if (rcode < 0) {
+			return rcode;
+		}
+		rad_assert(lhs_vp);
+
+		/*
+		 *	paircompare requires the operator be set for the
+		 *	check attribute.
+		 */
+		lhs_vp->op = map->op;
+		ret = paircompare(request, request->packet->vps, lhs_vp, NULL);
+		talloc_free(lhs_vp);
+		if (ret == 0) {
+			return true;
+		}
+		return false;
+	}
+	rad_assert(c->pass2_fixup != PASS2_PAIRCOMPARE);
+
+	/*
+	 *	RHS has been pre-parsed into binary data.  Go check
+	 *	that.
+	 */
+	if ((map->dst->type == VPT_TYPE_ATTR) &&
+	    (map->src->type == VPT_TYPE_DATA)) {
+		VALUE_PAIR *lhs_vp, *rhs_vp;
+
+		EVAL_DEBUG("ATTR to DATA");
+
+		if (radius_vpt_get_vp(&lhs_vp, request, map->dst) < 0) {
+			return -2;
+		}
+
+		rcode = get_cast_vp(&rhs_vp, request, map->src, map->dst->da);
+		if (rcode < 0) {
+			return rcode;
+		}
+		rad_assert(rhs_vp);
+
+#ifdef WITH_EVAL_DEBUG
+		debug_pair(lhs_vp);
+		debug_pair(rhs_vp);
+#endif
+
+		rcode = paircmp_op(lhs_vp, map->op, rhs_vp);
+		pairfree(&rhs_vp);
+		return rcode;
+	}
+
+	rad_assert(map->src->type != VPT_TYPE_DATA);
+	rad_assert(map->dst->type != VPT_TYPE_DATA);
+
+	/*
+	 *	The RHS now needs to be expanded into a string.
+	 */
+	rcode = radius_expand_tmpl(&rhs, request, map->src);
+	if (rcode < 0) {
+		EVAL_DEBUG("FAIL %d", __LINE__);
+		return rcode;
+	}
+
+	/*
+	 *	User-Name == FOO
+	 *
+	 *	Parse the RHS to be the same DA as the LHS.  do
+	 *	comparisons.  So long as it's not a regex, which does
+	 *	string comparisons.
+	 *
+	 *	The LHS may be a virtual attribute, too.
+	 */
+	if ((map->dst->type == VPT_TYPE_ATTR) &&
+	    (map->src->type != VPT_TYPE_REGEX)) {
+		VALUE_PAIR *lhs_vp, *rhs_vp;
+
+		EVAL_DEBUG("ATTR to non-REGEX");
+
+		/*
+		 *	No LHS means no match
+		 */
+		if (radius_vpt_get_vp(&lhs_vp, request, map->dst) < 0) {
+			/*
+			 *	Not a real attr: might be a dynamic comparison.
+			 */
+			if ((map->dst->type == VPT_TYPE_ATTR) &&
+			    (map->dst->da->vendor == 0) &&
+			    radius_find_compare(map->dst->da)) {
+				rhs_vp = pairalloc(request, map->dst->da);
+				rad_assert(rhs_vp != NULL);		
+				if (!pairparsevalue(rhs_vp, rhs)) {
+					talloc_free(rhs);
+					EVAL_DEBUG("FAIL %d", __LINE__);
+					return -1;
+				}
+				talloc_free(rhs);
+
+				rcode = (radius_callback_compare(request, NULL, rhs_vp, NULL, NULL) == 0);
+				pairfree(&rhs_vp);
+				return rcode;
+			}
+
+			return -2;
+		}
+
+		/*
+		 *	Get VP for RHS
+		 */
+		rhs_vp = pairalloc(request, map->dst->da);
+		rad_assert(rhs_vp != NULL);
+		if (!pairparsevalue(rhs_vp, rhs)) {
+			talloc_free(rhs);
+			pairfree(&rhs_vp);
+			EVAL_DEBUG("FAIL %d", __LINE__);
+			return -1;
+		}
+
+		rcode = paircmp_op(lhs_vp, map->op, rhs_vp);
+		talloc_free(rhs);
+		pairfree(&rhs_vp);
+		return rcode;
+	}
+
+	/*
+	 *	The LHS is a string.  Expand it.
+	 */
+	rcode = radius_expand_tmpl(&lhs, request, map->dst);
+	if (rcode < 0) {
+		EVAL_DEBUG("FAIL %d", __LINE__);
+		return rcode;
+	}
+
+	EVAL_DEBUG("LHS is %s", lhs);
+
+	/*
+	 *	Compile  the RHS to a regex, and do regex stuff
+	 */
+	if (map->src->type == VPT_TYPE_REGEX) {
+		return do_regex(request, lhs, rhs, c->regex_i);
+	}
+
+	/*
+	 *	Loop over the string, doing comparisons
+	 */
+	if (all_digits(lhs) && all_digits(rhs)) {
+		int lint, rint;
+
+		lint = strtoul(lhs, NULL, 0);
+		rint = strtoul(rhs, NULL, 0);
+		talloc_free(lhs);
+		talloc_free(rhs);
+
+		switch (map->op) {
+		case T_OP_CMP_EQ:
+			return (lint == rint);
+
+		case T_OP_NE:
+			return (lint != rint);
+
+		case T_OP_LT:
+			return (lint < rint);
+
+		case T_OP_GT:
+			return (lint > rint);
+
+		case T_OP_LE:
+			return (lint <= rint);
+
+		case T_OP_GE:
+			return (lint >= rint);
+
+		default:
+			break;
+		}
+
+	} else {
+		rcode = strcmp(lhs, rhs);
+		talloc_free(lhs);
+		talloc_free(rhs);
+
+		switch (map->op) {
+		case T_OP_CMP_EQ:
+			return (rcode == 0);
+
+		case T_OP_NE:
+			return (rcode != 0);
+
+		case T_OP_LT:
+			return (rcode < 0);
+
+		case T_OP_GT:
+			return (rcode > 0);
+
+		case T_OP_LE:
+			return (rcode <= 0);
+
+		case T_OP_GE:
+			return (rcode >= 0);
+
+		default:
+			break;
+		}
+	}
+
+	EVAL_DEBUG("FAIL %d", __LINE__);
+	return -1;
+}
+
+
+/** Evaluate a fr_cond_t;
+ *
+ * @param[in] request the REQUEST
+ * @param[in] modreturn the previous module return code
+ * @param[in] depth of the recursion (only used for debugging)
+ * @param[in] c the condition to evaluate
+ * @return -1 on failure, -2 on attribute not found, 0 for "no match", 1 for "match".
+ */
+int radius_evaluate_cond(REQUEST *request, int modreturn, int depth,
+			 fr_cond_t const *c)
+{
+	int rcode = -1;
+
+	while (c) {
+		switch (c->type) {
+		case COND_TYPE_EXISTS:
+			rcode = radius_evaluate_tmpl(request, modreturn, depth, c->data.vpt);
+			/* Existence checks are special, because we expect them to fail */
+			if (rcode < 0) rcode = false;
+			break;
+
+		case COND_TYPE_MAP:
+			rcode = radius_evaluate_map(request, modreturn, depth, c);
+			break;
+
+		case COND_TYPE_CHILD:
+			rcode = radius_evaluate_cond(request, modreturn, depth + 1, c->data.child);
+			break;
+
+		case COND_TYPE_TRUE:
+			rcode = true;
+			break;
+
+		case COND_TYPE_FALSE:
+			rcode = false;
+			break;
+		default:
+			EVAL_DEBUG("FAIL %d", __LINE__);
+			return -1;
+		}
+
+		if (rcode < 0) return rcode;
+
+		if (c->negate) rcode = !rcode;
+
+		if (!c->next) break;
+
+		/*
+		 *	FALSE && ... = FALSE
+		 */
+		if (!rcode && (c->next_op == COND_AND)) return false;
+
+		/*
+		 *	TRUE || ... = TRUE
+		 */
+		if (rcode && (c->next_op == COND_OR)) return true;
+
+		c = c->next;
+	}
+
+	if (rcode < 0) {
+		EVAL_DEBUG("FAIL %d", __LINE__);
+	}
+	return rcode;
 }
 #endif
 
@@ -796,9 +672,10 @@ int radius_evaluate_condition(REQUEST *request, int modreturn, int depth,
 void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 {
 	int i, j, count, from_count, to_count, tailto;
+	vp_cursor_t cursor;
 	VALUE_PAIR *vp, *next, **last;
 	VALUE_PAIR **from_list, **to_list;
-	int *edited = NULL;
+	bool *edited = NULL;
 	REQUEST *fixup = NULL;
 
 	/*
@@ -823,11 +700,11 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 	 *	the matching attributes are deleted.
 	 */
 	count = 0;
-	for (vp = from; vp != NULL; vp = vp->next) count++;
-	from_list = rad_malloc(sizeof(*from_list) * count);
+	for (vp = fr_cursor_init(&cursor, &from); vp; vp = fr_cursor_next(&cursor)) count++;
+	from_list = talloc_array(request, VALUE_PAIR *, count);
 
-	for (vp = *to; vp != NULL; vp = vp->next) count++;
-	to_list = rad_malloc(sizeof(*to_list) * count);
+	for (vp = fr_cursor_init(&cursor, to); vp; vp = fr_cursor_next(&cursor)) count++;
+	to_list = talloc_array(request, VALUE_PAIR *, count);
 
 	/*
 	 *	Move the lists to the arrays, and break the list
@@ -847,8 +724,7 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 		vp->next = NULL;
 	}
 	tailto = to_count;
-	edited = rad_malloc(sizeof(*edited) * to_count);
-	memset(edited, 0, sizeof(*edited) * to_count);
+	edited = talloc_zero_array(request, bool, to_count);
 
 	RDEBUG4("::: FROM %d TO %d MAX %d", from_count, to_count, count);
 
@@ -859,7 +735,7 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 	for (i = 0; i < from_count; i++) {
 		int found;
 
-		RDEBUG4("::: Examining %s", from_list[i]->name);
+		RDEBUG4("::: Examining %s", from_list[i]->da->name);
 
 		/*
 		 *	Attribute should be appended, OR the "to" list
@@ -868,15 +744,14 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 		 */
 		if (from_list[i]->op == T_OP_ADD) goto append;
 
-		found = FALSE;
+		found = false;
 		for (j = 0; j < to_count; j++) {
 			if (edited[j] || !to_list[j] || !from_list[i]) continue;
 
 			/*
 			 *	Attributes aren't the same, skip them.
 			 */
-			if ((from_list[i]->attribute != to_list[j]->attribute) ||
-			    (from_list[i]->vendor != to_list[j]->vendor)) {
+			if (from_list[i]->da != to_list[j]->da) {
 				continue;
 			}
 
@@ -894,11 +769,11 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 			 */
 			if (from_list[i]->op == T_OP_SET) {
 				RDEBUG4("::: OVERWRITING %s FROM %d TO %d",
-				       to_list[j]->name, i, j);
+				       to_list[j]->da->name, i, j);
 				pairfree(&to_list[j]);
 				to_list[j] = from_list[i];
 				from_list[i] = NULL;
-				edited[j] = TRUE;
+				edited[j] = true;
 				break;
 			}
 
@@ -908,7 +783,7 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 			 *	looking.
 			 */
 			if (from_list[i]->op == T_OP_EQ) {
-				found = TRUE;
+				found = true;
 				break;
 			}
 
@@ -959,7 +834,7 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 					if (rcode == 0) {
 					delete:
 						RDEBUG4("::: DELETING %s FROM %d TO %d",
-						       from_list[i]->name, i, j);
+						       from_list[i]->da->name, i, j);
 						pairfree(&to_list[j]);
 						to_list[j] = NULL;
 					}
@@ -972,22 +847,22 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 				case T_OP_LE:
 					if (rcode > 0) {
 						RDEBUG4("::: REPLACING %s FROM %d TO %d",
-						       from_list[i]->name, i, j);
+						       from_list[i]->da->name, i, j);
 						pairfree(&to_list[j]);
 						to_list[j] = from_list[i];
 						from_list[i] = NULL;
-						edited[j] = TRUE;
+						edited[j] = true;
 					}
 					break;
 
 				case T_OP_GE:
 					if (rcode < 0) {
 						RDEBUG4("::: REPLACING %s FROM %d TO %d",
-						       from_list[i]->name, i, j);
+						       from_list[i]->da->name, i, j);
 						pairfree(&to_list[j]);
 						to_list[j] = from_list[i];
 						from_list[i] = NULL;
-						edited[j] = TRUE;
+						edited[j] = true;
 					}
 					break;
 				}
@@ -1011,7 +886,7 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 			    (from_list[i]->op == T_OP_SET)) {
 			append:
 				RDEBUG4("::: APPENDING %s FROM %d TO %d",
-				       from_list[i]->name, i, tailto);
+				       from_list[i]->da->name, i, tailto);
 				to_list[tailto++] = from_list[i];
 				from_list[i] = NULL;
 			}
@@ -1026,7 +901,7 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 
 		pairfree(&from_list[i]);
 	}
-	free(from_list);
+	talloc_free(from_list);
 
 	RDEBUG4("::: TO in %d out %d", to_count, tailto);
 
@@ -1048,9 +923,9 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 
 	for (i = 0; i < tailto; i++) {
 		if (!to_list[i]) continue;
-		
+
 		vp = to_list[i];
-		RDEBUG4("::: to[%d] = %s", i, vp->name);
+		RDEBUG4("::: to[%d] = %s", i, vp->da->name);
 
 		/*
 		 *	Mash the operator to a simple '='.  The
@@ -1064,173 +939,27 @@ void radius_pairmove(REQUEST *request, VALUE_PAIR **to, VALUE_PAIR *from)
 		/*
 		 *	Fix dumb cache issues
 		 */
-		if (fixup && (vp->vendor == 0)) {
-			if ((vp->attribute == PW_USER_NAME) &&
+		if (fixup && !vp->da->vendor) {
+			if ((vp->da->attr == PW_USER_NAME) &&
 			    !fixup->username) {
 				fixup->username = vp;
 
-			} else if (vp->attribute == PW_STRIPPED_USER_NAME) {
+			} else if (vp->da->attr == PW_STRIPPED_USER_NAME) {
 				fixup->username = vp;
 
-			} else if (vp->attribute == PW_USER_PASSWORD) {
+			} else if (vp->da->attr == PW_USER_PASSWORD) {
 				fixup->password = vp;
 			}
 		}
 
 		*last = vp;
 		last = &(*last)->next;
+		(void) talloc_steal(request, vp);
 	}
 
 	rad_assert(request != NULL);
 	rad_assert(request->packet != NULL);
 
-	free(to_list);
-	free(edited);
+	talloc_free(to_list);
+	talloc_free(edited);
 }
-
-
-#ifdef WITH_UNLANG
-/*
- *     Copied shamelessly from conffile.c, to simplify the API for
- *     now...
- */
-typedef enum conf_type {
-	CONF_ITEM_INVALID = 0,
-	CONF_ITEM_PAIR,
-	CONF_ITEM_SECTION,
-	CONF_ITEM_DATA
-} CONF_ITEM_TYPE;
-
-struct conf_item {
-	struct conf_item *next;
-	struct conf_part *parent;
-	int lineno;
-	const char *filename;
-	CONF_ITEM_TYPE type;
-};
-struct conf_pair {
-	CONF_ITEM item;
-	char *attr;
-	char *value;
-	FR_TOKEN op;
-	FR_TOKEN value_type;
-};
-
-/*
- *	Add attributes to a list.
- */
-int radius_update_attrlist(REQUEST *request, CONF_SECTION *cs,
-			   VALUE_PAIR *input_vps, const char *name)
-{
-	int list;
-	CONF_ITEM *ci;
-	VALUE_PAIR *newlist, *vp;
-	VALUE_PAIR **output_vps;
-	request_refs_t request_name;
-	REQUEST *update_request = request;
-
-	if (!request || !cs) return RLM_MODULE_INVALID;
-
-	request_name = radius_request_name(&name, REQUEST_CURRENT);
-	if (request_name == REQUEST_UNKNOWN) {
-		RDEBUG("ERROR: Invalid request name");
-		
-		return RLM_MODULE_INVALID;
-	}
-	
-	/* 
-	 *	Qualifiers not valid for this request
-	 */
-	if (radius_request(&update_request, request_name) < 0) {
-		RDEBUG("WARNING: List name refers to outer request"
-		       " but not in a tunnel.");
-		return RLM_MODULE_NOOP; 
-	}
-	
- 	list = fr_str2int(pair_lists, name, PAIR_LIST_UNKNOWN);
- 
- 	/* 
-	 *	Bad list name name
-	 */
-	if (list == PAIR_LIST_UNKNOWN) {
-		RDEBUG("ERROR: Invalid list name '%s'", name);
-		return RLM_MODULE_INVALID;
-	}
-	
-	output_vps = radius_list(update_request, list);
-	if (!output_vps) {
-		if (!((list == PAIR_LIST_COA) || (list == PAIR_LIST_DM))) {
-			RDEBUG("WARNING: List '%s' doesn't exist for this packet", name);
-			return RLM_MODULE_INVALID;
-		}
-
-		request_alloc_coa(update_request);
-		if (list == PAIR_LIST_COA) {
-			update_request->coa->proxy->code = PW_COA_REQUEST;
-		} else {
-			update_request->coa->proxy->code = PW_DISCONNECT_REQUEST;
-		}
-
-		output_vps = radius_list(update_request, list);
-	}
-
-	newlist = paircopy(input_vps);
-	if (!newlist) {
-		RDEBUG2("Out of memory");
-		return RLM_MODULE_FAIL;
-	}
-
-	vp = newlist;
-	for (ci=cf_item_find_next(cs, NULL);
-	     ci != NULL;
-	     ci=cf_item_find_next(cs, ci)) {
-		CONF_PAIR *cp;
-
-		/*
-		 *	This should never happen.
-		 */
-		if (cf_item_is_section(ci)) {
-			pairfree(&newlist);
-			return RLM_MODULE_INVALID;
-		}
-
-		cp = cf_itemtopair(ci);
-
-#ifndef NDEBUG
-		if (debug_flag && (vp->vendor == 0) &&
-		    radius_find_compare(vp->attribute)) {
-			DEBUG("WARNING: You are modifying the value of virtual attribute %s.  This is not supported.", vp->name);
-		}
-#endif
-
-		/*
-		 *	The VP && CF lists should be in sync.  If they're
-		 *	not, panic.
-		 */
-		if (vp->flags.do_xlat) {
-			const char *value;
-			char buffer[2048];
-
-			value = expand_string(buffer, sizeof(buffer), request,
-					      cp->value_type, cp->value);
-			if (!value) {
-				pairfree(&newlist);
-				return RLM_MODULE_INVALID;
-			}
-
-			if (!pairparsevalue(vp, value)) {
-				RDEBUG2("ERROR: Failed parsing value \"%s\" for attribute %s: %s",
-				       value, vp->name, fr_strerror());
-				pairfree(&newlist);
-				return RLM_MODULE_FAIL;
-			}
-			vp->flags.do_xlat = 0;
-		}
-		vp = vp->next;
-	}
-
-	radius_pairmove(update_request, output_vps, newlist);
-
-	return RLM_MODULE_UPDATED;
-}
-#endif

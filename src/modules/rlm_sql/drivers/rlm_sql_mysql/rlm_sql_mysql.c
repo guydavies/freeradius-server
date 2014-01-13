@@ -22,7 +22,6 @@
  * Copyright 2000  Alan DeKok <aland@ox.org>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -43,17 +42,69 @@ RCSID("$Id$")
 #endif
 #endif
 
-#include	"rlm_sql.h"
+#include "rlm_sql.h"
 
-typedef struct rlm_sql_mysql_sock {
-	MYSQL conn;
+typedef struct rlm_sql_mysql_conn {
+	MYSQL db;
 	MYSQL *sock;
 	MYSQL_RES *result;
-	SQL_ROW row;
-} rlm_sql_mysql_sock;
+	rlm_sql_row_t row;
+} rlm_sql_mysql_conn_t;
+
+typedef struct rlm_sql_mysql_config {
+	char const *tls_ca_file;
+	char const *tls_ca_path;
+	char const *tls_certificate_file;
+	char const *tls_private_key_file;
+	char const *tls_cipher;
+} rlm_sql_mysql_config_t;
+
+static CONF_PARSER tls_config[] = {
+	{"ca_file", PW_TYPE_FILE_INPUT, offsetof(rlm_sql_mysql_config_t, tls_ca_file), NULL, NULL},
+	{"ca_path", PW_TYPE_FILE_INPUT, offsetof(rlm_sql_mysql_config_t, tls_ca_path), NULL, NULL},
+	{"certificate_file", PW_TYPE_FILE_INPUT, offsetof(rlm_sql_mysql_config_t, tls_certificate_file), NULL, NULL},
+	{"private_key_file", PW_TYPE_FILE_INPUT, offsetof(rlm_sql_mysql_config_t, tls_private_key_file), NULL, NULL},
+
+	/*
+	 *	MySQL Specific TLS attributes
+	 */
+	{"cipher", PW_TYPE_STRING_PTR, offsetof(rlm_sql_mysql_config_t, tls_cipher), NULL, NULL},
+
+	{ NULL, -1, 0, NULL, NULL }
+};
+
+static const CONF_PARSER driver_config[] = {
+	{ "tls", PW_TYPE_SUBSECTION, 0, NULL, (void const *) tls_config },
+
+	{NULL, -1, 0, NULL, NULL}
+};
 
 /* Prototypes */
-static int sql_free_result(SQLSOCK*, SQL_CONFIG*);
+static sql_rcode_t sql_free_result(rlm_sql_handle_t*, rlm_sql_config_t*);
+
+static int _sql_socket_destructor(rlm_sql_mysql_conn_t *conn)
+{
+	DEBUG2("rlm_sql_mysql: Socket destructor called, closing socket");
+
+	if (conn->sock){
+		mysql_close(conn->sock);
+	}
+
+	return 0;
+}
+
+static int mod_instantiate(CONF_SECTION *conf, rlm_sql_config_t *config)
+{
+	rlm_sql_mysql_config_t *driver;
+
+	MEM(driver = config->driver = talloc_zero(config, rlm_sql_mysql_config_t));
+
+	if (cf_section_parse(conf, driver, driver_config) < 0) {
+		return -1;
+	}
+
+	return 0;
+}
 
 /*************************************************************************
  *
@@ -62,24 +113,32 @@ static int sql_free_result(SQLSOCK*, SQL_CONFIG*);
  *	Purpose: Establish connection to the db
  *
  *************************************************************************/
-static int sql_init_socket(SQLSOCK *sqlsocket, SQL_CONFIG *config)
+static sql_rcode_t sql_socket_init(rlm_sql_handle_t *handle, rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_sock *mysql_sock;
+	rlm_sql_mysql_conn_t *conn;
+	rlm_sql_mysql_config_t *driver = config->driver;
 	unsigned long sql_flags;
 
-	if (!sqlsocket->conn) {
-		sqlsocket->conn = (rlm_sql_mysql_sock *)rad_malloc(sizeof(rlm_sql_mysql_sock));
-		if (!sqlsocket->conn) {
-			return -1;
-		}
-	}
-	mysql_sock = sqlsocket->conn;
-	memset(mysql_sock, 0, sizeof(*mysql_sock));
+	MEM(conn = handle->conn = talloc_zero(handle, rlm_sql_mysql_conn_t));
+	talloc_set_destructor(conn, _sql_socket_destructor);
 
 	DEBUG("rlm_sql_mysql: Starting connect to MySQL server");
 
-	mysql_init(&(mysql_sock->conn));
-	mysql_options(&(mysql_sock->conn), MYSQL_READ_DEFAULT_GROUP, "freeradius");
+	mysql_init(&(conn->db));
+
+	/*
+	 *	If any of the TLS options are set, configure TLS
+	 *
+	 *	According to MySQL docs this function always returns 0, so we won't
+	 *	know if ssl setup succeeded until mysql_real_connect is called below.
+	 */
+	if (driver->tls_ca_file || driver->tls_ca_path ||
+	    driver->tls_certificate_file || driver->tls_private_key_file) {
+		mysql_ssl_set(&(conn->db), driver->tls_private_key_file, driver->tls_certificate_file,
+			      driver->tls_ca_file, driver->tls_ca_path, driver->tls_cipher);
+	}
+
+	mysql_options(&(conn->db), MYSQL_READ_DEFAULT_GROUP, "freeradius");
 
 #if (MYSQL_VERSION_ID >= 50000)
 	if (config->query_timeout) {
@@ -92,11 +151,11 @@ static int sql_init_socket(SQLSOCK *sqlsocket, SQL_CONFIG *config)
 		 */
 		if (timeout > 3) timeout /= 3;
 
-		mysql_options(&(mysql_sock->conn), MYSQL_OPT_CONNECT_TIMEOUT,
+		mysql_options(&(conn->db), MYSQL_OPT_CONNECT_TIMEOUT,
 			      &timeout);
-		mysql_options(&(mysql_sock->conn), MYSQL_OPT_READ_TIMEOUT,
+		mysql_options(&(conn->db), MYSQL_OPT_READ_TIMEOUT,
 			      &timeout);
-		mysql_options(&(mysql_sock->conn), MYSQL_OPT_WRITE_TIMEOUT,
+		mysql_options(&(conn->db), MYSQL_OPT_WRITE_TIMEOUT,
 			      &timeout);
 	}
 #endif
@@ -110,40 +169,29 @@ static int sql_init_socket(SQLSOCK *sqlsocket, SQL_CONFIG *config)
 #ifdef CLIENT_MULTI_STATEMENTS
 	sql_flags |= CLIENT_MULTI_STATEMENTS;
 #endif
-	if (!(mysql_sock->sock = mysql_real_connect(&(mysql_sock->conn),
-						    config->sql_server,
-						    config->sql_login,
-						    config->sql_password,
-						    config->sql_db,
-						    atoi(config->sql_port),
-						    NULL,
-						    sql_flags))) {
-		radlog(L_ERR, "rlm_sql_mysql: Couldn't connect socket to MySQL server %s@%s:%s", config->sql_login, config->sql_server, config->sql_db);
-		radlog(L_ERR, "rlm_sql_mysql: Mysql error '%s'", mysql_error(&mysql_sock->conn));
-		mysql_sock->sock = NULL;
+	conn->sock = mysql_real_connect(&(conn->db),
+					config->sql_server,
+					config->sql_login,
+					config->sql_password,
+					config->sql_db,
+					atoi(config->sql_port),
+					NULL,
+					sql_flags);
+	if (!conn->sock) {
+		ERROR("rlm_sql_mysql: Couldn't connect socket to MySQL "
+		       "server %s@%s:%s", config->sql_login, config->sql_server,
+		       config->sql_db);
+		ERROR("rlm_sql_mysql: Mysql error '%s'",
+		       mysql_error(&conn->db));
+
+		conn->sock = NULL;
+
 		return -1;
 	}
 
 
 	return 0;
 }
-
-
-/*************************************************************************
- *
- *	Function: sql_destroy_socket
- *
- *	Purpose: Free socket and any private connection data
- *
- *************************************************************************/
-static int sql_destroy_socket(SQLSOCK *sqlsocket, UNUSED SQL_CONFIG *config)
-{
-	free(sqlsocket->conn);
-	sqlsocket->conn = NULL;
-
-	return 0;
-}
-
 
 /*************************************************************************
  *
@@ -158,8 +206,8 @@ static int sql_check_error(int error)
 	case CR_SERVER_GONE_ERROR:
 	case CR_SERVER_LOST:
 	case -1:
-		radlog(L_DBG, "rlm_sql_mysql: MYSQL check_error: %d, returning SQL_DOWN", error);
-		return SQL_DOWN;
+		DEBUG("rlm_sql_mysql: MYSQL check_error: %d, returning RLM_SQL_RECONNECT", error);
+		return RLM_SQL_RECONNECT;
 		break;
 	case 0:
 		return 0;
@@ -168,7 +216,7 @@ static int sql_check_error(int error)
 	case CR_COMMANDS_OUT_OF_SYNC:
 	case CR_UNKNOWN_ERROR:
 	default:
-		radlog(L_DBG, "rlm_sql_mysql: MYSQL check_error: %d received", error);
+		DEBUG("rlm_sql_mysql: MYSQL check_error: %d received", error);
 		return -1;
 		break;
 	}
@@ -182,18 +230,17 @@ static int sql_check_error(int error)
  *	Purpose: Issue a query to the database
  *
  *************************************************************************/
-static int sql_query(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config,
-		     char *querystr)
+static sql_rcode_t sql_query(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config, char const *query)
 {
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 
-	if (mysql_sock->sock == NULL) {
-		radlog(L_ERR, "rlm_sql_mysql: Socket not connected");
-		return SQL_DOWN;
+	if (!conn->sock) {
+		ERROR("rlm_sql_mysql: Socket not connected");
+		return RLM_SQL_RECONNECT;
 	}
 
-	mysql_query(mysql_sock->sock, querystr);
-	return sql_check_error(mysql_errno(mysql_sock->sock));
+	mysql_query(conn->sock, query);
+	return sql_check_error(mysql_errno(conn->sock));
 }
 
 
@@ -202,37 +249,37 @@ static int sql_query(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config,
  *	Function: sql_store_result
  *
  *	Purpose: database specific store_result function. Returns a result
- *               set for the query. In case of multiple results, get the
- *               first non-empty one.
+ *	       set for the query. In case of multiple results, get the
+ *	       first non-empty one.
  *
  *************************************************************************/
-static int sql_store_result(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static sql_rcode_t sql_store_result(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 	int status;
 
-	if (mysql_sock->sock == NULL) {
-		radlog(L_ERR, "rlm_sql_mysql: Socket not connected");
-		return SQL_DOWN;
+	if (!conn->sock) {
+		ERROR("rlm_sql_mysql: Socket not connected");
+		return RLM_SQL_RECONNECT;
 	}
 retry_store_result:
-	if (!(mysql_sock->result = mysql_store_result(mysql_sock->sock))) {
-		status = sql_check_error(mysql_errno(mysql_sock->sock));
+	if (!(conn->result = mysql_store_result(conn->sock))) {
+		status = sql_check_error(mysql_errno(conn->sock));
 		if (status != 0) {
-			radlog(L_ERR, "rlm_sql_mysql: Cannot store result");
-			radlog(L_ERR, "rlm_sql_mysql: MySQL error '%s'",
-			       mysql_error(mysql_sock->sock));
+			ERROR("rlm_sql_mysql: Cannot store result");
+			ERROR("rlm_sql_mysql: MySQL error '%s'",
+			       mysql_error(conn->sock));
 			return status;
 		}
 #if (MYSQL_VERSION_ID >= 40100)
-		status = mysql_next_result(mysql_sock->sock);
+		status = mysql_next_result(conn->sock);
 		if (status == 0) {
 			/* there are more results */
 			goto retry_store_result;
 		} else if (status > 0) {
-			radlog(L_ERR, "rlm_sql_mysql: Cannot get next result");
-			radlog(L_ERR, "rlm_sql_mysql: MySQL error '%s'",
-			       mysql_error(mysql_sock->sock));
+			ERROR("rlm_sql_mysql: Cannot get next result");
+			ERROR("rlm_sql_mysql: MySQL error '%s'",
+			       mysql_error(conn->sock));
 			return sql_check_error(status);
 		}
 #endif
@@ -246,22 +293,22 @@ retry_store_result:
  *	Function: sql_num_fields
  *
  *	Purpose: database specific num_fields function. Returns number
- *               of columns from query
+ *	       of columns from query
  *
  *************************************************************************/
-static int sql_num_fields(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static int sql_num_fields(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
 	int     num = 0;
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 
 #if MYSQL_VERSION_ID >= 32224
-	if (!(num = mysql_field_count(mysql_sock->sock))) {
+	if (!(num = mysql_field_count(conn->sock))) {
 #else
-	if (!(num = mysql_num_fields(mysql_sock->sock))) {
+	if (!(num = mysql_num_fields(conn->sock))) {
 #endif
-		radlog(L_ERR, "rlm_sql_mysql: MYSQL Error: No Fields");
-		radlog(L_ERR, "rlm_sql_mysql: MYSQL error: %s",
-		       mysql_error(mysql_sock->sock));
+		ERROR("rlm_sql_mysql: MYSQL Error: No Fields");
+		ERROR("rlm_sql_mysql: MYSQL error: %s",
+		       mysql_error(conn->sock));
 	}
 	return num;
 }
@@ -274,15 +321,14 @@ static int sql_num_fields(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
  *	Purpose: Issue a select query to the database
  *
  *************************************************************************/
-static int sql_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config,
-			    char *querystr)
+static sql_rcode_t sql_select_query(rlm_sql_handle_t *handle, rlm_sql_config_t *config, char const *query)
 {
 	int ret;
 
-	ret = sql_query(sqlsocket, config, querystr);
+	ret = sql_query(handle, config, query);
 	if(ret)
 		return ret;
-	ret = sql_store_result(sqlsocket, config);
+	ret = sql_store_result(handle, config);
 	if (ret) {
 		return ret;
 	}
@@ -291,7 +337,7 @@ static int sql_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config,
 	 * this cannot return an error.  Perhaps just to complain if no
 	 * fields are found?
 	 */
-	sql_num_fields(sqlsocket, config);
+	sql_num_fields(handle, config);
 
 	return ret;
 }
@@ -302,15 +348,15 @@ static int sql_select_query(SQLSOCK *sqlsocket, SQL_CONFIG *config,
  *	Function: sql_num_rows
  *
  *	Purpose: database specific num_rows. Returns number of rows in
- *               query
+ *	       query
  *
  *************************************************************************/
-static int sql_num_rows(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static int sql_num_rows(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 
-	if (mysql_sock->result)
-		return mysql_num_rows(mysql_sock->result);
+	if (conn->result)
+		return mysql_num_rows(conn->result);
 
 	return 0;
 }
@@ -320,46 +366,46 @@ static int sql_num_rows(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
  *
  *	Function: sql_fetch_row
  *
- *	Purpose: database specific fetch_row. Returns a SQL_ROW struct
- *               with all the data for the query in 'sqlsocket->row'. Returns
- *		 0 on success, -1 on failure, SQL_DOWN if database is down.
+ *	Purpose: database specific fetch_row. Returns a rlm_sql_row_t struct
+ *	       with all the data for the query in 'handle->row'. Returns
+ *		 0 on success, -1 on failure, RLM_SQL_RECONNECT if database is down.
  *
  *************************************************************************/
-static int sql_fetch_row(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static sql_rcode_t sql_fetch_row(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 	int status;
 
 	/*
 	 *  Check pointer before de-referencing it.
 	 */
-	if (!mysql_sock->result) {
-		return SQL_DOWN;
+	if (!conn->result) {
+		return RLM_SQL_RECONNECT;
 	}
 
 retry_fetch_row:
-	sqlsocket->row = mysql_fetch_row(mysql_sock->result);
+	handle->row = mysql_fetch_row(conn->result);
 
-	if (sqlsocket->row == NULL) {
-		status = sql_check_error(mysql_errno(mysql_sock->sock));
+	if (!handle->row) {
+		status = sql_check_error(mysql_errno(conn->sock));
 		if (status != 0) {
-			radlog(L_ERR, "rlm_sql_mysql: Cannot fetch row");
-			radlog(L_ERR, "rlm_sql_mysql: MySQL error '%s'",
-			       mysql_error(mysql_sock->sock));
+			ERROR("rlm_sql_mysql: Cannot fetch row");
+			ERROR("rlm_sql_mysql: MySQL error '%s'",
+			       mysql_error(conn->sock));
 			return status;
 		}
 #if (MYSQL_VERSION_ID >= 40100)
-		sql_free_result(sqlsocket, config);
-		status = mysql_next_result(mysql_sock->sock);
+		sql_free_result(handle, config);
+		status = mysql_next_result(conn->sock);
 		if (status == 0) {
 			/* there are more results */
-			if ((sql_store_result(sqlsocket, config) == 0)
-			 && (mysql_sock->result != NULL))
+			if ((sql_store_result(handle, config) == 0)
+			 && (conn->result != NULL))
 				goto retry_fetch_row;
 		} else if (status > 0) {
-			radlog(L_ERR, "rlm_sql_mysql: Cannot get next result");
-			radlog(L_ERR, "rlm_sql_mysql: MySQL error '%s'",
-			       mysql_error(mysql_sock->sock));
+			ERROR("rlm_sql_mysql: Cannot get next result");
+			ERROR("rlm_sql_mysql: MySQL error '%s'",
+			       mysql_error(conn->sock));
 			return sql_check_error(status);
 		}
 #endif
@@ -373,16 +419,16 @@ retry_fetch_row:
  *	Function: sql_free_result
  *
  *	Purpose: database specific free_result. Frees memory allocated
- *               for a result set
+ *	       for a result set
  *
  *************************************************************************/
-static int sql_free_result(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static sql_rcode_t sql_free_result(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 
-	if (mysql_sock->result) {
-		mysql_free_result(mysql_sock->result);
-		mysql_sock->result = NULL;
+	if (conn->result) {
+		mysql_free_result(conn->result);
+		conn->result = NULL;
 	}
 
 	return 0;
@@ -395,40 +441,18 @@ static int sql_free_result(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
  *	Function: sql_error
  *
  *	Purpose: database specific error. Returns error associated with
- *               connection
+ *	       connection
  *
  *************************************************************************/
-static const char *sql_error(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static char const *sql_error(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 
-	if (mysql_sock == NULL || mysql_sock->sock == NULL) {
+	if (!conn || !conn->sock) {
 		return "rlm_sql_mysql: no connection to db";
 	}
-	return mysql_error(mysql_sock->sock);
+	return mysql_error(conn->sock);
 }
-
-
-/*************************************************************************
- *
- *	Function: sql_close
- *
- *	Purpose: database specific close. Closes an open database
- *               connection
- *
- *************************************************************************/
-static int sql_close(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
-{
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
-
-	if (mysql_sock && mysql_sock->sock){
-		mysql_close(mysql_sock->sock);
-		mysql_sock->sock = NULL;
-	}
-
-	return 0;
-}
-
 
 /*************************************************************************
  *
@@ -439,28 +463,28 @@ static int sql_close(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
  *	whether more results exist and process them in turn if so.
  *
  *************************************************************************/
-static int sql_finish_query(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static sql_rcode_t sql_finish_query(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
 #if (MYSQL_VERSION_ID >= 40100)
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 	int status;
 
 skip_next_result:
-	status = sql_store_result(sqlsocket, config);
+	status = sql_store_result(handle, config);
 	if (status != 0) {
 		return status;
-	} else if (mysql_sock->result != NULL) {
-		radlog(L_DBG, "rlm_sql_mysql: SQL statement returned unexpected result");
-		sql_free_result(sqlsocket, config);
+	} else if (conn->result != NULL) {
+		DEBUG("rlm_sql_mysql: SQL statement returned unexpected result");
+		sql_free_result(handle, config);
 	}
-	status = mysql_next_result(mysql_sock->sock);
+	status = mysql_next_result(conn->sock);
 	if (status == 0) {
 		/* there are more results */
 		goto skip_next_result;
 	}  else if (status > 0) {
-		radlog(L_ERR, "rlm_sql_mysql: Cannot get next result");
-		radlog(L_ERR, "rlm_sql_mysql: MySQL error '%s'",
-		       mysql_error(mysql_sock->sock));
+		ERROR("rlm_sql_mysql: Cannot get next result");
+		ERROR("rlm_sql_mysql: MySQL error '%s'",
+		       mysql_error(conn->sock));
 		return sql_check_error(status);
 	}
 #endif
@@ -476,22 +500,22 @@ skip_next_result:
  *	Purpose: End the select query, such as freeing memory or result
  *
  *************************************************************************/
-static int sql_finish_select_query(SQLSOCK * sqlsocket, SQL_CONFIG *config)
+static sql_rcode_t sql_finish_select_query(rlm_sql_handle_t * handle, rlm_sql_config_t *config)
 {
 #if (MYSQL_VERSION_ID >= 40100)
 	int status;
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 #endif
-	sql_free_result(sqlsocket, config);
+	sql_free_result(handle, config);
 #if (MYSQL_VERSION_ID >= 40100)
-	status = mysql_next_result(mysql_sock->sock);
+	status = mysql_next_result(conn->sock);
 	if (status == 0) {
 		/* there are more results */
-		sql_finish_query(sqlsocket, config);
+		sql_finish_query(handle, config);
 	}  else if (status > 0) {
-		radlog(L_ERR, "rlm_sql_mysql: Cannot get next result");
-		radlog(L_ERR, "rlm_sql_mysql: MySQL error '%s'",
-		       mysql_error(mysql_sock->sock));
+		ERROR("rlm_sql_mysql: Cannot get next result");
+		ERROR("rlm_sql_mysql: MySQL error '%s'",
+		       mysql_error(conn->sock));
 		return sql_check_error(status);
 	}
 #endif
@@ -506,19 +530,19 @@ static int sql_finish_select_query(SQLSOCK * sqlsocket, SQL_CONFIG *config)
  *	Purpose: End the select query, such as freeing memory or result
  *
  *************************************************************************/
-static int sql_affected_rows(SQLSOCK * sqlsocket, UNUSED SQL_CONFIG *config)
+static int sql_affected_rows(rlm_sql_handle_t * handle, UNUSED rlm_sql_config_t *config)
 {
-	rlm_sql_mysql_sock *mysql_sock = sqlsocket->conn;
+	rlm_sql_mysql_conn_t *conn = handle->conn;
 
-	return mysql_affected_rows(mysql_sock->sock);
+	return mysql_affected_rows(conn->sock);
 }
 
 
 /* Exported to rlm_sql */
 rlm_sql_module_t rlm_sql_mysql = {
 	"rlm_sql_mysql",
-	sql_init_socket,
-	sql_destroy_socket,
+	mod_instantiate,
+	sql_socket_init,
 	sql_query,
 	sql_select_query,
 	sql_store_result,
@@ -527,7 +551,6 @@ rlm_sql_module_t rlm_sql_mysql = {
 	sql_fetch_row,
 	sql_free_result,
 	sql_error,
-	sql_close,
 	sql_finish_query,
 	sql_finish_select_query,
 	sql_affected_rows

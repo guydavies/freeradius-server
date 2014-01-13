@@ -53,7 +53,7 @@ server vmps {
 		#  create one using other attributes.
 		if (!VMPS-Mac) {
 			if (VMPS-Ethernet-Frame =~ /0x.{12}(..)(..)(..)(..)(..)(..).*/) {
-        			update request {
+				update request {
 					VMPS-Mac = "%{1}:%{2}:%{3}:%{4}:%{5}:%{6}"
 				}
 			}
@@ -84,9 +84,9 @@ server vmps {
 			#
 			#VMPS-VLAN-Name = "%{sql:select ... where mac='%{VMPS-Mac}'}"
 		}
-		
+
 		# correct reply packet type for reconfirmation requests
-		#   
+		#
 		if (VMPS-Packet-Type == VMPS-Reconfirm-Request){
 			update reply {
 				VMPS-Packet-Type := VMPS-Reconfirm-Response

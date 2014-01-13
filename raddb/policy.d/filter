@@ -45,7 +45,7 @@ remove_reply_message_if_eap {
 #	realms.
 #
 deny_realms {
-	if (User-Name =~ /@|\\/) {
+	if (User-Name && (User-Name =~ /@|\\/)) {
 		reject
 	}
 }
@@ -62,6 +62,11 @@ filter_username {
 	#  reject mixed case
 	#  e.g. "UseRNaMe"
 	#
+
+	if (!User-Name) {
+		noop
+	}
+
 	if (User-Name != "%{tolower:%{User-Name}}") {
 		reject
 	}
@@ -87,7 +92,7 @@ filter_username {
 		}
 		reject
 	}
-	
+
 	#
 	#  reject double dots
 	#  e.g. "user@site..com"
@@ -98,14 +103,14 @@ filter_username {
 		}
 		reject
 	}
-	
+
 	#
-	#  must have at least 1 string-dot-string after @ 
+	#  must have at least 1 string-dot-string after @
 	#  e.g. "user@site.com"
 	#
 	if ((User-Name =~ /@/) && (User-Name !~ /@(.+)\\.(.+)$/))  {
 		update reply {
-			Reply-Message += "Rejected: Realm does not have at least one dot seperator"
+			Reply-Message += "Rejected: Realm does not have at least one dot separator"
 		}
 		reject
 	}

@@ -5,49 +5,57 @@
  *
  */
 
+typedef enum {
+	PW_TYPE_INVALID = 0,	//!< Invalid (uninitialised) attribute type.
+	PW_TYPE_STRING,		//!< String of printable characters.
+	PW_TYPE_INTEGER,	//!< 32 Bit unsigned integer.
+	PW_TYPE_IPADDR,		//!< 32 Bit IPv4 Address.
+	PW_TYPE_DATE,		//!< 32 Bit Unix timestamp.
+	PW_TYPE_ABINARY,	//!< Ascend binary format a packed data
+				//!< structure.
+	PW_TYPE_OCTETS,		//!< Raw octets.
+	PW_TYPE_IFID,		//!< Interface ID.
+	PW_TYPE_IPV6ADDR,	//!< 128 Bit IPv6 Address.
+	PW_TYPE_IPV6PREFIX,	//!< IPv6 Prefix.
+	PW_TYPE_BYTE,		//!< 8 Bit unsigned integer.
+	PW_TYPE_SHORT,		//!< 16 Bit unsigned integer.
+	PW_TYPE_ETHERNET,	//!< 48 Bit Mac-Address.
+	PW_TYPE_SIGNED,		//!< 32 Bit signed integer.
+	PW_TYPE_COMBO_IP,	//!< WiMAX IPv4 or IPv6 address depending
+				//!< on length.
+	PW_TYPE_TLV,		//!< Contains nested attributes.
+	PW_TYPE_EXTENDED,	//!< Extended attribute space attribute.
+	PW_TYPE_LONG_EXTENDED,	//!< Long extended attribute space attribute.
+	PW_TYPE_EVS,		//!< Extended attribute, vendor specific.
+	PW_TYPE_INTEGER64,	//!< 64 Bit unsigned integer.
+	PW_TYPE_IPV4PREFIX,	//!< IPv4 Prefix.
+	PW_TYPE_VSA,		//!< Vendor-Specific, for attribute 26
+	PW_TYPE_MAX		//!< Number of defined data types.
+} PW_TYPE;
 
-#define PW_TYPE_STRING			0
-#define PW_TYPE_INTEGER			1
-#define PW_TYPE_IPADDR			2
-#define PW_TYPE_DATE			3
-#define PW_TYPE_ABINARY			4
-#define PW_TYPE_OCTETS			5
-#define PW_TYPE_IFID			6
-#define PW_TYPE_IPV6ADDR		7
-#define PW_TYPE_IPV6PREFIX		8
-#define PW_TYPE_BYTE			9
-#define PW_TYPE_SHORT			10
-#define PW_TYPE_ETHERNET		11
-#define PW_TYPE_SIGNED			12
-#define PW_TYPE_COMBO_IP		13
-#define PW_TYPE_TLV			14
-#define PW_TYPE_EXTENDED		15
-#define PW_TYPE_LONG_EXTENDED		16
-#define PW_TYPE_EVS			17
-#define PW_TYPE_INTEGER64		18
-#define PW_TYPE_IPV4PREFIX		19
-
-#define PW_FLAG_LONG			(1 << 8)
-
-#define PW_AUTHENTICATION_REQUEST	1
-#define PW_AUTHENTICATION_ACK		2
-#define PW_AUTHENTICATION_REJECT	3
-#define PW_ACCOUNTING_REQUEST		4
-#define PW_ACCOUNTING_RESPONSE		5
-#define PW_ACCOUNTING_STATUS		6
-#define PW_PASSWORD_REQUEST		7
-#define PW_PASSWORD_ACK			8
-#define PW_PASSWORD_REJECT		9
-#define PW_ACCOUNTING_MESSAGE		10
-#define PW_ACCESS_CHALLENGE		11
-#define PW_STATUS_SERVER		12
-#define PW_STATUS_CLIENT		13
-#define PW_DISCONNECT_REQUEST		40
-#define PW_DISCONNECT_ACK		41
-#define PW_DISCONNECT_NAK		42
-#define PW_COA_REQUEST			43
-#define PW_COA_ACK			44
-#define PW_COA_NAK			45
+typedef enum {
+	PW_CODE_INVALID			= 0,	//!< Packet code is invalid
+	PW_CODE_AUTHENTICATION_REQUEST 	= 1,	//!< RFC2865 - Authentication request
+	PW_CODE_AUTHENTICATION_ACK	= 2,	//!< RFC2865 - Access-Accept
+	PW_CODE_AUTHENTICATION_REJECT	= 3,	//!< RFC2865 - Access-Reject
+	PW_CODE_ACCOUNTING_REQUEST	= 4,	//!< RFC2866 - Accounting-Request
+	PW_CODE_ACCOUNTING_RESPONSE	= 5,	//!< RFC2866 - Accounting-Response
+	PW_CODE_ACCOUNTING_STATUS	= 6,	//!< RFC3575 - Reserved
+	PW_CODE_PASSWORD_REQUEST	= 7,	//!< RFC3575 - Reserved
+	PW_CODE_PASSWORD_ACK		= 8,	//!< RFC3575 - Reserved
+	PW_CODE_PASSWORD_REJECT		= 9,	//!< RFC3575 - Reserved
+	PW_CODE_ACCOUNTING_MESSAGE	= 10,	//!< RFC3575 - Reserved
+	PW_CODE_ACCESS_CHALLENGE	= 11,	//!< RFC2865 - Access-Challenge
+	PW_CODE_STATUS_SERVER	 	= 12,	//!< RFC2865/RFC5997 - Status Server (request)
+	PW_CODE_STATUS_CLIENT		= 13,	//!< RFC2865/RFC5997 - Status Server (response)
+	PW_CODE_DISCONNECT_REQUEST	= 40,	//!< RFC3575/RFC5176 - Disconnect-Request
+	PW_CODE_DISCONNECT_ACK		= 41,	//!< RFC3575/RFC5176 - Disconnect-Ack (positive)
+	PW_CODE_DISCONNECT_NAK		= 42,	//!< RFC3575/RFC5176 - Disconnect-Nak (not willing to perform)
+	PW_CODE_COA_REQUEST		= 43,	//!< RFC3575/RFC5176 - CoA-Request
+	PW_CODE_COA_ACK			= 44,	//!< RFC3575/RFC5176 - CoA-Ack (positive)
+	PW_CODE_COA_NAK			= 45,	//!< RFC3575/RFC5176 - CoA-Nak (not willing to perform)
+	PW_CODE_MAX			= 255,	//!< Maximum possible code
+} PW_CODE;
 
 #define PW_AUTH_UDP_PORT		1812
 #define PW_ACCT_UDP_PORT		1813
@@ -127,6 +135,7 @@
 #define PW_FRAMED_POOL			88
 #define PW_CHARGEABLE_USER_IDENTITY	89
 #define PW_NAS_IPV6_ADDRESS		95
+#define PW_FRAMED_IPV6_PREFIX	97
 #define PW_OPERATOR_NAME		126
 
 #define PW_EXTENDED_ATTRIBUTE		192
@@ -243,6 +252,9 @@
 #define PW_CACHED_SESSION_POLICY     	1135
 #define PW_FREERADIUS_CLIENT_SRC_IP_ADDRESS	1143
 #define PW_FREERADIUS_CLIENT_SRC_IPV6_ADDRESS	1144
+
+#define PW_OTP_CHALLENGE		1145
+#define PW_EAP_SESSION_ID		1146
 
 /*
  *	Integer Translations

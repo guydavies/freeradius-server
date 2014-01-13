@@ -27,10 +27,10 @@
 /*
  *  EAP PACKET FORMAT
  *  --- ------ ------
- *  0                   1                   2                   3
+ *  0		   1		   2		   3
  *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |     Code      |  Identifier   |            Length             |
+ * |     Code      |  Identifier   |	    Length	     |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |    Data ...
  * +-+-+-+-+
@@ -38,10 +38,10 @@
  *
  * EAP Request and Response Packet Format
  * --- ------- --- -------- ------ ------
- *  0                   1                   2                   3
+ *  0		   1		   2		   3
  *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |     Code      |  Identifier   |            Length             |
+ * |     Code      |  Identifier   |	    Length	     |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |     Type      |  Type-Data ...
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
@@ -49,126 +49,65 @@
  *
  * EAP Success and Failure Packet Format
  * --- ------- --- ------- ------ ------
- *  0                   1                   2                   3
+ *  0		   1		   2		   3
  *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |     Code      |  Identifier   |            Length             |
+ * |     Code      |  Identifier   |	    Length	     |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  *
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/libradius.h>
 #include "eap_types.h"
 
-static const char *eap_types[] = {
-  "",
-  "identity",
-  "notification",
-  "nak",			/* NAK */
-  "md5",
-  "otp",
-  "gtc",
-  "7",
-  "8",
-  "9",
-  "10",
-  "11",
-  "12",
-  "tls",			/* 13 */
-  "14",
-  "15",
-  "16",
-  "leap",			/* 17 */
-  "sim",                        /* 18 GSM-SIM authentication */
-  "19",
-  "20",
-  "ttls",			/* 21 */
-  "22",
-  "23",
-  "24",
-  "peap",			/* 25 */
-  "mschapv2",			/* 26 */
-  "27",
-  "28",
-  "cisco_mschapv2",		/* 29 */
-  "30",
-  "31",
-  "32",
-  "33",
-  "34",
-  "35",
-  "36",
-  "37",
-  "tnc",			/* 38 */
-  "39",
-  "40",
-  "41",
-  "42",
-  "fast",
-  "44",
-  "45",
-  "pax",
-  "psk",
-  "sake",
-  "ikev2",
-  "50",
-  "51",
-  "pwd"
-};				/* MUST have PW_EAP_MAX_TYPES */
+const FR_NAME_NUMBER eap_rcode_table[] = {
+	{ "notfound",		EAP_NOTFOUND		},
+	{ "found",		EAP_OK			},
+	{ "ok",			EAP_FAIL		},
+	{ "fail",		EAP_NOOP		},
+	{ "noop",		EAP_INVALID		},
+	{ "invalid",		EAP_VALID		},
+	{ "valid",		EAP_MAX_RCODES		},
 
-/*
- *	Return an EAP-Type for a particular name.
+	{  NULL , -1 }
+};
+
+/** Return an EAP-Type for a particular name
+ *
+ * Converts a name into an IANA EAP type.
+ *
+ * @param name to convert.
+ * @return The IANA EAP type or PW_EAP_INVALID if the name doesn't match any
+ * known types.
  */
-int eaptype_name2type(const char *name)
+eap_type_t eap_name2type(char const *name)
 {
-	int i;
+	DICT_VALUE	*dv;
 
-	for (i = 0; i <= PW_EAP_MAX_TYPES; i++) {
-		if (strcmp(name, eap_types[i]) == 0) {
-			return i;
-		}
-	}
+	dv = dict_valbyname(PW_EAP_TYPE, 0, name);
+	if (!dv) return PW_EAP_INVALID;
 
-	return -1;
+	if (dv->value >= PW_EAP_MAX_TYPES) return PW_EAP_INVALID;
+
+	return dv->value;
 }
 
-/*
- *	Returns a text string containing the name of the EAP type.
+/** Return an EAP-name for a particular type
+ *
+ * Resolve
  */
-const char *eaptype_type2name(unsigned int type, char *buffer, size_t buflen)
+char const *eap_type2name(eap_type_t method)
 {
-	DICT_VALUE	*dval;
+	DICT_VALUE	*dv;
 
-	if (type > PW_EAP_MAX_TYPES) {
-		/*
-		 *	Prefer the dictionary name over a number,
-		 *	if it exists.
-		 */
-		dval = dict_valbyattr(PW_EAP_TYPE, 0, type);
-		if (dval) {
-			snprintf(buffer, buflen, "%s", dval->name);
-		}
+	dv = dict_valbyattr(PW_EAP_TYPE, 0, method);
+	if (dv) {
+		return dv->name;
+	}
 
-		snprintf(buffer, buflen, "%d", type);
-		return buffer;
-	} else if ((*eap_types[type] >= '0') && (*eap_types[type] <= '9')) {
-		/*
-		 *	Prefer the dictionary name, if it exists.
-		 */
-		dval = dict_valbyattr(PW_EAP_TYPE, 0, type);
-		if (dval) {
-			snprintf(buffer, buflen, "%s", dval->name);
-			return buffer;
-		} /* else it wasn't in the dictionary */
-	} /* else the name in the array was non-numeric */
-
-	/*
-	 *	Return the name, whatever it is.
-	 */
-	return eap_types[type];
+	return "unknown";
 }
 
 /*
@@ -178,19 +117,19 @@ const char *eaptype_type2name(unsigned int type, char *buffer, size_t buflen)
  *	based on code.
  *
  * INPUT to function is reply->code
- *                      reply->id
- *                      reply->type   - setup with data
+ *		      reply->id
+ *		      reply->type   - setup with data
  *
  * OUTPUT reply->packet is setup with wire format, and will
- *                      be malloc()'ed to the right size.
+ *		      be allocated to the right size.
  *
  */
-int eap_wireformat(EAP_PACKET *reply)
+int eap_wireformat(eap_packet_t *reply)
 {
-	eap_packet_t	*hdr;
+	eap_packet_raw_t	*header;
 	uint16_t total_length = 0;
 
-	if (reply == NULL) return EAP_INVALID;
+	if (!reply) return EAP_INVALID;
 
 	/*
 	 *	If reply->packet is set, then the wire format
@@ -200,30 +139,30 @@ int eap_wireformat(EAP_PACKET *reply)
 
 	total_length = EAP_HEADER_LEN;
 	if (reply->code < 3) {
-		total_length += 1/*EAPtype*/;
+		total_length += 1/* EAP Method */;
 		if (reply->type.data && reply->type.length > 0) {
 			total_length += reply->type.length;
 		}
 	}
 
-	reply->packet = (unsigned char *)malloc(total_length);
-	hdr = (eap_packet_t *)reply->packet;
-	if (!hdr) {
-		radlog(L_ERR, "rlm_eap: out of memory");
+	reply->packet = talloc_array(reply, uint8_t, total_length);
+	header = (eap_packet_raw_t *)reply->packet;
+	if (!header) {
 		return EAP_INVALID;
 	}
 
-	hdr->code = (reply->code & 0xFF);
-	hdr->id = (reply->id & 0xFF);
+	header->code = (reply->code & 0xFF);
+	header->id = (reply->id & 0xFF);
+
 	total_length = htons(total_length);
-	memcpy(hdr->length, &total_length, sizeof(total_length));
+	memcpy(header->length, &total_length, sizeof(total_length));
 
 	/*
 	 *	Request and Response packets are special.
 	 */
 	if ((reply->code == PW_EAP_REQUEST) ||
 	    (reply->code == PW_EAP_RESPONSE)) {
-		hdr->data[0] = (reply->type.type & 0xFF);
+		header->data[0] = (reply->type.num & 0xFF);
 
 		/*
 		 * Here since we cannot know the typedata format and length
@@ -234,8 +173,8 @@ int eap_wireformat(EAP_PACKET *reply)
 		 * type is defined
 		 */
 		if (reply->type.data && reply->type.length > 0) {
-			memcpy(&hdr->data[1], reply->type.data, reply->type.length);
-			free(reply->type.data);
+			memcpy(&header->data[1], reply->type.data, reply->type.length);
+			talloc_free(reply->type.data);
 			reply->type.data = reply->packet + EAP_HEADER_LEN + 1/*EAPtype*/;
 		}
 	}
@@ -248,20 +187,20 @@ int eap_wireformat(EAP_PACKET *reply)
  *	compose EAP reply packet in EAP-Message attr of RADIUS.  If
  *	EAP exceeds 253, frame it in multiple EAP-Message attrs.
  */
-int eap_basic_compose(RADIUS_PACKET *packet, EAP_PACKET *reply)
+int eap_basic_compose(RADIUS_PACKET *packet, eap_packet_t *reply)
 {
 	VALUE_PAIR *vp;
-	eap_packet_t *eap_packet;
+	eap_packet_raw_t *eap_packet;
 	int rcode;
 
 	if (eap_wireformat(reply) == EAP_INVALID) {
 		return RLM_MODULE_INVALID;
 	}
-	eap_packet = (eap_packet_t *)reply->packet;
+	eap_packet = (eap_packet_raw_t *)reply->packet;
 
 	pairdelete(&(packet->vps), PW_EAP_MESSAGE, 0, TAG_ANY);
 
-	vp = eap_packet2vp(eap_packet);
+	vp = eap_packet2vp(packet, eap_packet);
 	if (!vp) return RLM_MODULE_INVALID;
 	pairadd(&(packet->vps), vp);
 
@@ -274,9 +213,10 @@ int eap_basic_compose(RADIUS_PACKET *packet, EAP_PACKET *reply)
 	 */
 	vp = pairfind(packet->vps, PW_MESSAGE_AUTHENTICATOR, 0, TAG_ANY);
 	if (!vp) {
-		vp = paircreate(PW_MESSAGE_AUTHENTICATOR, 0, PW_TYPE_OCTETS);
-		memset(vp->vp_strvalue, 0, AUTH_VECTOR_LEN);
+		vp = paircreate(packet, PW_MESSAGE_AUTHENTICATOR, 0);
 		vp->length = AUTH_VECTOR_LEN;
+		vp->vp_octets = talloc_zero_array(vp, uint8_t, vp->length);
+
 		pairadd(&(packet->vps), vp);
 	}
 
@@ -285,21 +225,21 @@ int eap_basic_compose(RADIUS_PACKET *packet, EAP_PACKET *reply)
 	if (!packet->code) switch(reply->code) {
 	case PW_EAP_RESPONSE:
 	case PW_EAP_SUCCESS:
-		packet->code = PW_AUTHENTICATION_ACK;
+		packet->code = PW_CODE_AUTHENTICATION_ACK;
 		rcode = RLM_MODULE_HANDLED;
 		break;
 	case PW_EAP_FAILURE:
-		packet->code = PW_AUTHENTICATION_REJECT;
+		packet->code = PW_CODE_AUTHENTICATION_REJECT;
 		rcode = RLM_MODULE_REJECT;
 		break;
 	case PW_EAP_REQUEST:
-		packet->code = PW_ACCESS_CHALLENGE;
+		packet->code = PW_CODE_ACCESS_CHALLENGE;
 		rcode = RLM_MODULE_HANDLED;
 		break;
 	default:
 		/* Should never enter here */
-		radlog(L_ERR, "rlm_eap: reply code %d is unknown, Rejecting the request.", reply->code);
-		packet->code = PW_AUTHENTICATION_REJECT;
+		ERROR("rlm_eap: reply code %d is unknown, Rejecting the request.", reply->code);
+		packet->code = PW_CODE_AUTHENTICATION_REJECT;
 		break;
 	}
 
@@ -307,32 +247,36 @@ int eap_basic_compose(RADIUS_PACKET *packet, EAP_PACKET *reply)
 }
 
 
-VALUE_PAIR *eap_packet2vp(const eap_packet_t *packet)
+VALUE_PAIR *eap_packet2vp(RADIUS_PACKET *packet, eap_packet_raw_t const *eap)
 {
 	int		total, size;
-	const uint8_t	*ptr;
+	uint8_t const *ptr;
 	VALUE_PAIR	*head = NULL;
-	VALUE_PAIR	**tail = &head;
 	VALUE_PAIR	*vp;
+	vp_cursor_t	out;
 
-	total = packet->length[0] * 256 + packet->length[1];
+	total = eap->length[0] * 256 + eap->length[1];
 
-	ptr = (const uint8_t *) packet;
+	if (total == 0) {
+		DEBUG("Asked to encode empty EAP-Message!");
+		return NULL;
+	}
 
+	ptr = (uint8_t const *) eap;
+
+	fr_cursor_init(&out, &head);
 	do {
 		size = total;
 		if (size > 253) size = 253;
 
-		vp = paircreate(PW_EAP_MESSAGE, 0, PW_TYPE_OCTETS);
+		vp = paircreate(packet, PW_EAP_MESSAGE, 0);
 		if (!vp) {
 			pairfree(&head);
 			return NULL;
 		}
-		memcpy(vp->vp_octets, ptr, size);
-		vp->length = size;
+		pairmemcpy(vp, ptr, size);
 
-		*tail = vp;
-		tail = &(vp->next);
+		fr_cursor_insert(&out, vp);
 
 		ptr += size;
 		total -= size;
@@ -349,19 +293,20 @@ VALUE_PAIR *eap_packet2vp(const eap_packet_t *packet)
  * NOTE: Sometimes Framed-MTU might contain the length of EAP-Message,
  *      refer fragmentation in rfc2869.
  */
-eap_packet_t *eap_vp2packet(VALUE_PAIR *vps)
+eap_packet_raw_t *eap_vp2packet(TALLOC_CTX *ctx, VALUE_PAIR *vps)
 {
-	VALUE_PAIR *first, *vp;
-	eap_packet_t *eap_packet;
+	VALUE_PAIR *first, *i;
+	eap_packet_raw_t *eap_packet;
 	unsigned char *ptr;
 	uint16_t len;
 	int total_len;
+	vp_cursor_t cursor;
 
 	/*
 	 *	Get only EAP-Message attribute list
 	 */
 	first = pairfind(vps, PW_EAP_MESSAGE, 0, TAG_ANY);
-	if (first == NULL) {
+	if (!first) {
 		DEBUG("rlm_eap: EAP-Message not found");
 		return NULL;
 	}
@@ -370,7 +315,7 @@ eap_packet_t *eap_vp2packet(VALUE_PAIR *vps)
 	 *	Sanity check the length before doing anything.
 	 */
 	if (first->length < 4) {
-		DEBUG("rlm_eap: EAP packet is too short.");
+		DEBUG("rlm_eap: EAP packet is too short");
 		return NULL;
 	}
 
@@ -385,16 +330,17 @@ eap_packet_t *eap_vp2packet(VALUE_PAIR *vps)
 	 *	Take out even more weird things.
 	 */
 	if (len < 4) {
-		DEBUG("rlm_eap: EAP packet has invalid length.");
+		DEBUG("rlm_eap: EAP packet has invalid length");
 		return NULL;
 	}
 
 	/*
-	 *	Sanity check the length, BEFORE malloc'ing memory.
+	 *	Sanity check the length, BEFORE allocating  memory.
 	 */
 	total_len = 0;
-	for (vp = first; vp; vp = pairfind(vp->next, PW_EAP_MESSAGE, 0, TAG_ANY)) {
-		total_len += vp->length;
+	fr_cursor_init(&cursor, &first);
+	while ((i = fr_cursor_next_by_num(&cursor, PW_EAP_MESSAGE, 0, TAG_ANY))) {
+		total_len += i->length;
 
 		if (total_len > len) {
 			DEBUG("rlm_eap: Malformed EAP packet.  Length in packet header does not match actual length");
@@ -413,9 +359,8 @@ eap_packet_t *eap_vp2packet(VALUE_PAIR *vps)
 	/*
 	 *	Now that we know the lengths are OK, allocate memory.
 	 */
-	eap_packet = (eap_packet_t *) malloc(len);
-	if (eap_packet == NULL) {
-		radlog(L_ERR, "rlm_eap: out of memory");
+	eap_packet = (eap_packet_raw_t *) talloc_zero_array(ctx, uint8_t, len);
+	if (!eap_packet) {
 		return NULL;
 	}
 
@@ -425,10 +370,29 @@ eap_packet_t *eap_vp2packet(VALUE_PAIR *vps)
 	ptr = (unsigned char *)eap_packet;
 
 	/* RADIUS ensures order of attrs, so just concatenate all */
-	for (vp = first; vp; vp = pairfind(vp->next, PW_EAP_MESSAGE, 0, TAG_ANY)) {
-		memcpy(ptr, vp->vp_strvalue, vp->length);
-		ptr += vp->length;
+	fr_cursor_first(&cursor);
+	while ((i = fr_cursor_next_by_num(&cursor, PW_EAP_MESSAGE, 0, TAG_ANY))) {
+		memcpy(ptr, i->vp_strvalue, i->length);
+		ptr += i->length;
 	}
 
 	return eap_packet;
+}
+
+/*
+ *	Add raw hex data to the reply.
+ */
+void eap_add_reply(REQUEST *request,
+		   char const *name, uint8_t const *value, int len)
+{
+	VALUE_PAIR *vp;
+
+	vp = pairmake_reply(name, NULL, T_OP_EQ);
+	if (!vp) {
+		REDEBUG("Did not create attribute %s: %s\n",
+			name, fr_strerror());
+		return;
+	}
+
+	pairmemcpy(vp, value, len);
 }

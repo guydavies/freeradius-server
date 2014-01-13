@@ -8,40 +8,29 @@
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
 
-#ifdef WITH_SYSTEM_LTDL
-#define WITH_LIBLTDL
-#include <ltdl.h>
-
-#else
 #ifndef HAVE_DLFCN_H
 #error FreeRADIUS needs either libltdl, or a working dlopen()
-#endif	/* WITH_LIBLTDL */
-#endif	/* WITH_LIBLTDL */
+#else
+#include <dlfcn.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#ifndef WITH_LIBLTDL
 typedef void *lt_dlhandle;
 
-int lt_dlinit(void);
-lt_dlhandle lt_dlopenext(const char *name);
-void *lt_dlsym(lt_dlhandle handle, const char *symbol);
+lt_dlhandle lt_dlopenext(char const *name);
+void *lt_dlsym(lt_dlhandle handle, char const *symbol);
 int lt_dlclose(lt_dlhandle handle);
-const char *lt_dlerror(void);
-
-#define LTDL_SET_PRELOADED_SYMBOLS(_x)
-#define lt_dlexit(_x)
-#define lt_dlsetsearchpath(_x)
-#endif	/* WITH_LIBLTDL */
+char const *lt_dlerror(void);
 
 /*
  *	Keep track of which modules we've loaded.
  */
 typedef struct module_entry_t {
 	char			name[MAX_STRING_LEN];
-	const module_t		*module;
+	module_t const		*module;
 	lt_dlhandle		handle;
 } module_entry_t;
 
@@ -55,7 +44,7 @@ typedef struct fr_module_hup_t fr_module_hup_t;
 typedef struct module_instance_t {
 	char			name[MAX_STRING_LEN];
 	module_entry_t		*entry;
-	void                    *insthandle;
+	void		    *insthandle;
 #ifdef HAVE_PTHREAD_H
 	pthread_mutex_t		*mutex;
 #endif
@@ -64,7 +53,7 @@ typedef struct module_instance_t {
 	fr_module_hup_t	       	*mh;
 } module_instance_t;
 
-module_instance_t *find_module_instance(CONF_SECTION *, const char *instname,
+module_instance_t *find_module_instance(CONF_SECTION *, char const *instname,
 					int do_link);
 int module_hup_module(CONF_SECTION *cs, module_instance_t *node, time_t when);
 

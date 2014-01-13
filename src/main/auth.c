@@ -21,8 +21,6 @@
  * Copyright 2000  Miquel van Smoorenburg <miquels@cistron.nl>
  * Copyright 2000  Jeff Carneal <jeff@apex.net>
  */
-
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -40,7 +38,7 @@ char *auth_name(char *buf, size_t buflen, REQUEST *request, int do_cli)
 	VALUE_PAIR	*cli;
 	VALUE_PAIR	*pair;
 	int		port = 0;
-	const char	*tls = "";
+	char const	*tls = "";
 
 	if ((cli = pairfind(request->packet->vps, PW_CALLING_STATION_ID, 0, TAG_ANY)) == NULL)
 		do_cli = 0;
@@ -57,7 +55,7 @@ char *auth_name(char *buf, size_t buflen, REQUEST *request, int do_cli)
 
 	snprintf(buf, buflen, "from client %.128s port %u%s%.128s%s",
 			request->client->shortname, port,
-		 (do_cli ? " cli " : ""), (do_cli ? (char *)cli->vp_strvalue : ""),
+		 (do_cli ? " cli " : ""), (do_cli ? cli->vp_strvalue : ""),
 		 tls);
 
 	return buf;
@@ -69,14 +67,15 @@ char *auth_name(char *buf, size_t buflen, REQUEST *request, int do_cli)
  * Make sure user/pass are clean
  * and then log them
  */
-static int rad_authlog(const char *msg, REQUEST *request, int goodpass)
+static int rad_authlog(char const *msg, REQUEST *request, int goodpass)
 {
 	int logit;
-	const char *extra_msg = NULL;
+	char const *extra_msg = NULL;
 	char clean_password[1024];
 	char clean_username[1024];
 	char buf[1024];
 	char extra[1024];
+	char *p;
 	VALUE_PAIR *username = NULL;
 
 	if (!request->root->log_auth) {
@@ -86,7 +85,7 @@ static int rad_authlog(const char *msg, REQUEST *request, int goodpass)
 	/*
 	 * Get the correct username based on the configured value
 	 */
-	if (log_stripped_names == 0) {
+	if (!log_stripped_names) {
 		username = pairfind(request->packet->vps, PW_USER_NAME, 0, TAG_ANY);
 	} else {
 		username = request->username;
@@ -98,7 +97,7 @@ static int rad_authlog(const char *msg, REQUEST *request, int goodpass)
 	if (username == NULL) {
 		strcpy(clean_username, "<no User-Name attribute>");
 	} else {
-		fr_print_string((char *)username->vp_strvalue,
+		fr_print_string(username->vp_strvalue,
 				username->length,
 				clean_username, sizeof(clean_username));
 	}
@@ -122,7 +121,7 @@ static int rad_authlog(const char *msg, REQUEST *request, int goodpass)
 		} else if (pairfind(request->packet->vps, PW_CHAP_PASSWORD, 0, TAG_ANY)) {
 			strcpy(clean_password, "<CHAP-Password>");
 		} else {
-			fr_print_string((char *)request->password->vp_strvalue,
+			fr_print_string(request->password->vp_strvalue,
 					 request->password->length,
 					 clean_password, sizeof(clean_password));
 		}
@@ -138,13 +137,15 @@ static int rad_authlog(const char *msg, REQUEST *request, int goodpass)
 
 	if (extra_msg) {
 		extra[0] = ' ';
-		radius_xlat(extra + 1, sizeof(extra) - 1, extra_msg, request,
-			    NULL, NULL);
+		p = extra + 1;
+		if (radius_xlat(p, sizeof(extra) - 1, request, extra_msg, NULL, NULL) < 0) {
+			return -1;
+		}
 	} else {
 		*extra = '\0';
 	}
 
-	radlog_request(L_AUTH, 0, request, "%s: [%s%s%s] (%s)%s",
+	RAUTH("%s: [%s%s%s] (%s)%s",
 		       msg,
 		       clean_username,
 		       logit ? "/" : "",
@@ -167,8 +168,8 @@ static int rad_authlog(const char *msg, REQUEST *request, int goodpass)
  */
 static int rad_check_password(REQUEST *request)
 {
+	vp_cursor_t cursor;
 	VALUE_PAIR *auth_type_pair;
-	VALUE_PAIR *cur_config_item;
 	int auth_type = -1;
 	int result;
 	int auth_type_count = 0;
@@ -179,17 +180,15 @@ static int rad_check_password(REQUEST *request)
 	 *	if the authentication type is PW_AUTHTYPE_ACCEPT or
 	 *	PW_AUTHTYPE_REJECT.
 	 */
-	cur_config_item = request->config_items;
-	while(((auth_type_pair = pairfind(cur_config_item, PW_AUTH_TYPE, 0, TAG_ANY))) != NULL) {
+	fr_cursor_init(&cursor, &request->config_items);
+	while ((auth_type_pair = fr_cursor_next_by_num(&cursor, PW_AUTH_TYPE, 0, TAG_ANY))) {
 		auth_type = auth_type_pair->vp_integer;
 		auth_type_count++;
 
-		RDEBUG2("Found Auth-Type = %s",
-			dict_valnamebyattr(PW_AUTH_TYPE, 0, auth_type));
-		cur_config_item = auth_type_pair->next;
-
+		RDEBUG2("Found Auth-Type = %s", dict_valnamebyattr(PW_AUTH_TYPE, 0, auth_type));
 		if (auth_type == PW_AUTHTYPE_REJECT) {
 			RDEBUG2("Auth-Type = Reject, rejecting user");
+
 			return -2;
 		}
 	}
@@ -198,8 +197,8 @@ static int rad_check_password(REQUEST *request)
 	 *	Warn if more than one Auth-Type was found, because only the last
 	 *	one found will actually be used.
 	 */
-	if (( auth_type_count > 1) && (debug_flag)) {
-		radlog_request(L_ERR, 0, request, "Warning:  Found %d auth-types on request for user '%s'",
+	if ((auth_type_count > 1) && (debug_flag)) {
+		RERROR("Warning:  Found %d auth-types on request for user '%s'",
 			auth_type_count, request->username->vp_strvalue);
 	}
 
@@ -225,12 +224,12 @@ static int rad_check_password(REQUEST *request)
 	 */
 	if (auth_type < 0) {
 		if (pairfind(request->config_items, PW_CRYPT_PASSWORD, 0, TAG_ANY) != NULL) {
-			RDEBUG2("WARNING: Please update your configuration, and remove 'Auth-Type = Crypt'");
-			RDEBUG2("WARNING: Use the PAP module instead.");
+			RWDEBUG2("Please update your configuration, and remove 'Auth-Type = Crypt'");
+			RWDEBUG2("Use the PAP module instead");
 		}
 		else if (pairfind(request->config_items, PW_CLEARTEXT_PASSWORD, 0, TAG_ANY) != NULL) {
-			RDEBUG2("WARNING: Please update your configuration, and remove 'Auth-Type = Local'");
-			RDEBUG2("WARNING: Use the PAP or CHAP modules instead.");
+			RWDEBUG2("Please update your configuration, and remove 'Auth-Type = Local'");
+			RWDEBUG2("Use the PAP or CHAP modules instead");
 		}
 
 		/*
@@ -240,7 +239,7 @@ static int rad_check_password(REQUEST *request)
 	 	 *	This is fail-safe.
 	 	 */
 
-		RDEBUG2("ERROR: No authenticate method (Auth-Type) found for the request: Rejecting the user");
+		REDEBUG2("No Auth-Type found: rejecting the user via Post-Auth-Type = Reject");
 		return -2;
 	}
 
@@ -250,7 +249,7 @@ static int rad_check_password(REQUEST *request)
 	 *	status into the values as defined at
 	 *	the top of this function.
 	 */
-	result = module_authenticate(auth_type, request);
+	result = process_authenticate(auth_type, request);
 	switch (result) {
 		/*
 		 *	An authentication module FAIL
@@ -299,7 +298,7 @@ int rad_postauth(REQUEST *request)
 		RDEBUG2("Using Post-Auth-Type %s",
 			dict_valnamebyattr(PW_POST_AUTH_TYPE, 0, postauth_type));
 	}
-	result = module_post_auth(postauth_type, request);
+	result = process_post_auth(postauth_type, request);
 	switch (result) {
 		/*
 		 *	The module failed, or said to reject the user: Do so.
@@ -309,7 +308,7 @@ int rad_postauth(REQUEST *request)
 		case RLM_MODULE_REJECT:
 		case RLM_MODULE_USERLOCK:
 		default:
-			request->reply->code = PW_AUTHENTICATION_REJECT;
+			request->reply->code = PW_CODE_AUTHENTICATION_REJECT;
 			result = RLM_MODULE_REJECT;
 			break;
 		/*
@@ -339,19 +338,14 @@ int rad_postauth(REQUEST *request)
  */
 int rad_authenticate(REQUEST *request)
 {
-	VALUE_PAIR	*namepair;
 #ifdef WITH_SESSION_MGMT
 	VALUE_PAIR	*check_item;
 #endif
-	VALUE_PAIR	*auth_item = NULL;
 	VALUE_PAIR	*module_msg;
 	VALUE_PAIR	*tmp = NULL;
 	int		result;
-	const char	*password;
 	char		autz_retry = 0;
 	int		autz_type = 0;
-
-	password = "";
 
 #ifdef WITH_PROXY
 	/*
@@ -364,10 +358,10 @@ int rad_authenticate(REQUEST *request)
 		 *	Reply of ACCEPT means accept, thus set Auth-Type
 		 *	accordingly.
 		 */
-		case PW_AUTHENTICATION_ACK:
+		case PW_CODE_AUTHENTICATION_ACK:
 			tmp = radius_paircreate(request,
 						&request->config_items,
-						PW_AUTH_TYPE, 0, PW_TYPE_INTEGER);
+						PW_AUTH_TYPE, 0);
 			if (tmp) tmp->vp_integer = PW_AUTHTYPE_ACCEPT;
 			goto authenticate;
 
@@ -375,8 +369,8 @@ int rad_authenticate(REQUEST *request)
 		 *	Challenges are punted back to the NAS without any
 		 *	further processing.
 		 */
-		case PW_ACCESS_CHALLENGE:
-			request->reply->code = PW_ACCESS_CHALLENGE;
+		case PW_CODE_ACCESS_CHALLENGE:
+			request->reply->code = PW_CODE_ACCESS_CHALLENGE;
 			return RLM_MODULE_OK;
 		/*
 		 *	ALL other replies mean reject. (this is fail-safe)
@@ -385,10 +379,10 @@ int rad_authenticate(REQUEST *request)
 		 *	are being rejected, so we minimize the amount of work
 		 *	done by the server, by rejecting them here.
 		 */
-		case PW_AUTHENTICATION_REJECT:
+		case PW_CODE_AUTHENTICATION_REJECT:
 			rad_authlog("Login incorrect (Home Server says so)",
 				    request, 0);
-			request->reply->code = PW_AUTHENTICATION_REJECT;
+			request->reply->code = PW_CODE_AUTHENTICATION_REJECT;
 			return RLM_MODULE_REJECT;
 
 		default:
@@ -398,50 +392,21 @@ int rad_authenticate(REQUEST *request)
 		}
 	}
 #endif
-
-	/*
-	 *	Get the username from the request.
-	 *
-	 *	Note that namepair MAY be NULL, in which case there
-	 *	is no User-Name attribute in the request.
-	 */
-	namepair = request->username;
-
 	/*
 	 *	Look for, and cache, passwords.
 	 */
 	if (!request->password) {
 		request->password = pairfind(request->packet->vps, PW_USER_PASSWORD, 0, TAG_ANY);
 	}
-
-	/*
-	 *	Discover which password we want to use.
-	 */
-	auth_item = request->password;
-	if (auth_item) {
-		password = (const char *)auth_item->vp_strvalue;
-
-	} else {
-		/*
-		 *	Maybe there's a CHAP-Password?
-		 */
-		if ((auth_item = pairfind(request->packet->vps, PW_CHAP_PASSWORD, 0, TAG_ANY)) != NULL) {
-			password = "<CHAP-PASSWORD>";
-
-		} else {
-			/*
-			 *	No password we recognize.
-			 */
-			password = "<NO-PASSWORD>";
-		}
+	if (!request->password) {
+		request->password = pairfind(request->packet->vps, PW_CHAP_PASSWORD, 0, TAG_ANY);
 	}
-	request->password = auth_item;
 
 	/*
 	 *	Get the user's authorization information from the database
 	 */
 autz_redo:
-	result = module_authorize(autz_type, request);
+	result = process_authorize(autz_type, request);
 	switch (result) {
 		case RLM_MODULE_NOOP:
 		case RLM_MODULE_NOTFOUND:
@@ -463,7 +428,7 @@ autz_redo:
 			} else {
 				rad_authlog("Invalid user", request, 0);
 			}
-			request->reply->code = PW_AUTHENTICATION_REJECT;
+			request->reply->code = PW_CODE_AUTHENTICATION_REJECT;
 			return result;
 	}
 	if (!autz_retry) {
@@ -506,22 +471,17 @@ autz_redo:
 		 *	*the* LOCAL realm.
 		 */
 		if (realm &&(strcmp(realm->name, "LOCAL") != 0)) {
-			RDEBUG2("WARNING: You set Proxy-To-Realm = %s, but it is a LOCAL realm!  Cancelling proxy request.", realm->name);
+			RWDEBUG2("You set Proxy-To-Realm = %s, but it is a LOCAL realm!  Cancelling proxy request.", realm->name);
 		}
 
 		if (!realm) {
-			RDEBUG2("WARNING: You set Proxy-To-Realm = %s, but the realm does not exist!  Cancelling invalid proxy request.", tmp->vp_strvalue);
+			RWDEBUG2("You set Proxy-To-Realm = %s, but the realm does not exist!  Cancelling invalid proxy request.", tmp->vp_strvalue);
 		}
 	}
 
 #ifdef WITH_PROXY
  authenticate:
 #endif
-
-	/*
-	 *	Perhaps there is a Stripped-User-Name now.
-	 */
-	namepair = request->username;
 
 	/*
 	 *	Validate the user
@@ -542,8 +502,8 @@ autz_redo:
 	 *	wants to send back.
 	 */
 	if (result < 0) {
-		RDEBUG2("Failed to authenticate the user.");
-		request->reply->code = PW_AUTHENTICATION_REJECT;
+		RDEBUG2("Failed to authenticate the user");
+		request->reply->code = PW_CODE_AUTHENTICATION_REJECT;
 
 		if ((module_msg = pairfind(request->packet->vps, PW_MODULE_FAILURE_MESSAGE, 0, TAG_ANY)) != NULL){
 			char msg[MAX_STRING_LEN+19];
@@ -555,21 +515,24 @@ autz_redo:
 			rad_authlog("Login incorrect", request, 0);
 		}
 
-		/* double check: maybe the secret is wrong? */
-		if ((debug_flag > 1) && (auth_item != NULL) &&
-				(auth_item->attribute == PW_USER_PASSWORD)) {
-			uint8_t *p;
+		if (request->password) {
+			VERIFY_VP(request->password);
+			/* double check: maybe the secret is wrong? */
+			if ((debug_flag > 1) && (request->password->da->attr == PW_USER_PASSWORD)) {
+				uint8_t const *p;
 
-			p = (uint8_t *) auth_item->vp_strvalue;
-			while (*p) {
-				int size;
+				p = (uint8_t const *) request->password->vp_strvalue;
+				while (*p) {
+					int size;
 
-				size = fr_utf8_char(p);
-				if (!size) {
-					log_debug("  WARNING: Unprintable characters in the password.  Double-check the shared secret on the server and the NAS!");
-					break;
+					size = fr_utf8_char(p);
+					if (!size) {
+						RWDEBUG("Unprintable characters in the password.  Double-check the "
+							"shared secret on the server and the NAS!");
+						break;
+					}
+					p += size;
 				}
-				p += size;
 			}
 		}
 	}
@@ -580,7 +543,7 @@ autz_redo:
 		int r, session_type = 0;
 		char		logstr[1024];
 		char		umsg[MAX_STRING_LEN + 1];
-		const char	*user_msg = NULL;
+		char const	*user_msg = NULL;
 
 		tmp = pairfind(request->config_items, PW_SESSION_TYPE, 0, TAG_ANY);
 		if (tmp) {
@@ -593,8 +556,8 @@ autz_redo:
 		 *	User authenticated O.K. Now we have to check
 		 *	for the Simultaneous-Use parameter.
 		 */
-		if (namepair &&
-		    (r = module_checksimul(session_type, request, check_item->vp_integer)) != 0) {
+		if (request->username &&
+		    (r = process_checksimul(session_type, request, check_item->vp_integer)) != 0) {
 			char mpp_ok = 0;
 
 			if (r == 2){
@@ -617,16 +580,15 @@ autz_redo:
 					user_msg = "\r\nYou are already logged in - access denied\r\n\n";
 				}
 
-				request->reply->code = PW_AUTHENTICATION_REJECT;
+				request->reply->code = PW_CODE_AUTHENTICATION_REJECT;
 
 				/*
 				 *	They're trying to log in too many times.
 				 *	Remove ALL reply attributes.
 				 */
 				pairfree(&request->reply->vps);
-				radius_pairmake(request, &request->reply->vps,
-						"Reply-Message",
-						user_msg, T_OP_SET);
+				pairmake_reply("Reply-Message",
+					       user_msg, T_OP_SET);
 
 				snprintf(logstr, sizeof(logstr), "Multiple logins (max %d) %s",
 					check_item->vp_integer,
@@ -652,7 +614,7 @@ autz_redo:
 	 *	been set to something.  (i.e. Access-Challenge)
 	 */
 	if (request->reply->code == 0)
-	  request->reply->code = PW_AUTHENTICATION_ACK;
+	  request->reply->code = PW_CODE_AUTHENTICATION_ACK;
 
 	if ((module_msg = pairfind(request->packet->vps, PW_MODULE_SUCCESS_MESSAGE, 0, TAG_ANY)) != NULL){
 		char msg[MAX_STRING_LEN+12];
@@ -680,21 +642,19 @@ int rad_virtual_server(REQUEST *request)
 	 *	We currently only handle AUTH packets here.
 	 *	This could be expanded to handle other packets as well if required.
 	 */
-	rad_assert(request->packet->code == PW_AUTHENTICATION_REQUEST);
+	rad_assert(request->packet->code == PW_CODE_AUTHENTICATION_REQUEST);
 
 	result = rad_authenticate(request);
 
-        if (request->reply->code == PW_AUTHENTICATION_REJECT) {
-                pairdelete(&request->config_items, PW_POST_AUTH_TYPE, 0, TAG_ANY);
-                vp = radius_pairmake(request, &request->config_items,
-                                     "Post-Auth-Type", "Reject",
-                                     T_OP_SET);
-                if (vp) rad_postauth(request);
-        }
+	if (request->reply->code == PW_CODE_AUTHENTICATION_REJECT) {
+		pairdelete(&request->config_items, PW_POST_AUTH_TYPE, 0, TAG_ANY);
+		vp = pairmake_config("Post-Auth-Type", "Reject", T_OP_SET);
+		if (vp) rad_postauth(request);
+	}
 
-        if (request->reply->code == PW_AUTHENTICATION_ACK) {
-                rad_postauth(request);
-        }
+	if (request->reply->code == PW_CODE_AUTHENTICATION_ACK) {
+		rad_postauth(request);
+	}
 
 	return result;
 }

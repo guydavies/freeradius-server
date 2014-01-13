@@ -5,18 +5,18 @@
 ##  $Id$
 
 sqlippool dhcp_sqlippool {
-	sql-instance-name = "sql"
+	sql_instance_name = "sql"
 
 	ippool_table = "radippool"
 
-	lease-duration = 7200
+	lease_duration = 7200
 
 	# Client's MAC address is mapped to Calling-Station-Id in policy.conf
-	pool-key = "%{Calling-Station-Id}"
+	pool_key = "%{Calling-Station-Id}"
 
 	# For now, it only works with MySQL.
-	$INCLUDE ${confdir}/sql/mysql/ippool-dhcp.conf
- 
+	$INCLUDE ${modconfdir}/sql/ippool-dhcp/mysql/queries.conf
+
 	sqlippool_log_exists = "DHCP: Existing IP: %{reply:Framed-IP-Address} (did %{Called-Station-Id} cli %{Calling-Station-Id} port %{NAS-Port} user %{User-Name})"
 
 	sqlippool_log_success = "DHCP: Allocated IP: %{reply:Framed-IP-Address} from %{control:Pool-Name} (did %{Called-Station-Id} cli %{Calling-Station-Id} port %{NAS-Port} user %{User-Name})"

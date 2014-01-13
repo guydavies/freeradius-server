@@ -1,5 +1,5 @@
 /*
- * md4.h        Structures and prototypes for md4.
+ * md4.h	Structures and prototypes for md4.
  *
  * Version:     $Id$
  * License:		LGPL, but largely derived from a public domain source.
@@ -9,7 +9,6 @@
 #ifndef _FR_MD4_H
 #define _FR_MD4_H
 
-#include <freeradius-devel/ident.h>
 RCSIDH(md4_h, "$Id$")
 
 #ifdef HAVE_INTTYPES_H
@@ -34,7 +33,7 @@ RCSIDH(md4_h, "$Id$")
 extern "C" {
 #endif
 
-void fr_md4_calc (unsigned char *, const unsigned char *, unsigned int);
+void fr_md4_calc (unsigned char *, unsigned char const *, unsigned int);
 
 #ifndef WITH_OPENSSL_MD4
 /*  The below was retrieved from
@@ -76,16 +75,16 @@ typedef struct FR_MD4Context {
 
 /*__BEGIN_DECLS*/
 void	 fr_MD4Init(FR_MD4_CTX *);
-void	 fr_MD4Update(FR_MD4_CTX *, const uint8_t *, size_t)
+void	 fr_MD4Update(FR_MD4_CTX *, uint8_t const *, size_t)
 /*		__attribute__((__bounded__(__string__,2,3)))*/;
 void	 fr_MD4Final(uint8_t [MD4_DIGEST_LENGTH], FR_MD4_CTX *)
 /*		__attribute__((__bounded__(__minbytes__,1,MD4_DIGEST_LENGTH)))*/;
-void	 fr_MD4Transform(uint32_t [4], const uint8_t [MD4_BLOCK_LENGTH])
+void	 fr_MD4Transform(uint32_t [4], uint8_t const [MD4_BLOCK_LENGTH])
 /*		__attribute__((__bounded__(__minbytes__,1,4)))
 		__attribute__((__bounded__(__minbytes__,2,MD4_BLOCK_LENGTH)))*/;
 /*__END_DECLS*/
 #else  /* WITH_OPENSSL_MD4 */
-
+USES_APPLE_DEPRECATED_API
 #define FR_MD4_CTX	MD4_CTX
 #define fr_MD4Init	MD4_Init
 #define fr_MD4Update	MD4_Update

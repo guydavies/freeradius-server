@@ -18,7 +18,6 @@
  * Copyright 2000-2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/libradius.h>
@@ -42,10 +41,10 @@ static pthread_mutex_t fr_crypt_mutex;
  * performs a crypt password check in an thread-safe way.
  *
  * returns:  0 -- check succeeded
- *          -1 -- failed to crypt
- *           1 -- check failed
+ *	  -1 -- failed to crypt
+ *	   1 -- check failed
  */
-int fr_crypt_check(const char *key, const char *crypted)
+int fr_crypt_check(char const *key, char const *crypted)
 {
 	char *passwd;
 	int cmp = 0;

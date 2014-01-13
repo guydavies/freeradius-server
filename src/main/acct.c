@@ -23,7 +23,6 @@
  * Copyright 2000  Alan Curry <pacman@world.std.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -91,7 +90,7 @@ int rad_accounting(REQUEST *request)
 			DEBUG2("  Found Acct-Type %s",
 			       dict_valnamebyattr(PW_ACCT_TYPE, 0, acct_type));
 		}
-		result = module_accounting(acct_type, request);
+		result = process_accounting(acct_type, request);
 		switch (result) {
 			/*
 			 *	In case the accounting module returns FAIL,
@@ -159,13 +158,9 @@ int rad_accounting(REQUEST *request)
 		 */
 		case RLM_MODULE_OK:
 		case RLM_MODULE_UPDATED:
-			request->reply->code = PW_ACCOUNTING_RESPONSE;
+			request->reply->code = PW_CODE_ACCOUNTING_RESPONSE;
 			break;
-		/*
-		 *	The module handled the request, don't reply.
-		 */
-		case RLM_MODULE_HANDLED:
-			break;
+
 		/*
 		 *	Failed to log or to proxy the accounting data,
 		 *	therefore don't reply to the NAS.

@@ -31,13 +31,13 @@ detail {
 	#  be ONE "listen" section reading detail files from a
 	#  particular directory.
 	#
-	detailfile = ${radacctdir}/%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}}/detail-%Y%m%d
+	filename = ${radacctdir}/%{%{Packet-Src-IP-Address}:-%{Packet-Src-IPv6-Address}}/detail-%Y%m%d
 
 	#
-	#  If you are using radrelay, delete the above line for "detailfile",
+	#  If you are using radrelay, delete the above line for "file",
 	#  and use this one instead:
 	#
-#	detailfile = ${radacctdir}/detail
+#	filename = ${radacctdir}/detail
 
 	#
 	#  The Unix-style permissions on the 'detail' file.
@@ -46,7 +46,7 @@ detail {
 	#  information about users.  So by keeping the file
 	#  permissions restrictive, we can prevent unwanted
 	#  people from seeing that information.
-	detailperm = 0600
+	permissions = 0600
 
 	# The Unix group of the log file.
 	#
@@ -60,7 +60,7 @@ detail {
 	#  is a timestamp.  By default, we use the ctime
 	#  format (see "man ctime" for details).
 	#
-	#  The header can be customized by editing this
+	#  The header can be customised by editing this
 	#  string.  See "doc/variables.txt" for a description
 	#  of what can be put here.
 	#

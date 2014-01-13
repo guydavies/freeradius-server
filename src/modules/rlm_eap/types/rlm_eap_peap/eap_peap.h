@@ -23,7 +23,6 @@
 #ifndef _EAP_PEAP_H
 #define _EAP_PEAP_H
 
-#include <freeradius-devel/ident.h>
 RCSIDH(eap_peap_h, "$Id$")
 
 #include "eap_tls.h"
@@ -35,13 +34,13 @@ typedef struct peap_tunnel_t {
 	VALUE_PAIR	*accept_vps;
 	int		status;
 	int		home_access_accept;
-	int		default_eap_type;
+	int		default_method;
 	int		copy_request_to_tunnel;
 	int		use_tunneled_reply;
 	int		proxy_tunneled_request_as_eap;
-	const char	*virtual_server;
+	char const	*virtual_server;
 	int		soh;
-	const char	*soh_virtual_server;
+	char const	*soh_virtual_server;
 	VALUE_PAIR	*soh_reply_vps;
 	int		session_resumption_state;
 } peap_tunnel_t;
@@ -68,5 +67,5 @@ typedef struct peap_tunnel_t {
 /*
  *	Process the PEAP portion of an EAP-PEAP request.
  */
-int eappeap_process(EAP_HANDLER *handler, tls_session_t *tls_session);
+rlm_rcode_t eappeap_process(eap_handler_t *handler, tls_session_t *tls_session);
 #endif /* _EAP_PEAP_H */

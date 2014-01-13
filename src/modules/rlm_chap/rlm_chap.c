@@ -12,40 +12,35 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_chap.c
  * @brief Process chap authentication requests.
- * 
+ *
  * @copyright 2001,2006  The FreeRADIUS server project
  * @copyright 2001  Kostas Kalevras <kkalev@noc.ntua.gr>
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
 
-static rlm_rcode_t chap_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t mod_authorize(UNUSED void *instance,
+				  UNUSED REQUEST *request)
 {
-
-	/* quiet the compiler */
-	instance = instance;
-	request = request;
-
 	if (!pairfind(request->packet->vps, PW_CHAP_PASSWORD, 0, TAG_ANY)) {
 		return RLM_MODULE_NOOP;
 	}
 
 	if (pairfind(request->config_items, PW_AUTHTYPE, 0, TAG_ANY) != NULL) {
-		RDEBUG2("WARNING: Auth-Type already set.  Not setting to CHAP");
+		RWDEBUG2("Auth-Type already set.  Not setting to CHAP");
 		return RLM_MODULE_NOOP;
 	}
 
 	RDEBUG("Setting 'Auth-Type := CHAP'");
-	pairadd(&request->config_items,
-		pairmake("Auth-Type", "CHAP", T_OP_EQ));
+	pairmake_config("Auth-Type", "CHAP", T_OP_EQ);
+
 	return RLM_MODULE_OK;
 }
 
@@ -56,64 +51,55 @@ static rlm_rcode_t chap_authorize(void *instance, REQUEST *request)
  *	from the database. The authentication code only needs to check
  *	the password, the rest is done here.
  */
-static rlm_rcode_t chap_authenticate(void *instance, REQUEST *request)
+static rlm_rcode_t mod_authenticate(UNUSED void *instance,
+				     REQUEST *request)
 {
 	VALUE_PAIR *passwd_item, *chap;
 	uint8_t pass_str[MAX_STRING_LEN];
-	VALUE_PAIR *module_fmsg_vp;
-	char module_fmsg[MAX_STRING_LEN];
-
-	/* quiet the compiler */
-	instance = instance;
-	request = request;
 
 	if (!request->username) {
-		radlog_request(L_AUTH, 0, request, "rlm_chap: Attribute \"User-Name\" is required for authentication.\n");
+		RWDEBUG("Attribute 'User-Name' is required for authentication.\n");
 		return RLM_MODULE_INVALID;
 	}
 
 	chap = pairfind(request->packet->vps, PW_CHAP_PASSWORD, 0, TAG_ANY);
 	if (!chap) {
-		RDEBUG("ERROR: You set 'Auth-Type = CHAP' for a request that does not contain a CHAP-Password attribute!");
+		REDEBUG("You set 'Auth-Type = CHAP' for a request that does not contain a CHAP-Password attribute!");
 		return RLM_MODULE_INVALID;
 	}
 
 	if (chap->length == 0) {
-		RDEBUG("ERROR: CHAP-Password is empty");
+		REDEBUG("CHAP-Password is empty");
 		return RLM_MODULE_INVALID;
 	}
 
 	if (chap->length != CHAP_VALUE_LENGTH + 1) {
-		RDEBUG("ERROR: CHAP-Password has invalid length");
+		REDEBUG("CHAP-Password has invalid length");
 		return RLM_MODULE_INVALID;
 	}
 
 	/*
 	 *	Don't print out the CHAP password here.  It's binary crap.
 	 */
-	RDEBUG("login attempt by \"%s\" with CHAP password",
+	RDEBUG("Login attempt by \"%s\" with CHAP password",
 		request->username->vp_strvalue);
 
 	if ((passwd_item = pairfind(request->config_items, PW_CLEARTEXT_PASSWORD, 0, TAG_ANY)) == NULL){
-		if ((passwd_item = pairfind(request->config_items, PW_USER_PASSWORD, 0, TAG_ANY)) != NULL){
-			RDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-			RDEBUG("!!! Please update your configuration so that the \"known !!!");
-			RDEBUG("!!! good\" clear text password is in Cleartext-Password, !!!");
-			RDEBUG("!!! and NOT in User-Password.                           !!!");
-			RDEBUG("!!!                                                     !!!");
-			RDEBUG("!!! Authentication will fail because of this.           !!!");
-			RDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+		if (pairfind(request->config_items, PW_USER_PASSWORD, 0, TAG_ANY) != NULL){
+			REDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+			REDEBUG("!!! Please update your configuration so that the \"known !!!");
+			REDEBUG("!!! good\" clear text password is in Cleartext-Password, !!!");
+			REDEBUG("!!! and NOT in User-Password.                            !!!");
+			REDEBUG("!!!						          !!!");
+			REDEBUG("!!! Authentication will fail because of this.	          !!!");
+			REDEBUG("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
 		}
-		RDEBUG("Cleartext-Password is required for authentication");
-		snprintf(module_fmsg, sizeof(module_fmsg),
-			 "rlm_chap: Clear text password not available");
-		module_fmsg_vp = pairmake("Module-Failure-Message",
-					  module_fmsg, T_OP_EQ);
-		pairadd(&request->packet->vps, module_fmsg_vp);
+
+		REDEBUG("Clear-Text password is required for authentication");
 		return RLM_MODULE_INVALID;
 	}
 
-	RDEBUG("Using clear text password \"%s\" for user %s authentication.",
+	RDEBUG("Using Clear-Text password \"%s\" for user %s authentication.",
 	      passwd_item->vp_strvalue, request->username->vp_strvalue);
 
 	rad_chap_encode(request->packet,pass_str,
@@ -121,20 +107,46 @@ static rlm_rcode_t chap_authenticate(void *instance, REQUEST *request)
 
 	if (rad_digest_cmp(pass_str + 1, chap->vp_octets + 1,
 			   CHAP_VALUE_LENGTH) != 0) {
-		RDEBUG("Password check failed");
-		snprintf(module_fmsg, sizeof(module_fmsg),
-			 "rlm_chap: Wrong user password");
-		module_fmsg_vp = pairmake("Module-Failure-Message",
-					  module_fmsg, T_OP_EQ);
-		pairadd(&request->packet->vps, module_fmsg_vp);
+		REDEBUG("Password is comparison failed: password is incorrect");
 		return RLM_MODULE_REJECT;
 	}
 
-	RDEBUG("chap user %s authenticated succesfully",
+	RDEBUG("CHAP user \"%s\" authenticated successfully",
 	      request->username->vp_strvalue);
 
 	return RLM_MODULE_OK;
 }
+
+
+/*
+ *	Access-Requests can have the CHAP-Challenge implicitly taken
+ *	from the request authenticator.  If the NAS has done that,
+ *	then we need to copy the data to a real CHAP-Challenge
+ *	attribute when proxying.  Otherwise when we proxy the request,
+ *	the new authenticator is different, and the CHAP calculations
+ *	will fail.
+ */
+static rlm_rcode_t mod_pre_proxy(UNUSED void *instance,
+				 REQUEST *request)
+{
+	VALUE_PAIR *vp;
+
+	/*
+	 *	For Access-Requests, which have CHAP-Password,
+	 *	and no CHAP-Challenge, copy it over from the request.
+	 */
+	if (request->packet->code != PW_CODE_AUTHENTICATION_REQUEST) return RLM_MODULE_NOOP;
+
+	if (!pairfind(request->proxy->vps, PW_CHAP_PASSWORD, 0, TAG_ANY)) return RLM_MODULE_NOOP;
+
+	vp = radius_paircreate(request, &request->proxy->vps, PW_CHAP_CHALLENGE, 0);
+	if (!vp) return RLM_MODULE_FAIL;
+
+	pairmemcpy(vp, request->packet->vector, sizeof(request->packet->vector));
+
+	return RLM_MODULE_OK;
+}
+
 
 /*
  *	The module name should be the only globally exported symbol.
@@ -149,15 +161,17 @@ module_t rlm_chap = {
 	 RLM_MODULE_INIT,
 	"CHAP",
 	RLM_TYPE_CHECK_CONFIG_SAFE,   	/* type */
+	 0,
+	 NULL,				/* CONF_PARSER */
 	NULL,				/* instantiation */
 	NULL,				/* detach */
 	{
-		chap_authenticate,	/* authentication */
-		chap_authorize,	 	/* authorization */
+		mod_authenticate,	/* authentication */
+		mod_authorize,	 	/* authorization */
 		NULL,			/* preaccounting */
 		NULL,			/* accounting */
 		NULL,			/* checksimul */
-		NULL,			/* pre-proxy */
+		mod_pre_proxy,	      	/* pre-proxy */
 		NULL,			/* post-proxy */
 		NULL			/* post-auth */
 	},

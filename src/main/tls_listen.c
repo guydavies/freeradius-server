@@ -22,8 +22,8 @@
  * Copyright 2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
+USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/process.h>
@@ -50,7 +50,7 @@ RCSID("$Id$")
 #define PTHREAD_MUTEX_UNLOCK(_x)
 #endif
 
-static void dump_hex(const char *msg, const uint8_t *data, size_t data_len)
+static void dump_hex(char const *msg, uint8_t const *data, size_t data_len)
 {
 	size_t i;
 
@@ -72,9 +72,9 @@ static void tls_socket_close(rad_listen_t *listener)
 {
 	listen_socket_t *sock = listener->data;
 
-	listener->status = RAD_LISTEN_STATUS_REMOVE_FD;
+	listener->status = RAD_LISTEN_STATUS_REMOVE_NOW;
 	listener->tls = NULL; /* parent owns this! */
-	
+
 	if (sock->parent) {
 		/*
 		 *	Decrement the number of connections.
@@ -86,13 +86,13 @@ static void tls_socket_close(rad_listen_t *listener)
 			sock->client->limit.num_connections--;
 		}
 	}
-	
+
 	/*
 	 *	Tell the event handler that an FD has disappeared.
 	 */
 	DEBUG("Client has closed connection");
 	event_new_fd(listener);
-	
+
 	/*
 	 *	Do NOT free the listener here.  It's in use by
 	 *	a request, and will need to hang around until
@@ -109,14 +109,14 @@ static int tls_socket_write(rad_listen_t *listener, REQUEST *request)
 	listen_socket_t *sock = listener->data;
 
 	p = sock->ssn->dirty_out.data;
-	
+
 	while (p < (sock->ssn->dirty_out.data + sock->ssn->dirty_out.used)) {
 		RDEBUG3("Writing to socket %d", request->packet->sockfd);
 		rcode = write(request->packet->sockfd, p,
 			      (sock->ssn->dirty_out.data + sock->ssn->dirty_out.used) - p);
 		if (rcode <= 0) {
-			RDEBUG("Error writing to TLS socket: %s", strerror(errno));
-			
+			RDEBUG("Error writing to TLS socket: %s", fr_syserror(errno));
+
 			tls_socket_close(listener);
 			return 0;
 		}
@@ -124,14 +124,14 @@ static int tls_socket_write(rad_listen_t *listener, REQUEST *request)
 	}
 
 	sock->ssn->dirty_out.used = 0;
-	
+
 	return 1;
 }
 
 
 static int tls_socket_recv(rad_listen_t *listener)
 {
-	int doing_init = FALSE;
+	int doing_init = false;
 	ssize_t rcode;
 	RADIUS_PACKET *packet;
 	REQUEST *request;
@@ -140,7 +140,7 @@ static int tls_socket_recv(rad_listen_t *listener)
 	RADCLIENT *client = sock->client;
 
 	if (!sock->packet) {
-		sock->packet = rad_alloc(0);
+		sock->packet = rad_alloc(sock, 0);
 		if (!sock->packet) return 0;
 
 		sock->packet->sockfd = listener->fd;
@@ -149,16 +149,19 @@ static int tls_socket_recv(rad_listen_t *listener)
 		sock->packet->dst_ipaddr = sock->my_ipaddr;
 		sock->packet->dst_port = sock->my_port;
 
-		if (sock->request) sock->request->packet = sock->packet;
+		if (sock->request) {
+			(void) talloc_steal(sock->request, sock->packet);
+			sock->request->packet = sock->packet;
+		}
 	}
 
 	/*
 	 *	Allocate a REQUEST for debugging.
 	 */
 	if (!sock->request) {
-		sock->request = request = request_alloc();
+		sock->request = request = request_alloc(NULL);
 		if (!sock->request) {
-			radlog(L_ERR, "Out of memory");
+			ERROR("Out of memory");
 			return 0;
 		}
 
@@ -172,10 +175,8 @@ static int tls_socket_recv(rad_listen_t *listener)
 		/*
 		 *	Not sure if we should do this on every packet...
 		 */
-		request->reply = rad_alloc(0);
+		request->reply = rad_alloc(request, 0);
 		if (!request->reply) return 0;
-
-		request->options = RAD_REQUEST_OPTION_DEBUG2;
 
 		rad_assert(sock->ssn == NULL);
 
@@ -187,10 +188,11 @@ static int tls_socket_recv(rad_listen_t *listener)
 			return 0;
 		}
 
+		(void) talloc_steal(sock, sock->ssn);
 		SSL_set_ex_data(sock->ssn->ssl, FR_TLS_EX_INDEX_REQUEST, (void *)request);
 		SSL_set_ex_data(sock->ssn->ssl, FR_TLS_EX_INDEX_CERTS, (void *)&request->packet->vps);
 
-		doing_init = TRUE;
+		doing_init = true;
 	}
 
 	rad_assert(sock->request != NULL);
@@ -211,9 +213,9 @@ static int tls_socket_recv(rad_listen_t *listener)
 		tls_socket_close(listener);
 		return 0;
 	}
-	
+
 	if (rcode < 0) {
-		RDEBUG("Error reading TLS socket: %s", strerror(errno));
+		RDEBUG("Error reading TLS socket: %s", fr_syserror(errno));
 		goto do_close;
 	}
 
@@ -221,10 +223,8 @@ static int tls_socket_recv(rad_listen_t *listener)
 	 *	Normal socket close.
 	 */
 	if (rcode == 0) goto do_close;
-	
+
 	sock->ssn->dirty_in.used = rcode;
-	memset(sock->ssn->dirty_in.data + sock->ssn->dirty_in.used,
-	       0, 16);
 
 	dump_hex("READ FROM SSL", sock->ssn->dirty_in.data, sock->ssn->dirty_in.used);
 
@@ -235,7 +235,7 @@ static int tls_socket_recv(rad_listen_t *listener)
 		RDEBUG("Non-TLS data sent to TLS socket: closing");
 		goto do_close;
 	}
-	
+
 	/*
 	 *	Skip ahead to reading application data.
 	 */
@@ -245,7 +245,7 @@ static int tls_socket_recv(rad_listen_t *listener)
 		RDEBUG("FAILED in TLS handshake receive");
 		goto do_close;
 	}
-	
+
 	if (sock->ssn->dirty_out.used > 0) {
 		tls_socket_write(listener, request);
 		PTHREAD_MUTEX_UNLOCK(&sock->mutex);
@@ -287,13 +287,13 @@ app:
 	}
 
 	packet = sock->packet;
-	packet->data = rad_malloc(sock->ssn->clean_out.used);
+	packet->data = talloc_array(packet, uint8_t, sock->ssn->clean_out.used);
 	packet->data_len = sock->ssn->clean_out.used;
 	sock->ssn->record_minus(&sock->ssn->clean_out, packet->data, packet->data_len);
 	packet->vps = NULL;
 	PTHREAD_MUTEX_UNLOCK(&sock->mutex);
 
-	if (!rad_packet_ok(packet, 0)) {
+	if (!rad_packet_ok(packet, 0, NULL)) {
 		RDEBUG("Received bad packet: %s", fr_strerror());
 		tls_socket_close(listener);
 		return 0;	/* do_close unlocks the mutex */
@@ -346,30 +346,45 @@ int dual_tls_recv(rad_listen_t *listener)
 	rad_assert(sock->request->packet != NULL);
 	rad_assert(sock->packet != NULL);
 	rad_assert(sock->ssn != NULL);
+	rad_assert(client != NULL);
 
 	request = sock->request;
 	packet = sock->packet;
 
 	/*
 	 *	Some sanity checks, based on the packet code.
+	 *
+	 *	"auth+acct" are marked as "auth", with the "dual" flag
+	 *	set.
 	 */
 	switch(packet->code) {
-	case PW_AUTHENTICATION_REQUEST:
+	case PW_CODE_AUTHENTICATION_REQUEST:
 		if (listener->type != RAD_LISTEN_AUTH) goto bad_packet;
 		FR_STATS_INC(auth, total_requests);
 		fun = rad_authenticate;
 		break;
 
-	case PW_ACCOUNTING_REQUEST:
-		if (listener->type != RAD_LISTEN_ACCT) goto bad_packet;
+#ifdef WITH_ACCOUNTING
+	case PW_CODE_ACCOUNTING_REQUEST:
+		if (listener->type != RAD_LISTEN_ACCT) {
+			/*
+			 *	Allow auth + dual.  Disallow
+			 *	everything else.
+			 */
+			if (!((listener->type == RAD_LISTEN_AUTH) &&
+			      (listener->dual))) {
+				    goto bad_packet;
+			}
+		}
 		FR_STATS_INC(acct, total_requests);
 		fun = rad_accounting;
 		break;
+#endif
 
-	case PW_STATUS_SERVER:
+	case PW_CODE_STATUS_SERVER:
 		if (!mainconfig.status_server) {
 			FR_STATS_INC(auth, total_unknown_types);
-			DEBUG("WARNING: Ignoring Status-Server request due to security configuration");
+			WDEBUG("Ignoring Status-Server request due to security configuration");
 			rad_free(&sock->packet);
 			request->packet = NULL;
 			return 0;
@@ -437,7 +452,7 @@ int dual_tls_send(rad_listen_t *listener, REQUEST *request)
 		RDEBUG("Failed signing packet: %s", fr_strerror());
 		return 0;
 	}
-	
+
 	PTHREAD_MUTEX_LOCK(&sock->mutex);
 	/*
 	 *	Write the packet to the SSL buffers.
@@ -464,6 +479,7 @@ int dual_tls_send(rad_listen_t *listener, REQUEST *request)
 }
 
 
+#ifdef WITH_PROXY
 int proxy_tls_recv(rad_listen_t *listener)
 {
 	int rcode;
@@ -473,7 +489,11 @@ int proxy_tls_recv(rad_listen_t *listener)
 	RADIUS_PACKET *packet;
 	uint8_t *data;
 
-	if (!sock->data) sock->data = rad_malloc(sock->ssn->offset);
+	/*
+	 *	Get the maximum size of data to receive.
+	 */
+	if (!sock->data) sock->data = talloc_array(sock, uint8_t,
+						   sock->ssn->offset);
 	data = sock->data;
 
 	DEBUG3("Proxy SSL socket has data to read");
@@ -502,7 +522,7 @@ redo:
 				DEBUG("proxy recv says %s",
 				      ERR_error_string(err, NULL));
 			}
-			
+
 			goto do_close;
 		}
 	}
@@ -512,12 +532,11 @@ redo:
 	       (unsigned int) length);
 
 	if (length > sock->ssn->offset) {
-		radlog(L_INFO,
-		       "Received packet will be too large! Set \"fragment_size=%u\"",
+		INFO("Received packet will be too large! Set \"fragment_size=%u\"",
 		       (data[2] << 8) | data[3]);
 		goto do_close;
 	}
-	
+
 	rcode = SSL_read(sock->ssn->ssl, data + 4, length);
 	if (rcode <= 0) {
 		switch (SSL_get_error(sock->ssn->ssl, rcode)) {
@@ -535,7 +554,7 @@ redo:
 	}
 	PTHREAD_MUTEX_UNLOCK(&sock->mutex);
 
-	packet = rad_alloc(0);
+	packet = rad_alloc(sock, 0);
 	packet->sockfd = listener->fd;
 	packet->src_ipaddr = sock->other_ipaddr;
 	packet->src_port = sock->other_port;
@@ -544,7 +563,7 @@ redo:
 	packet->code = data[0];
 	packet->id = data[1];
 	packet->data_len = length;
-	packet->data = rad_malloc(packet->data_len);
+	packet->data = talloc_array(packet, uint8_t, packet->data_len);
 	memcpy(packet->data, data, packet->data_len);
 	memcpy(packet->vector, packet->data + 4, 16);
 
@@ -552,13 +571,13 @@ redo:
 	 *	FIXME: Client MIB updates?
 	 */
 	switch(packet->code) {
-	case PW_AUTHENTICATION_ACK:
-	case PW_ACCESS_CHALLENGE:
-	case PW_AUTHENTICATION_REJECT:
+	case PW_CODE_AUTHENTICATION_ACK:
+	case PW_CODE_ACCESS_CHALLENGE:
+	case PW_CODE_AUTHENTICATION_REJECT:
 		break;
 
 #ifdef WITH_ACCOUNTING
-	case PW_ACCOUNTING_RESPONSE:
+	case PW_CODE_ACCOUNTING_RESPONSE:
 		break;
 #endif
 
@@ -566,7 +585,7 @@ redo:
 		/*
 		 *	FIXME: Update MIB for packet types?
 		 */
-		radlog(L_ERR, "Invalid packet code %d sent to a proxy port "
+		ERROR("Invalid packet code %d sent to a proxy port "
 		       "from home server %s port %d - ID %d : IGNORED",
 		       packet->code,
 		       ip_ntoh(&packet->src_ipaddr, buffer, sizeof(buffer)),
@@ -616,5 +635,6 @@ int proxy_tls_send(rad_listen_t *listener, REQUEST *request)
 
 	return 1;
 }
+#endif	/* WITH_PROXY */
 
 #endif	/* WITH_TLS */

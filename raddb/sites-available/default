@@ -8,7 +8,7 @@
 #	directory to these files.  This is done in a normal installation.
 #
 #	If you are using 802.1X (EAP) authentication, please see also
-#	the "inner-tunnel" virtual server.  You wll likely have to edit
+#	the "inner-tunnel" virtual server.  You will likely have to edit
 #	that, too, for authentication to work.
 #
 #	$Id$
@@ -47,7 +47,7 @@
 server default {
 #
 #  If you want the server to listen on additional addresses, or on
-#  additionnal ports, you can use multiple "listen" sections.
+#  additional ports, you can use multiple "listen" sections.
 #
 #  Each section make the server listen for only one type of packet,
 #  therefore authentication and accounting have to be configured in
@@ -174,28 +174,36 @@ listen {
 #	interface = eth0
 #	clients = per_socket_clients
 
-	#  The number of packets received can be rate limited via the
-	#  "max_pps" configuration item.  When it is set, the server
-	#  tracks the total number of packets received in the previous
-	#  second.  If the count is greater than "max_pps", then the
-	#  new packet is silently discarded.  This helps the server
-	#  deal with overload situations.
-	#
-	#  The packets/s counter is tracked in a sliding window.  This
-	#  means that the pps calculation is done for the second
-	#  before the current packet was received.  NOT for the current
-	#  wall-clock second, and NOT for the previous wall-clock second.
-	#
-	#  Useful values are 0 (no limit), or 100 to 10000.
-	#  Values lower than 100 will likely cause the server to ignore
-	#  normal traffic.  Few systems are capable of handling more than
-	#  10K packets/s.
-	#
-	#  It is most useful for accounting systems.  Set it to 50%
-	#  more than the normal accounting load, and you can be sure that
-	#  the server will never get overloaded
-	#  
-#	max_pps = 0
+	limit {
+		#  The number of packets received can be rate limited via the
+		#  "max_pps" configuration item.  When it is set, the server
+		#  tracks the total number of packets received in the previous
+		#  second.  If the count is greater than "max_pps", then the
+		#  new packet is silently discarded.  This helps the server
+		#  deal with overload situations.
+		#
+		#  The packets/s counter is tracked in a sliding window.  This
+		#  means that the pps calculation is done for the second
+		#  before the current packet was received.  NOT for the current
+		#  wall-clock second, and NOT for the previous wall-clock second.
+		#
+		#  Useful values are 0 (no limit), or 100 to 10000.
+		#  Values lower than 100 will likely cause the server to ignore
+		#  normal traffic.  Few systems are capable of handling more than
+		#  10K packets/s.
+		#
+		#  It is most useful for accounting systems.  Set it to 50%
+		#  more than the normal accounting load, and you can be sure that
+		#  the server will never get overloaded
+		#
+#		max_pps = 0
+
+		# Only for "proto = tcp". These are ignored for "udp" sockets.
+		#
+#		idle_timeout = 0
+#		lifetime = 0
+#		max_connections = 0
+	}
 }
 
 #  Authorization. First preprocess (hints and huntgroups files),
@@ -207,12 +215,12 @@ listen {
 #  The order of the realm modules will determine the order that
 #  we try to find a matching realm.
 #
-#  Make *sure* that 'preprocess' comes before any realm if you 
+#  Make *sure* that 'preprocess' comes before any realm if you
 #  need to setup hints for the remote radius server
 authorize {
 	#
 	#  Take a User-Name, and perform some checks on it, for spaces and other
-	#  invalid characters.  If the User-Name appears invalid, reject the 
+	#  invalid characters.  If the User-Name appears invalid, reject the
 	#  request.
 	#
 	#  See policy.d/filter for the definition of the filter_username policy.
@@ -228,16 +236,16 @@ authorize {
 	#  'raddb/huntgroups' files.
 	preprocess
 
-        #  If you intend to use CUI and you require that the Operator-Name
-        #  be set for CUI generation and you want to generate CUI also
-        #  for your local clients then uncomment the operator-name
-        #  below and set the operator-name for your clients in clients.conf
+	#  If you intend to use CUI and you require that the Operator-Name
+	#  be set for CUI generation and you want to generate CUI also
+	#  for your local clients then uncomment the operator-name
+	#  below and set the operator-name for your clients in clients.conf
 #       operator-name
 
-        #
-        #  If you want to generate CUI for some clients that do not
-        #  send proper CUI requiests, then uncomment the
-        #  cui below and set "add-cui = yes" for these clients in clients.conf
+	#
+	#  If you want to generate CUI for some clients that do not
+	#  send proper CUI requests, then uncomment the
+	#  cui below and set "add_cui = yes" for these clients in clients.conf
 #       cui
 
 	#
@@ -327,27 +335,23 @@ authorize {
 	#  is meant to mirror the "users" file.
 	#
 	#  See "Authorization Queries" in sql.conf
-#	sql
+	-sql
 
 	#
 	#  If you are using /etc/smbpasswd, and are also doing
 	#  mschap authentication, the un-comment this line, and
-	#  configure the 'etc_smbpasswd' module, above.
-#	etc_smbpasswd
+	#  configure the 'smbpasswd' module.
+#	smbpasswd
 
 	#
-	#  The ldap module will set Auth-Type to LDAP if it has not
-	#  already been set
-#	ldap
+	#  The ldap module reads passwords from the LDAP database.
+	-ldap
 
 	#
 	#  Enforce daily limits on time spent logged in.
 #	daily
 
 	#
-	# Use the checkval module
-#	checkval
-
 	expiration
 	logintime
 
@@ -383,7 +387,7 @@ authorize {
 #  Note that it does NOT mean 'try each module in order'.  It means
 #  that a module from the 'authorize' section adds a configuration
 #  attribute 'Auth-Type := FOO'.  That authentication type is then
-#  used to pick the apropriate module from the list below.
+#  used to pick the appropriate module from the list below.
 #
 
 #  In general, you SHOULD NOT set the Auth-Type attribute.  The server
@@ -436,24 +440,17 @@ authenticate {
 	#  Pluggable Authentication Modules.
 #	pam
 
+	#  Uncomment it if you want to use ldap for authentication
 	#
-	#  See 'man getpwent' for information on how the 'unix'
-	#  module checks the users password.  Note that packets
-	#  containing CHAP-Password attributes CANNOT be authenticated
-	#  against /etc/passwd!  See the FAQ for details.
+	#  Note that this means "check plain-text password against
+	#  the ldap database", which means that EAP won't work,
+	#  as it does not supply a plain-text password.
 	#
-	#  For normal "crypt" authentication, the "pap" module should
-	#  be used instead of the "unix" module.  The "unix" module should
-	#  be used for authentication ONLY for compatibility with legacy
-	#  FreeRADIUS configurations.
+	#  We do NOT recommend using this.  LDAP servers are databases.
+	#  They are NOT authentication servers.  FreeRADIUS is an
+	#  authentication server, and knows what to do with authentication.
+	#  LDAP servers do not.
 	#
-	unix
-
-	# Uncomment it if you want to use ldap for authentication
-	#
-	# Note that this means "check plain-text password against
-	# the ldap database", which means that EAP won't work,
-	# as it does not supply a plain-text password.
 #	Auth-Type LDAP {
 #		ldap
 #	}
@@ -470,7 +467,7 @@ authenticate {
 	#
 #	Auth-Type eap {
 #		eap {
-#			handled = 1  
+#			handled = 1
 #		}
 #		if (handled && (Response-Packet-Type == Access-Challenge)) {
 #			attr_filter.access_challenge.post-auth
@@ -485,6 +482,12 @@ authenticate {
 #
 preacct {
 	preprocess
+
+	#
+	#  Merge Acct-[Input|Output]-Gigawords and Acct-[Input-Output]-Octets
+	#  into a single 64bit counter Acct-[Input|Output]-Octets64.
+	#
+#	acct_counters64
 
 	#
 	#  Session start times are *implied* in RADIUS.
@@ -531,9 +534,9 @@ preacct {
 #  Accounting.  Log the accounting data.
 #
 accounting {
-        #  Update accounting packet by adding the CUI attribute
-        #  recorded from the corresponding Access-Accept
-        #  use it only if your NAS boxes do not support CUI themselves
+	#  Update accounting packet by adding the CUI attribute
+	#  recorded from the corresponding Access-Accept
+	#  use it only if your NAS boxes do not support CUI themselves
 #       cui
 	#
 	#  Create a 'detail'ed log of the packets.
@@ -562,7 +565,7 @@ accounting {
 	#  Log traffic to an SQL database.
 	#
 	#  See "Accounting queries" in sql.conf
-#	sql
+	-sql
 
 	#
 	#  If you receive stop packets with zero session length,
@@ -602,7 +605,7 @@ accounting {
 }
 
 
-#  Session database, used for checking Simultaneous-Use. Either the radutmp 
+#  Session database, used for checking Simultaneous-Use. Either the radutmp
 #  or rlm_sql module can handle this.
 #  The rlm_sql module is *much* faster
 session {
@@ -621,17 +624,22 @@ post-auth {
 	#  Get an address from the IP Pool.
 #	main_pool
 
+
+	#  Create the CUI value and add the attribute to Access-Accept.
+	#  Uncomment the line below if *returning* the CUI.
+#       cui
+
 	#
 	#  If you want to have a log of authentication replies,
-	#  un-comment the following line, and the 'detail reply_log'
-	#  section, above.
+	#  un-comment the following line, and enable the
+	#  'detail reply_log' module.
 #	reply_log
 
 	#
 	#  After authenticating the user, do another SQL query.
 	#
 	#  See "Authentication Logging Queries" in sql.conf
-#	sql
+	-sql
 
 	#
 	#  Instead of sending the query to the SQL server,
@@ -673,9 +681,6 @@ post-auth {
 	#
 #	wimax
 
-        #  Create the CUI value and add the attribute to Access-Accept.
-        #  Uncomment the line below if *returning* the CUI.
-#       cui
 
 	#  If there is a client certificate (EAP-TLS, sometimes PEAP
 	#  and TTLS), then some attributes are filled out after the
@@ -710,8 +715,20 @@ post-auth {
 	#  RFC 2865 behaviour for the class attribute, AND if the NAS
 	#  supports long Class attributes.  Many older or cheap NASes
 	#  only support 16-octet Class attributes.
-	#
 #	insert_acct_class
+
+	#  MacSEC requires the use of EAP-Key-Name.  However, we don't
+	#  want to send it for all EAP sessions.  Therefore, the EAP
+	#  modules put required data into the EAP-Session-Id attribute.
+	#  This attribute is never put into a request or reply packet.
+	#
+	#  Uncomment the next few lines to copy the required data into
+	#  the EAP-Key-Name attribute
+#	if (reply:EAP-Session-Id) {
+#		update reply {
+#			EAP-Key-Name := "%{reply:EAP-Session-Id}"
+#		}
+#	}
 
 	#  Remove reply message if the response contains an EAP-Message
 	remove_reply_message_if_eap
@@ -720,12 +737,12 @@ post-auth {
 	#  Access-Reject packets are sent through the REJECT sub-section of the
 	#  post-auth section.
 	#
-	#  Add the ldap module name (or instance) if you have set 
+	#  Add the ldap module name (or instance) if you have set
 	#  'edir_account_policy_check = yes' in the ldap module configuration
 	#
 	Post-Auth-Type REJECT {
 		# log failed authentications in SQL, too.
-#		sql
+		-sql
 		attr_filter.access_reject
 
 		# Insert EAP-Failure message if the request was
@@ -747,17 +764,15 @@ post-auth {
 #  Only a few modules currently have this method.
 #
 pre-proxy {
-#	attr_rewrite
-
-        # Before proxing the request add an Operator-Name attribute identifying
-        # if the operator-name is found for this client.
-        # No need to uncomment this if you have already enabled this in
-        # the authorize section.
+	# Before proxing the request add an Operator-Name attribute identifying
+	# if the operator-name is found for this client.
+	# No need to uncomment this if you have already enabled this in
+	# the authorize section.
 #       operator-name
 
-        #  The client requests the CUI by sending a CUI attribute
-        #  containing one zero byte.
-        #  Uncomment the line below if *requesting* the CUI.
+	#  The client requests the CUI by sending a CUI attribute
+	#  containing one zero byte.
+	#  Uncomment the line below if *requesting* the CUI.
 #       cui
 
 	#  Uncomment the following line if you want to change attributes
@@ -786,8 +801,6 @@ post-proxy {
 	#  un-comment the following line, and the 'detail post_proxy_log'
 	#  section, above.
 #	post_proxy_log
-
-#	attr_rewrite
 
 	#  Uncomment the following line if you want to filter replies from
 	#  remote proxies based on the rules defined in the 'attrs' file.

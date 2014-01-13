@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_soh.c
@@ -20,28 +20,27 @@
  *
  * @copyright 2010 Phil Mayers <p.mayers@imperial.ac.uk>
  */
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
-#include        <freeradius-devel/radiusd.h>
-#include        <freeradius-devel/modules.h>
+#include	<freeradius-devel/radiusd.h>
+#include	<freeradius-devel/modules.h>
 #include	<freeradius-devel/dhcp.h>
 #include	<freeradius-devel/soh.h>
 
 
 typedef struct rlm_soh_t {
-	char *xlat_name;
-	int dhcp;
+	char const *xlat_name;
+	bool dhcp;
 } rlm_soh_t;
 
 
 /*
  * Not sure how to make this useful yet...
  */
-static size_t soh_xlat(UNUSED void *instance, REQUEST *request, const char *fmt, char *out, size_t outlen) {
+static ssize_t soh_xlat(UNUSED void *instance, REQUEST *request, char const *fmt, char *out, size_t outlen) {
 
 	VALUE_PAIR* vp[6];
-	const char *osname;
+	char const *osname;
 
 	/* there will be no point unless SoH-Supported = yes
 	 *
@@ -97,48 +96,29 @@ static size_t soh_xlat(UNUSED void *instance, REQUEST *request, const char *fmt,
 
 static const CONF_PARSER module_config[] = {
 	/*
-	 * Do SoH over DHCP? 
+	 * Do SoH over DHCP?
 	 */
 	{ "dhcp",    PW_TYPE_BOOLEAN, offsetof(rlm_soh_t,dhcp), NULL, "no" },
 
 	{ NULL, -1, 0, NULL, NULL }		/* end the list */
 };
 
-static int soh_detach(void *instance) {
-	rlm_soh_t	*inst = instance;
 
-	if (inst->xlat_name) {
-		xlat_unregister(inst->xlat_name, soh_xlat, instance);
-		free(inst->xlat_name);
-	}
-	free(instance);
-	return 0;
-}
-
-static int soh_instantiate(CONF_SECTION *conf, void **instance) {
-	const char *name;
-	rlm_soh_t *inst;
-
-	inst = *instance = rad_malloc(sizeof(*inst));
-	if (!inst) {
-		return -1;
-	}
-	memset(inst, 0, sizeof(*inst));
-
-	if (cf_section_parse(conf, inst, module_config) < 0) {
-		free(inst);
-		return -1;
-	}
+static int mod_instantiate(CONF_SECTION *conf, void *instance)
+{
+	char const *name;
+	rlm_soh_t *inst = instance;
 
 	name = cf_section_name2(conf);
 	if (!name) name = cf_section_name1(conf);
-	inst->xlat_name = strdup(name);
-	xlat_register(inst->xlat_name, soh_xlat, inst);
+	inst->xlat_name = name;
+	if (!inst->xlat_name) return -1;
+	xlat_register(inst->xlat_name, soh_xlat, NULL, inst);
 
 	return 0;
 }
 
-static rlm_rcode_t soh_postauth(UNUSED void * instance, REQUEST *request)
+static rlm_rcode_t mod_post_auth(UNUSED void * instance, REQUEST *request)
 {
 #ifdef WITH_DHCP
 	int rcode;
@@ -154,7 +134,8 @@ static rlm_rcode_t soh_postauth(UNUSED void * instance, REQUEST *request)
 		 *
 		 * vendor opt 222/0xde - SoH correlation ID as utf-16 string, yuck...
 		 */
-		uint8_t vopt, vlen, *data;
+		uint8_t vopt, vlen;
+		uint8_t const *data;
 
 		data = vp->vp_octets;
 		while (data < vp->vp_octets + vp->length) {
@@ -163,22 +144,26 @@ static rlm_rcode_t soh_postauth(UNUSED void * instance, REQUEST *request)
 			switch (vopt) {
 				case 220:
 					if (vlen <= 1) {
+						uint8_t *p;
+
 						RDEBUG("SoH adding NAP marker to DHCP reply");
 						/* client probe; send "NAP" in the reply */
-						vp = paircreate(43, DHCP_MAGIC_VENDOR, PW_TYPE_OCTETS);
-						vp->vp_octets[0] = 220;
-						vp->vp_octets[1] = 3;
-						vp->vp_octets[4] = 'N';
-						vp->vp_octets[3] = 'A';
-						vp->vp_octets[2] = 'P';
+						vp = paircreate(request->reply, 43, DHCP_MAGIC_VENDOR);
 						vp->length = 5;
+						vp->vp_octets = p = talloc_array(vp, uint8_t, vp->length);
+
+						p[0] = 220;
+						p[1] = 3;
+						p[4] = 'N';
+						p[3] = 'A';
+						p[2] = 'P';
 
 						pairadd(&request->reply->vps, vp);
 
 					} else {
 						RDEBUG("SoH decoding NAP from DHCP request");
 						/* SoH payload */
-						rcode = soh_verify(request, request->packet->vps, data, vlen);
+						rcode = soh_verify(request, data, vlen);
 						if (rcode < 0) {
 							return RLM_MODULE_FAIL;
 						}
@@ -196,7 +181,7 @@ static rlm_rcode_t soh_postauth(UNUSED void * instance, REQUEST *request)
 	return RLM_MODULE_NOOP;
 }
 
-static rlm_rcode_t soh_authorize(UNUSED void * instance, REQUEST *request)
+static rlm_rcode_t mod_authorize(UNUSED void * instance, REQUEST *request)
 {
 	VALUE_PAIR *vp;
 	int rv;
@@ -210,7 +195,7 @@ static rlm_rcode_t soh_authorize(UNUSED void * instance, REQUEST *request)
 
 	RDEBUG("SoH radius VP found");
 	/* decode it */
-	rv = soh_verify(request, request->packet->vps, vp->vp_octets, vp->length);
+	rv = soh_verify(request, vp->vp_octets, vp->length);
 	if (rv < 0) {
 		return RLM_MODULE_FAIL;
 	}
@@ -222,16 +207,18 @@ module_t rlm_soh = {
 	RLM_MODULE_INIT,
 	"SoH",
 	RLM_TYPE_THREAD_SAFE,		/* type */
-	soh_instantiate,		/* instantiation */
-	soh_detach,		/* detach */
+	sizeof(rlm_soh_t),
+	module_config,
+	mod_instantiate,		/* instantiation */
+	NULL,			/* detach */
 	{
 		NULL,			/* authenticate */
-		soh_authorize,		/* authorize */
+		mod_authorize,		/* authorize */
 		NULL,			/* pre-accounting */
 		NULL,			/* accounting */
 		NULL,			/* checksimul */
 		NULL,			/* pre-proxy */
 		NULL,			/* post-proxy */
-		soh_postauth		/* post-auth */
+		mod_post_auth		/* post-auth */
 	},
 };

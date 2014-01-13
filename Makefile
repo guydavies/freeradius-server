@@ -7,14 +7,11 @@
 # Version:	$Id$
 #
 
-include Make.inc
-MFLAGS += --no-print-directory
+$(if $(wildcard Make.inc),,$(error Missing 'Make.inc' Run './configure [options]' and retry))
 
-# Speed up the build for developers.  This means editing Make.inc,
-# and adding "BOILER = yes" to the bottom.  Once that's done, the
-#
-#
-ifeq "$(BOILER)" "yes"
+include Make.inc
+
+MFLAGS += --no-print-directory
 
 # The version of GNU Make is too old, don't use it (.FEATURES variable was
 # wad added in 3.81)
@@ -27,26 +24,29 @@ export DESTDIR := $(R)
 # And over-ride all of the other magic.
 include scripts/boiler.mk
 
-# These are not yet converted to the new system
-SUBDIRS		= $(wildcard raddb scripts doc)
+#
+#  Run "radiusd -C", looking for errors.
+#
+$(BUILD_DIR)/tests/radiusd-c: ${BUILD_DIR}/bin/radiusd | build.raddb
+	@$(MAKE) -C raddb/certs
+	@if ! ./build/make/jlibtool --mode=execute ./build/bin/radiusd -XCMd ./raddb -n debug -D ./share > $(BUILD_DIR)/tests/radiusd.config.log 2>&1; then \
+		cat $(BUILD_DIR)/tests/radiusd.config.log; \
+		echo "FAIL: radiusd -C"; \
+		exit 1; \
+	fi
+	@echo "OK: radiusd -C"
+	@touch $@
 
-else
-.PHONY: all clean install
-
-SUBDIRS		= $(wildcard src raddb scripts doc)
-WHAT_TO_MAKE	= all
-
-all:
-	@$(MAKE) $(MFLAGS) WHAT_TO_MAKE=$@ common
-
-clean:
-	@$(MAKE) $(MFLAGS) WHAT_TO_MAKE=$@ common
-	@rm -f *~
-endif
-
-.PHONY: tests
-tests:
+test: ${BUILD_DIR}/bin/radiusd ${BUILD_DIR}/bin/radclient tests.unit tests.keywords $(BUILD_DIR)/tests/radiusd-c | build.raddb
 	@$(MAKE) -C src/tests tests
+
+#  Tests specifically for Travis.  We do a LOT more than just
+#  the above tests
+ifneq "$(findstring travis,${prefix})" ""
+travis-test: test
+	@$(MAKE) install
+	@$(MAKE) deb
+endif
 
 #
 # The $(R) is a magic variable not defined anywhere in this source.
@@ -75,10 +75,6 @@ install.bindir:
 install.sbindir:
 	@[ -d $(R)$(sbindir) ] || $(INSTALL) -d -m 755 $(R)$(sbindir)
 
-.PHONY: install.raddbdir
-install.raddbdir:
-	@[ -d $(R)$(raddbdir) ] || $(INSTALL) -d -m 755 $(R)$(raddbdir)
-
 .PHONY: install.dirs
 install.dirs: install.bindir install.sbindir
 	@$(INSTALL) -d -m 755	$(R)$(mandir)
@@ -104,9 +100,6 @@ $(R)$(mandir)/%: man/%
 
 install: install.dirs install.share install.man
 
-install:
-	@$(MAKE) $(MFLAGS) WHAT_TO_MAKE=$@ common
-
 ifneq ($(RADMIN),)
 ifneq ($(RGROUP),)
 .PHONY: install-chown
@@ -128,25 +121,15 @@ install-chown:
 endif
 endif
 
-.PHONY: common $(SUBDIRS)
-
-common: $(SUBDIRS)
-
-$(SUBDIRS):
-	@echo "Making $(WHAT_TO_MAKE) in $@..."
-	@$(MAKE) $(MFLAGS) -C $@ $(WHAT_TO_MAKE)
-
 distclean: clean
-	@rm -f config.cache config.log config.status libtool \
+	@-find src/modules -regex .\*/config[.][^.]*\$$ -delete
+	@-find src/modules -name autom4te.cache -exec rm -rf '{}' \;
+	@rm -rf config.cache config.log config.status libtool \
 		src/include/radpaths.h src/include/stamp-h \
 		libltdl/config.log libltdl/config.status \
-		libltdl/libtool
-	@-find . ! -name configure.in -name \*.in -print | \
+		libltdl/libtool autom4te.cache build
+	@-find . ! -name configure.ac -name \*.in -print | \
 		sed 's/\.in$$//' | \
-		while read file; do rm -f $$file; done
-	@-find src/modules -name config.mak | \
-		while read file; do rm -f $$file; done
-	@-find src/modules -name config.h | \
 		while read file; do rm -f $$file; done
 
 ######################################################################
@@ -154,30 +137,74 @@ distclean: clean
 #  Automatic remaking rules suggested by info:autoconf#Automatic_Remaking
 #
 ######################################################################
-.PHONY: reconfig
-reconfig:
-	@$(MAKE) $(MFLAGS) -C src reconfig
-	@$(MAKE) configure
-	@$(MAKE) src/include/autoconf.h.in
+#
+#  Do these checks ONLY if we're re-building the "configure"
+#  scripts, and ONLY the "configure" scripts.  If we leave
+#  these rules enabled by default, then they're run too often.
+#
+ifeq "$(MAKECMDGOALS)" "reconfig"
 
-configure: configure.in aclocal.m4
-	$(AUTOCONF)
+CONFIGURE_AC_FILES := $(shell find . -name configure.ac -print)
+CONFIGURE_FILES	   := $(patsubst %.ac,%,$(CONFIGURE_AC_FILES))
 
-.PHONY: src/include/autoconf.h.in
-src/include/autoconf.h.in:
-	$(AUTOHEADER)
+#
+#  The GNU tools make autoconf=="missing autoconf", which then returns
+#  0, even when autoconf doesn't exist.  This check is to ensure that
+#  we run AUTOCONF only when it exists.
+#
+AUTOCONF_EXISTS := $(shell autoconf --version 2>/dev/null)
+
+ifeq "$(AUTOCONF_EXISTS)" ""
+$(error You need to install autoconf to re-build the "configure" scripts)
+endif
+
+# Configure files depend on "in" files, and on the top-level macro files
+# If there are headers, run auto-header, too.
+src/%configure: src/%configure.ac acinclude.m4 aclocal.m4 $(wildcard $(dir $@)m4/*m4) | src/freeradius-devel
+	@echo AUTOCONF $(dir $@)
+	cd $(dir $@) && $(AUTOCONF) -I $(top_builddir) -I $(top_builddir)/m4 -I $(top_builddir)/$(dir $@)m4
+	@if grep AC_CONFIG_HEADERS $@ >/dev/null; then\
+		echo AUTOHEADER $@ \
+		cd $(dir $@) && $(AUTOHEADER); \
+	 fi
+
+# "%configure" doesn't match "configure"
+configure: configure.ac $(wildcard ac*.m4) $(wildcard m4/*.m4)
+	@echo AUTOCONF $@
+	@$(AUTOCONF)
+
+src/include/autoconf.h.in: configure.ac
+	@echo AUTOHEADER $@
+	@$(AUTOHEADER)
+
+reconfig: $(CONFIGURE_FILES) src/include/autoconf.h.in
 
 config.status: configure
 	./config.status --recheck
 
-configure.in:
+# target is "configure"
+endif
+
+#  If we've already run configure, then add rules which cause the
+#  module-specific "all.mk" files to depend on the mk.in files, and on
+#  the configure script.
+#
+ifneq "$(wildcard config.log)" ""
+CONFIGURE_ARGS	   := $(shell head -10 config.log | grep '^  \$$' | sed 's/^....//;s:.*configure ::')
+
+src/%all.mk: src/%all.mk.in src/%configure
+	@echo CONFIGURE $(dir $@)
+	@rm -f ./config.cache $(dir $<)/config.cache
+	@cd $(dir $<) && CPPFLAGS=$(DARWIN_CFLAGS) CFLAGS=$(DARWIN_CFLAGS) ./configure $(CONFIGURE_ARGS)
+endif
 
 .PHONY: check-includes
 check-includes:
 	scripts/min-includes.pl `find . -name "*.c" -print`
 
+.PHONY: TAGS
 TAGS:
-	etags `find src -type f -name '*.[ch]' -print`
+	etags `find src -type f -name '*.[ch]' -print` > $@
 
 #
 #  Make test certificates.
@@ -195,13 +222,13 @@ certs:
 #
 ######################################################################
 freeradius-server-$(RADIUSD_VERSION_STRING).tar.gz: .git
-	git archive --format=tar --prefix=freeradius-server-$(RADIUSD_VERSION_STRING)/ stable | gzip > $@
+	git archive --format=tar --prefix=freeradius-server-$(RADIUSD_VERSION_STRING)/ master | gzip > $@
 
 freeradius-server-$(RADIUSD_VERSION_STRING).tar.gz.sig: freeradius-server-$(RADIUSD_VERSION_STRING).tar.gz
 	gpg --default-key aland@freeradius.org -b $<
 
 freeradius-server-$(RADIUSD_VERSION_STRING).tar.bz2: .git
-	git archive --format=tar --prefix=freeradius-server-$(RADIUSD_VERSION_STRING)/ stable | bzip2 > $@
+	git archive --format=tar --prefix=freeradius-server-$(RADIUSD_VERSION_STRING)/ master | bzip2 > $@
 
 freeradius-server-$(RADIUSD_VERSION_STRING).tar.bz2.sig: freeradius-server-$(RADIUSD_VERSION_STRING).tar.bz2
 	gpg --default-key aland@freeradius.org -b $<
@@ -221,7 +248,7 @@ dist-check: redhat/freeradius.spec suse/freeradius.spec debian/changelog
 		echo suse/freeradius.spec 'Version' needs to be updated; \
 		exit 1; \
 	fi
-	@if [ `head -n 1 debian/changelog | sed 's/.*(//;s/-0).*//;s/-1).*//;'`  != "$(RADIUSD_VERSION_STRING)" ]; then \
+	@if [ `head -n 1 debian/changelog | sed 's/.*(//;s/-0).*//;s/-1).*//;s/\+.*//'`  != "$(RADIUSD_VERSION_STRING)" ]; then \
 		echo debian/changelog needs to be updated; \
 		exit 1; \
 	fi

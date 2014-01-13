@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_sometimes.c
@@ -20,23 +20,23 @@
  *
  * @copyright 2012 The FreeRADIUS server project
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/modules.h>
+#include <freeradius-devel/rad_assert.h>
 
 /*
  *	The instance data for rlm_sometimes is the list of fake values we are
  *	going to return.
  */
 typedef struct rlm_sometimes_t {
-	char	*rcode_str;
-	int	rcode;
-	int	start;
-	int	end;
-	char	*key;
-	DICT_ATTR *da;
+	char			*rcode_str;
+	int			rcode;
+	int			start;
+	int			end;
+	char			*key;
+	DICT_ATTR const		*da;
 } rlm_sometimes_t;
 
 /*
@@ -49,98 +49,32 @@ typedef struct rlm_sometimes_t {
  *	buffer over-flows.
  */
 static const CONF_PARSER module_config[] = {
-  { "rcode",      PW_TYPE_STRING_PTR, offsetof(rlm_sometimes_t,rcode_str),
-    NULL, "fail" },
+	{ "rcode",      PW_TYPE_STRING_PTR, offsetof(rlm_sometimes_t,rcode_str), NULL, "fail" },
+	{ "key", PW_TYPE_STRING_PTR | PW_TYPE_ATTRIBUTE,    offsetof(rlm_sometimes_t,key), NULL, "User-Name" },
+	{ "start", PW_TYPE_INTEGER,    offsetof(rlm_sometimes_t,start), NULL, "0" },
+	{ "end", PW_TYPE_INTEGER,    offsetof(rlm_sometimes_t,end), NULL, "127" },
 
-  { "key", PW_TYPE_STRING_PTR,    offsetof(rlm_sometimes_t,key),
-    NULL, "User-Name" },
-
-  { "start", PW_TYPE_INTEGER,    offsetof(rlm_sometimes_t,start),
-    NULL, "0" },
-
-  { "end", PW_TYPE_INTEGER,    offsetof(rlm_sometimes_t,end),
-    NULL, "127" },
-
-  { NULL, -1, 0, NULL, NULL }		/* end the list */
+	{ NULL, -1, 0, NULL, NULL }		/* end the list */
 };
 
-static int str2rcode(const char *s)
-{
-	if(!strcasecmp(s, "reject"))
-		return RLM_MODULE_REJECT;
-	else if(!strcasecmp(s, "fail"))
-		return RLM_MODULE_FAIL;
-	else if(!strcasecmp(s, "ok"))
-		return RLM_MODULE_OK;
-	else if(!strcasecmp(s, "handled"))
-		return RLM_MODULE_HANDLED;
-	else if(!strcasecmp(s, "invalid"))
-		return RLM_MODULE_INVALID;
-	else if(!strcasecmp(s, "userlock"))
-		return RLM_MODULE_USERLOCK;
-	else if(!strcasecmp(s, "notfound"))
-		return RLM_MODULE_NOTFOUND;
-	else if(!strcasecmp(s, "noop"))
-		return RLM_MODULE_NOOP;
-	else if(!strcasecmp(s, "updated"))
-		return RLM_MODULE_UPDATED;
-	else {
-		radlog(L_ERR|L_CONS,
-			"rlm_sometimes: Unknown module rcode '%s'.\n", s);
-		return -1;
-	}
-}
 
-static int sometimes_detach(void *instance)
+extern const FR_NAME_NUMBER mod_rcode_table[];
+
+static int mod_instantiate(CONF_SECTION *conf, void *instance)
 {
 	rlm_sometimes_t *inst = instance;
-
-	free(inst->rcode_str);
-	free(inst->key);
-	free(inst);
-
-	return 0;
-}
-
-static int sometimes_instantiate(CONF_SECTION *conf, void **instance)
-{
-	rlm_sometimes_t *inst;
-
-	/*
-	 *	Set up a storage area for instance data
-	 */
-	inst = rad_malloc(sizeof(*inst));
-	if (!inst) {
-		return -1;
-	}
-	memset(inst, 0, sizeof(*inst));
-
-	/*
-	 *	If the configuration parameters can't be parsed, then
-	 *	fail.
-	 */
-	if (cf_section_parse(conf, inst, module_config) < 0) {
-		sometimes_detach(inst);
-		return -1;
-	}
 
 	/*
 	 *	Convert the rcode string to an int, and get rid of it
 	 */
-	inst->rcode = str2rcode(inst->rcode_str);
+	inst->rcode = fr_str2int(mod_rcode_table, inst->rcode_str, -1);
 	if (inst->rcode == -1) {
-		sometimes_detach(inst);
+		cf_log_err_cs(conf, "Unknown module return code '%s'", inst->rcode_str);
 		return -1;
 	}
 
 	inst->da = dict_attrbyname(inst->key);
-	if (!inst->da) {
-		radlog(L_ERR, "rlm_sometimes; Unknown attributes %s", inst->key);
-		return -1;
-		return -1;
-	}
-
-	*instance = inst;
+	rad_assert(inst->da);
 
 	return 0;
 }
@@ -185,20 +119,20 @@ static rlm_rcode_t sometimes_return(void *instance, RADIUS_PACKET *packet,
 	 */
 	if ((inst->rcode == RLM_MODULE_HANDLED) && reply) {
 		switch (packet->code) {
-		case PW_AUTHENTICATION_REQUEST:
-			reply->code = PW_AUTHENTICATION_ACK;
+		case PW_CODE_AUTHENTICATION_REQUEST:
+			reply->code = PW_CODE_AUTHENTICATION_ACK;
 			break;
 
-		case PW_ACCOUNTING_REQUEST:
-			reply->code = PW_ACCOUNTING_RESPONSE;
+		case PW_CODE_ACCOUNTING_REQUEST:
+			reply->code = PW_CODE_ACCOUNTING_RESPONSE;
 			break;
 
-		case PW_COA_REQUEST:
-			reply->code = PW_COA_ACK;
+		case PW_CODE_COA_REQUEST:
+			reply->code = PW_CODE_COA_ACK;
 			break;
 
-		case PW_DISCONNECT_REQUEST:
-			reply->code = PW_DISCONNECT_ACK;
+		case PW_CODE_DISCONNECT_REQUEST:
+			reply->code = PW_CODE_DISCONNECT_ACK;
 			break;
 
 		default:
@@ -219,34 +153,42 @@ static rlm_rcode_t sometimes_reply(void *instance, REQUEST *request)
 	return sometimes_return(instance, request->reply, NULL);
 }
 
-static rlm_rcode_t sometimes_pre_proxy(void *instance, REQUEST *request)
+#ifdef WITH_PROXY
+static rlm_rcode_t mod_pre_proxy(void *instance, REQUEST *request)
 {
 	if (!request->proxy) return RLM_MODULE_NOOP;
 
 	return sometimes_return(instance, request->proxy, request->proxy_reply);
 }
 
-static rlm_rcode_t sometimes_post_proxy(void *instance, REQUEST *request)
+static rlm_rcode_t mod_post_proxy(void *instance, REQUEST *request)
 {
 	if (!request->proxy_reply) return RLM_MODULE_NOOP;
 
 	return sometimes_return(instance, request->proxy_reply, NULL);
 }
+#endif
 
 module_t rlm_sometimes = {
 	RLM_MODULE_INIT,
 	"sometimes",
 	RLM_TYPE_CHECK_CONFIG_SAFE | RLM_TYPE_HUP_SAFE,   	/* type */
-	sometimes_instantiate,		/* instantiation */
-	sometimes_detach,		/* detach */
+	sizeof(rlm_sometimes_t),
+	module_config,
+	mod_instantiate,		/* instantiation */
+	NULL,				/* detach */
 	{
 		sometimes_packet,	/* authentication */
 		sometimes_packet,	/* authorization */
 		sometimes_packet,	/* preaccounting */
 		sometimes_packet,	/* accounting */
 		NULL,
-		sometimes_pre_proxy,	/* pre-proxy */
-		sometimes_post_proxy,	/* post-proxy */
+#ifdef WITH_PROXY
+		mod_pre_proxy,	/* pre-proxy */
+		mod_post_proxy,	/* post-proxy */
+#else
+		NULL, NULL,
+#endif
 		sometimes_reply		/* post-auth */
 #ifdef WITH_COA
 		,

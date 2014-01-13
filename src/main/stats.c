@@ -21,7 +21,6 @@
  * Copyright 2008  Alan DeKok <aland@deployingradius.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -74,7 +73,7 @@ static void tv_sub(struct timeval *end, struct timeval *start,
 	}
 	elapsed->tv_usec += end->tv_usec;
 	elapsed->tv_usec -= start->tv_usec;
-	
+
 	if (elapsed->tv_usec >= USEC) {
 		elapsed->tv_usec -= USEC;
 		elapsed->tv_sec++;
@@ -127,6 +126,10 @@ void request_stats_final(REQUEST *request)
 #endif
 	    (request->listener->type != RAD_LISTEN_AUTH)) return;
 
+	/* don't count statistic requests */
+	if (request->packet->code == PW_CODE_STATUS_SERVER)
+		return;
+
 #undef INC_AUTH
 #define INC_AUTH(_x) radius_auth_stats._x++;request->listener->stats._x++;request->client->auth._x++;
 
@@ -161,7 +164,7 @@ void request_stats_final(REQUEST *request)
 	 *	this function, which makes it thread-safe.
 	 */
 	if (request->reply) switch (request->reply->code) {
-	case PW_AUTHENTICATION_ACK:
+	case PW_CODE_AUTHENTICATION_ACK:
 		INC_AUTH(total_access_accepts);
 
 		auth_stats:
@@ -181,16 +184,16 @@ void request_stats_final(REQUEST *request)
 			   &request->reply->timestamp);
 		break;
 
-	case PW_AUTHENTICATION_REJECT:
+	case PW_CODE_AUTHENTICATION_REJECT:
 		INC_AUTH(total_access_rejects);
 		goto auth_stats;
 
-	case PW_ACCESS_CHALLENGE:
+	case PW_CODE_ACCESS_CHALLENGE:
 		INC_AUTH(total_access_challenges);
 		goto auth_stats;
 
 #ifdef WITH_ACCOUNTING
-	case PW_ACCOUNTING_RESPONSE:
+	case PW_CODE_ACCOUNTING_RESPONSE:
 		INC_ACCT(total_responses);
 		stats_time(&radius_acct_stats,
 			   &request->packet->timestamp,
@@ -202,7 +205,7 @@ void request_stats_final(REQUEST *request)
 #endif
 
 #ifdef WITH_COA
-	case PW_COA_ACK:
+	case PW_CODE_COA_ACK:
 		INC_COA(total_access_accepts);
 	  coa_stats:
 		INC_COA(total_responses);
@@ -211,11 +214,11 @@ void request_stats_final(REQUEST *request)
 			   &request->reply->timestamp);
 		break;
 
-	case PW_COA_NAK:
+	case PW_CODE_COA_NAK:
 		INC_COA(total_access_rejects);
 		goto coa_stats;
 
-	case PW_DISCONNECT_ACK:
+	case PW_CODE_DISCONNECT_ACK:
 		INC_DSC(total_access_accepts);
 	  dsc_stats:
 		INC_DSC(total_responses);
@@ -224,7 +227,7 @@ void request_stats_final(REQUEST *request)
 			   &request->reply->timestamp);
 		break;
 
-	case PW_DISCONNECT_NAK:
+	case PW_CODE_DISCONNECT_NAK:
 		INC_DSC(total_access_rejects);
 		goto dsc_stats;
 #endif
@@ -234,13 +237,13 @@ void request_stats_final(REQUEST *request)
 		 *	authenticator.
 		 */
 	case 0:
-		if (request->packet->code == PW_AUTHENTICATION_REQUEST) {
+		if (request->packet->code == PW_CODE_AUTHENTICATION_REQUEST) {
 			if (request->reply->offset == -2) {
 				INC_AUTH(total_bad_authenticators);
 			} else {
 				INC_AUTH(total_packets_dropped);
 			}
-		} else if (request->packet->code == PW_ACCOUNTING_REQUEST) {
+		} else if (request->packet->code == PW_CODE_ACCOUNTING_REQUEST) {
 			if (request->reply->offset == -2) {
 				INC_ACCT(total_bad_authenticators);
 			} else {
@@ -257,14 +260,14 @@ void request_stats_final(REQUEST *request)
 	if (!request->proxy || !request->proxy_listener) goto done;	/* simplifies formatting */
 
 	switch (request->proxy->code) {
-	case PW_AUTHENTICATION_REQUEST:
+	case PW_CODE_AUTHENTICATION_REQUEST:
 		proxy_auth_stats.total_requests += request->num_proxied_requests;
 		request->proxy_listener->stats.total_requests += request->num_proxied_requests;
 		request->home_server->stats.total_requests += request->num_proxied_requests;
 		break;
 
 #ifdef WITH_ACCOUNTING
-	case PW_ACCOUNTING_REQUEST:
+	case PW_CODE_ACCOUNTING_REQUEST:
 		proxy_acct_stats.total_requests++;
 		request->proxy_listener->stats.total_requests += request->num_proxied_requests;
 		request->home_server->stats.total_requests += request->num_proxied_requests;
@@ -281,7 +284,7 @@ void request_stats_final(REQUEST *request)
 #define INC(_x) proxy_auth_stats._x += request->num_proxied_responses; request->proxy_listener->stats._x += request->num_proxied_responses; request->home_server->stats._x += request->num_proxied_responses;
 
 	switch (request->proxy_reply->code) {
-	case PW_AUTHENTICATION_ACK:
+	case PW_CODE_AUTHENTICATION_ACK:
 		INC(total_access_accepts);
 	proxy_stats:
 		INC(total_responses);
@@ -293,16 +296,16 @@ void request_stats_final(REQUEST *request)
 			   &request->proxy_reply->timestamp);
 		break;
 
-	case PW_AUTHENTICATION_REJECT:
+	case PW_CODE_AUTHENTICATION_REJECT:
 		INC(total_access_rejects);
 		goto proxy_stats;
 
-	case PW_ACCESS_CHALLENGE:
+	case PW_CODE_ACCESS_CHALLENGE:
 		INC(total_access_challenges);
 		goto proxy_stats;
 
 #ifdef WITH_ACCOUNTING
-	case PW_ACCOUNTING_RESPONSE:
+	case PW_CODE_ACCOUNTING_RESPONSE:
 		proxy_acct_stats.total_responses++;
 		request->proxy_listener->stats.total_responses++;
 		request->home_server->stats.total_responses++;
@@ -436,8 +439,7 @@ static void request_stats_addvp(REQUEST *request,
 
 	for (i = 0; table[i].attribute != 0; i++) {
 		vp = radius_paircreate(request, &request->reply->vps,
-				       table[i].attribute, VENDORPEC_FREERADIUS,
-				       PW_TYPE_INTEGER);
+				       table[i].attribute, VENDORPEC_FREERADIUS);
 		if (!vp) continue;
 
 		counter = *(fr_uint_t *) (((uint8_t *) stats) + table[i].offset);
@@ -453,9 +455,9 @@ void request_stats_reply(REQUEST *request)
 	/*
 	 *	Statistics are available ONLY on a "status" port.
 	 */
-	rad_assert(request->packet->code == PW_STATUS_SERVER);
+	rad_assert(request->packet->code == PW_CODE_STATUS_SERVER);
 	rad_assert(request->listener->type == RAD_LISTEN_NONE);
-		
+
 	flag = pairfind(request->packet->vps, 127, VENDORPEC_FREERADIUS, TAG_ANY);
 	if (!flag || (flag->vp_integer == 0)) return;
 
@@ -466,7 +468,7 @@ void request_stats_reply(REQUEST *request)
 	    ((flag->vp_integer & 0xc0) == 0)) {
 		request_stats_addvp(request, authvp, &radius_auth_stats);
 	}
-		
+
 #ifdef WITH_ACCOUNTING
 	/*
 	 *	Accounting
@@ -502,12 +504,12 @@ void request_stats_reply(REQUEST *request)
 	 */
 	if ((flag->vp_integer & 0x10) != 0) {
 		vp = radius_paircreate(request, &request->reply->vps,
-				       176, VENDORPEC_FREERADIUS, PW_TYPE_DATE);
+				       176, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = start_time.tv_sec;
 		vp = radius_paircreate(request, &request->reply->vps,
-				       177, VENDORPEC_FREERADIUS, PW_TYPE_DATE);
+				       177, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = hup_time.tv_sec;
-		
+
 #ifdef HAVE_PTHREAD_H
 		int i, array[RAD_LISTEN_MAX], pps[2];
 
@@ -515,18 +517,16 @@ void request_stats_reply(REQUEST *request)
 
 		for (i = 0; i <= 4; i++) {
 			vp = radius_paircreate(request, &request->reply->vps,
-					       162 + i, VENDORPEC_FREERADIUS,
-					       PW_TYPE_INTEGER);
-			
+					       162 + i, VENDORPEC_FREERADIUS);
+
 			if (!vp) continue;
 			vp->vp_integer = array[i];
 		}
 
 		for (i = 0; i < 2; i++) {
 			vp = radius_paircreate(request, &request->reply->vps,
-					       181 + i, VENDORPEC_FREERADIUS,
-					       PW_TYPE_INTEGER);
-			
+					       181 + i, VENDORPEC_FREERADIUS);
+
 			if (!vp) continue;
 			vp->vp_integer = pps[i];
 		}
@@ -554,7 +554,7 @@ void request_stats_reply(REQUEST *request)
 				ipaddr.af = AF_INET;
 				ipaddr.ipaddr.ip4addr.s_addr = server_ip->vp_ipaddr;
 				cl = listener_find_client_list(&ipaddr, server_port->vp_integer);
-							       
+
 				/*
 				 *	Not found: don't do anything
 				 */
@@ -565,6 +565,7 @@ void request_stats_reply(REQUEST *request)
 
 		vp = pairfind(request->packet->vps, 167, VENDORPEC_FREERADIUS, TAG_ANY);
 		if (vp) {
+			memset(&ipaddr, 0, sizeof(ipaddr));
 			ipaddr.af = AF_INET;
 			ipaddr.ipaddr.ip4addr.s_addr = vp->vp_ipaddr;
 			client = client_find(cl, &ipaddr, IPPROTO_UDP);
@@ -586,18 +587,17 @@ void request_stats_reply(REQUEST *request)
 			 *	If found, echo it back, along with
 			 *	the requested statistics.
 			 */
-			pairadd(&request->reply->vps, paircopyvp(vp));
+			pairadd(&request->reply->vps, paircopyvp(request->reply, vp));
 
 			/*
 			 *	When retrieving client by number, also
 			 *	echo back it's IP address.
 			 */
-			if ((vp->type == PW_TYPE_INTEGER) &&
+			if ((vp->da->type == PW_TYPE_INTEGER) &&
 			    (client->ipaddr.af == AF_INET)) {
 				vp = radius_paircreate(request,
 						       &request->reply->vps,
-						       167, VENDORPEC_FREERADIUS,
-						       PW_TYPE_IPADDR);
+						       167, VENDORPEC_FREERADIUS);
 				if (vp) {
 					vp->vp_ipaddr = client->ipaddr.ipaddr.ip4addr.s_addr;
 				}
@@ -605,21 +605,20 @@ void request_stats_reply(REQUEST *request)
 				if (client->prefix != 32) {
 					vp = radius_paircreate(request,
 							       &request->reply->vps,
-							       169, VENDORPEC_FREERADIUS,
-							       PW_TYPE_INTEGER);
+							       169, VENDORPEC_FREERADIUS);
 					if (vp) {
 						vp->vp_integer = client->prefix;
 					}
 				}
 			}
-			
+
 			if (server_ip) {
 				pairadd(&request->reply->vps,
-					paircopyvp(server_ip));
+					paircopyvp(request->reply, server_ip));
 			}
 			if (server_port) {
 				pairadd(&request->reply->vps,
-					paircopyvp(server_port));
+					paircopyvp(request->reply, server_port));
 			}
 
 			if ((flag->vp_integer & 0x01) != 0) {
@@ -653,29 +652,29 @@ void request_stats_reply(REQUEST *request)
 
 		server_port = pairfind(request->packet->vps, 171, VENDORPEC_FREERADIUS, TAG_ANY);
 		if (!server_port) return;
-		
+
 		ipaddr.af = AF_INET;
 		ipaddr.ipaddr.ip4addr.s_addr = server_ip->vp_ipaddr;
 		this = listener_find_byipaddr(&ipaddr,
 					      server_port->vp_integer,
 					      IPPROTO_UDP);
-		
+
 		/*
 		 *	Not found: don't do anything
 		 */
 		if (!this) return;
-		
+
 		pairadd(&request->reply->vps,
-			paircopyvp(server_ip));
+			paircopyvp(request->reply, server_ip));
 		pairadd(&request->reply->vps,
-			paircopyvp(server_port));
+			paircopyvp(request->reply, server_port));
 
 		if (((flag->vp_integer & 0x01) != 0) &&
 		    ((request->listener->type == RAD_LISTEN_AUTH) ||
 		     (request->listener->type == RAD_LISTEN_NONE))) {
 			request_stats_addvp(request, authvp, &this->stats);
 		}
-		
+
 #ifdef WITH_ACCOUNTING
 		if (((flag->vp_integer & 0x02) != 0) &&
 		    ((request->listener->type == RAD_LISTEN_ACCT) ||
@@ -704,7 +703,10 @@ void request_stats_reply(REQUEST *request)
 
 		server_port = pairfind(request->packet->vps, 171, VENDORPEC_FREERADIUS, TAG_ANY);
 		if (!server_port) return;
-		
+
+#ifndef NDEBUG
+		memset(&ipaddr, 0, sizeof(ipaddr));
+#endif
 		ipaddr.af = AF_INET;
 		ipaddr.ipaddr.ip4addr.s_addr = server_ip->vp_ipaddr;
 		home = home_server_find(&ipaddr, server_port->vp_integer,
@@ -714,24 +716,24 @@ void request_stats_reply(REQUEST *request)
 		 *	Not found: don't do anything
 		 */
 		if (!home) return;
-		
+
 		pairadd(&request->reply->vps,
-			paircopyvp(server_ip));
+			paircopyvp(request->reply, server_ip));
 		pairadd(&request->reply->vps,
-			paircopyvp(server_port));
+			paircopyvp(request->reply, server_port));
 
 		vp = radius_paircreate(request, &request->reply->vps,
-				       172, VENDORPEC_FREERADIUS, PW_TYPE_INTEGER);
+				       172, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_integer = home->currently_outstanding;
 
 		vp = radius_paircreate(request, &request->reply->vps,
-				       173, VENDORPEC_FREERADIUS, PW_TYPE_INTEGER);
+				       173, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_integer = home->state;
 
 		if ((home->state == HOME_STATE_ALIVE) &&
 		    (home->revive_time.tv_sec != 0)) {
 			vp = radius_paircreate(request, &request->reply->vps,
-					       175, VENDORPEC_FREERADIUS, PW_TYPE_DATE);
+					       175, VENDORPEC_FREERADIUS);
 			if (vp) vp->vp_date = home->revive_time.tv_sec;
 		}
 
@@ -739,25 +741,22 @@ void request_stats_reply(REQUEST *request)
 		    (home->ema.window > 0)) {
 				vp = radius_paircreate(request,
 						       &request->reply->vps,
-						       178, VENDORPEC_FREERADIUS,
-						       PW_TYPE_INTEGER);
+						       178, VENDORPEC_FREERADIUS);
 				if (vp) vp->vp_integer = home->ema.window;
 				vp = radius_paircreate(request,
 						       &request->reply->vps,
-						       179, VENDORPEC_FREERADIUS,
-						       PW_TYPE_INTEGER);
+						       179, VENDORPEC_FREERADIUS);
 				if (vp) vp->vp_integer = home->ema.ema1 / EMA_SCALE;
 				vp = radius_paircreate(request,
 						       &request->reply->vps,
-						       180, VENDORPEC_FREERADIUS,
-						       PW_TYPE_INTEGER);
+						       180, VENDORPEC_FREERADIUS);
 				if (vp) vp->vp_integer = home->ema.ema10 / EMA_SCALE;
 
 		}
 
 		if (home->state == HOME_STATE_IS_DEAD) {
 			vp = radius_paircreate(request, &request->reply->vps,
-					       174, VENDORPEC_FREERADIUS, PW_TYPE_DATE);
+					       174, VENDORPEC_FREERADIUS);
 			if (vp) vp->vp_date = home->zombie_period_start.tv_sec + home->zombie_period;
 		}
 
@@ -767,11 +766,11 @@ void request_stats_reply(REQUEST *request)
 		 *	FIXME: do this for clients, too!
 		 */
 		vp = radius_paircreate(request, &request->reply->vps,
-				       184, VENDORPEC_FREERADIUS, PW_TYPE_DATE);
+				       184, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = home->last_packet_recv;
 
 		vp = radius_paircreate(request, &request->reply->vps,
-				       185, VENDORPEC_FREERADIUS, PW_TYPE_DATE);
+				       185, VENDORPEC_FREERADIUS);
 		if (vp) vp->vp_date = home->last_packet_sent;
 
 		if (((flag->vp_integer & 0x01) != 0) &&
@@ -818,7 +817,7 @@ void radius_stats_ema(fr_stats_ema_t *ema,
 	 */
 	if (ema->f1 == 0) {
 		if (ema->window > 10000) ema->window = 10000;
-		
+
 		ema->f1 =  (2 * F_EMA_SCALE) / (ema->window + 1);
 		ema->f10 = (2 * F_EMA_SCALE) / ((10 * ema->window) + 1);
 	}
@@ -826,13 +825,13 @@ void radius_stats_ema(fr_stats_ema_t *ema,
 
 	tdiff = start->tv_sec;
 	tdiff -= end->tv_sec;
-	
+
 	micro = (int) tdiff;
 	if (micro > 40) micro = 40; /* don't overflow 32-bit ints */
 	micro *= USEC;
 	micro += start->tv_usec;
 	micro -= end->tv_usec;
-	
+
 	micro *= EMA_SCALE;
 
 	if (ema->ema1 == 0) {
@@ -840,22 +839,22 @@ void radius_stats_ema(fr_stats_ema_t *ema,
 		ema->ema10 = micro;
 	} else {
 		int diff;
-		
+
 		diff = ema->f1 * (micro - ema->ema1);
 		ema->ema1 += (diff / 1000000);
-		
+
 		diff = ema->f10 * (micro - ema->ema10);
 		ema->ema10 += (diff / 1000000);
 	}
-	
-	
+
+
 #ifdef WITH_STATS_DEBUG
 	DEBUG("time %d %d.%06d\t%d.%06d\t%d.%06d\n",
 	      n, micro / PREC, (micro / EMA_SCALE) % USEC,
 	      ema->ema1 / PREC, (ema->ema1 / EMA_SCALE) % USEC,
 	      ema->ema10 / PREC, (ema->ema10 / EMA_SCALE) % USEC);
 	n++;
-#endif	
+#endif
 }
 
 #endif /* WITH_STATS */

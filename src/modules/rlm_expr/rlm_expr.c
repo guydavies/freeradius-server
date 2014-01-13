@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_expr.c
@@ -21,11 +21,11 @@
  * @copyright 2001,2006  The FreeRADIUS server project
  * @copyright 2002  Alan DeKok <aland@ox.org>
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/md5.h>
+#include <freeradius-devel/sha1.h>
 #include <freeradius-devel/base64.h>
 #include <freeradius-devel/modules.h>
 
@@ -37,28 +37,29 @@ RCSID("$Id$")
  *	Define a structure for our module configuration.
  */
 typedef struct rlm_expr_t {
-	char *xlat_name;
+	char const *xlat_name;
 	char *allowed_chars;
 } rlm_expr_t;
 
 static const CONF_PARSER module_config[] = {
-	{"safe-characters", PW_TYPE_STRING_PTR,
+	{"safe_characters", PW_TYPE_STRING_PTR,
 	 offsetof(rlm_expr_t, allowed_chars), NULL,
 	"@abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_: /"},
 	{NULL, -1, 0, NULL, NULL}
 };
 
 typedef enum expr_token_t {
-  TOKEN_NONE = 0,
-  TOKEN_INTEGER,
-  TOKEN_ADD,
-  TOKEN_SUBTRACT,
-  TOKEN_DIVIDE,
-  TOKEN_REMAINDER,
-  TOKEN_MULTIPLY,
-  TOKEN_AND,
-  TOKEN_OR,
-  TOKEN_LAST
+	TOKEN_NONE = 0,
+	TOKEN_INTEGER,
+	TOKEN_ADD,
+	TOKEN_SUBTRACT,
+	TOKEN_DIVIDE,
+	TOKEN_REMAINDER,
+	TOKEN_MULTIPLY,
+	TOKEN_AND,
+	TOKEN_OR,
+	TOKEN_POWER,
+	TOKEN_LAST
 } expr_token_t;
 
 typedef struct expr_map_t {
@@ -75,6 +76,7 @@ static expr_map_t map[] =
 	{'%',	TOKEN_REMAINDER },
 	{'&',	TOKEN_AND },
 	{'|',	TOKEN_OR },
+	{'^',	TOKEN_POWER },
 	{0,	TOKEN_LAST}
 };
 
@@ -84,12 +86,12 @@ static expr_map_t map[] =
 static char randstr_punc[] = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 static char randstr_salt[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmopqrstuvwxyz/.";
 
-static int get_number(REQUEST *request, const char **string, int64_t *answer)
+static int get_number(REQUEST *request, char const **string, int64_t *answer)
 {
 	int		i, found;
 	int64_t		result;
 	int64_t		x;
-	const char	*p;
+	char const 	*p;
 	expr_token_t	this;
 
 	/*
@@ -108,7 +110,7 @@ static int get_number(REQUEST *request, const char **string, int64_t *answer)
 		/*
 		 *  Discover which token it is.
 		 */
-		found = FALSE;
+		found = false;
 		for (i = 0; map[i].token != TOKEN_LAST; i++) {
 			if (*p == map[i].op) {
 				if (this != TOKEN_NONE) {
@@ -117,7 +119,7 @@ static int get_number(REQUEST *request, const char **string, int64_t *answer)
 				}
 				this = map[i].token;
 				p++;
-				found = TRUE;
+				found = true;
 				break;
 			}
 		}
@@ -158,6 +160,15 @@ static int get_number(REQUEST *request, const char **string, int64_t *answer)
 			 *
 			 *  If it isn't, then we die.
 			 */
+			if ((*p == '0') && (p[1] == 'x')) {
+				char *end;
+
+				x = strtoul(p, &end, 16);
+				p = end;
+				goto calc;
+			}
+
+
 			if ((*p < '0') || (*p > '9')) {
 				RDEBUG2("Not a number at \"%s\"", p);
 				return -1;
@@ -175,6 +186,7 @@ static int get_number(REQUEST *request, const char **string, int64_t *answer)
 			}
 		}
 
+	calc:
 		switch (this) {
 		default:
 		case TOKEN_NONE:
@@ -216,6 +228,14 @@ static int get_number(REQUEST *request, const char **string, int64_t *answer)
 		case TOKEN_OR:
 			result |= x;
 			break;
+
+		case TOKEN_POWER:
+			if ((x > 255) || (x < 0)) {
+				REDEBUG("Exponent must be between 0-255");
+				return -1;
+			}
+			x = fr_pow((int32_t) result, (uint8_t) x);
+			break;
 		}
 
 		/*
@@ -235,30 +255,17 @@ static int get_number(REQUEST *request, const char **string, int64_t *answer)
 /*
  *  Do xlat of strings!
  */
-static size_t expr_xlat(void *instance, REQUEST *request, const char *fmt,
-			char *out, size_t outlen)
+static ssize_t expr_xlat(UNUSED void *instance, REQUEST *request, char const *fmt,
+			 char *out, size_t outlen)
 {
 	int		rcode;
 	int64_t		result;
-	rlm_expr_t	*inst = instance;
-	const		char *p;
-	char		buffer[256];
+	char const 	*p;
 
-	inst = inst;		/* -Wunused */
-
-	/*
-	 * Do an xlat on the provided string (nice recursive operation).
-	 */
-	if (!radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL)) {
-		radlog(L_ERR, "rlm_expr: xlat failed.");
-		*out = '\0';
-		return 0;
-	}
-
-	p = buffer;
+	p = fmt;
 	rcode = get_number(request, &p, &result);
 	if (rcode < 0) {
-		return 0;
+		return -1;
 	}
 
 	/*
@@ -266,7 +273,7 @@ static size_t expr_xlat(void *instance, REQUEST *request, const char *fmt,
 	 */
 	if (*p != '\0') {
 		RDEBUG2("Failed at %s", p);
-		return 0;
+		return -1;
 	}
 
 	snprintf(out, outlen, "%ld", (long int) result);
@@ -277,27 +284,20 @@ static size_t expr_xlat(void *instance, REQUEST *request, const char *fmt,
  *  @brief Generate a random integer value
  *
  */
-static size_t rand_xlat(UNUSED void *instance, REQUEST *request, const char *fmt,
-			char *out, size_t outlen)
+static ssize_t rand_xlat(UNUSED void *instance, UNUSED REQUEST *request, char const *fmt,
+			 char *out, size_t outlen)
 {
 	int64_t		result;
-	char		buffer[256];
 
-	/*
-	 * Do an xlat on the provided string (nice recursive operation).
-	 */
-	if (!radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL)) {
-		radlog(L_ERR, "rlm_expr: xlat failed.");
-		*out = '\0';
-		return 0;
-	}
-
-	result = atoi(buffer);
+	result = atoi(fmt);
 
 	/*
 	 *	Too small or too big.
 	 */
-	if (result <= 0) return 0;
+	if (result <= 0) {
+		*out = '\0';
+		return -1;
+	}
 	if (result >= (1 << 30)) result = (1 << 30);
 
 	result *= fr_rand();	/* 0..2^32-1 */
@@ -313,29 +313,19 @@ static size_t rand_xlat(UNUSED void *instance, REQUEST *request, const char *fmt
  *  Build strings of random chars, useful for generating tokens and passcodes
  *  Format similar to String::Random.
  */
-static size_t randstr_xlat(UNUSED void *instance, REQUEST *request,
-			   const char *fmt, char *out, size_t outlen)
+static ssize_t randstr_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+			    char const *fmt, char *out, size_t outlen)
 {
-	char		*p;
-	char		buffer[1024];
+	char const 	*p;
 	unsigned int	result;
 	size_t		freespace = outlen;
-	size_t		len;
-	
+
 	if (outlen <= 1) return 0;
 
-	/*
-	 * Do an xlat on the provided string (nice recursive operation).
-	 */
-	len = radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL);
-	if (!len) {
-		radlog(L_ERR, "rlm_expr: xlat failed.");
-		*out = '\0';
-		return 0;
-	}
-	
-	p = buffer;
-	while ((len-- > 0) && (--freespace > 0)) {
+	*out = '\0';
+
+	p = fmt;
+	while (*p && (--freespace > 0)) {
 		result = fr_rand();
 		switch (*p) {
 			/*
@@ -343,106 +333,95 @@ static size_t randstr_xlat(UNUSED void *instance, REQUEST *request,
 			 */
 			case 'c':
 				*out++ = 'a' + (result % 26);
-			break;
-			
+				break;
+
 			/*
 			 *  Uppercase letters
 			 */
 			case 'C':
 				*out++ = 'A' + (result % 26);
-			break;
-			
+				break;
+
 			/*
 			 *  Numbers
 			 */
 			case 'n':
 				*out++ = '0' + (result % 10);
-			break;
-			
+				break;
+
 			/*
 			 *  Alpha numeric
 			 */
 			case 'a':
 				*out++ = randstr_salt[result % (sizeof(randstr_salt) - 3)];
-			break;
-			
+				break;
+
 			/*
 			 *  Punctuation
 			 */
 			case '!':
 				*out++ = randstr_punc[result % (sizeof(randstr_punc) - 1)];
-			break;
-			
+				break;
+
 			/*
 			 *  Alpa numeric + punctuation
 			 */
 			case '.':
 				*out++ = '!' + (result % 95);
-			break;
-			
+				break;
+
 			/*
 			 *  Alpha numeric + salt chars './'
-			 */	
+			 */
 			case 's':
 				*out++ = randstr_salt[result % (sizeof(randstr_salt) - 1)];
-			break;
-			
+				break;
+
 			/*
-			 *  Binary data as hexits (we don't really support 
+			 *  Binary data as hexits (we don't really support
 			 *  non printable chars).
 			 */
 			case 'h':
-				if (freespace < 2)
+				if (freespace < 2) {
 					break;
-				
+				}
+
 				snprintf(out, 3, "%02x", result % 256);
-				
+
 				/* Already decremented */
 				freespace -= 1;
 				out += 2;
-			break;
-			
+				break;
+
 			default:
-				radlog(L_ERR,
-				       "rlm_expr: invalid character class '%c'",
-				       *p);
-				       
-				return 0;
-			break;
+				ERROR("rlm_expr: invalid character class '%c'", *p);
+
+				return -1;
 		}
-	
+
 		p++;
 	}
-	
+
 	*out++ = '\0';
-	
+
 	return outlen - freespace;
 }
 
 /**
- * @brief URLencode special characters 
+ * @brief URLencode special characters
  *
  * Example: "%{urlquote:http://example.org/}" == "http%3A%47%47example.org%47"
  */
-static size_t urlquote_xlat(UNUSED void *instance, REQUEST *request,
-			    const char *fmt, char *out, size_t outlen)
+static ssize_t urlquote_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+			     char const *fmt, char *out, size_t outlen)
 {
-	char	*p;
-	char 	buffer[1024];
+	char const 	*p;
 	size_t	freespace = outlen;
-	size_t	len;
-	
+
 	if (outlen <= 1) return 0;
 
-	len = radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL);
-	if (!len) {
-		radlog(L_ERR, "rlm_expr: xlat failed.");
-		*out = '\0';
-		return 0;
-	}
-
-	p = buffer;
-	while ((len-- > 0) && (--freespace > 0)) {
+	p = fmt;
+	while (*p && (--freespace > 0)) {
 		if (isalnum(*p)) {
 			*out++ = *p++;
 			continue;
@@ -458,9 +437,9 @@ static size_t urlquote_xlat(UNUSED void *instance, REQUEST *request,
 			default:
 				if (freespace < 3)
 					break;
-				
+
 				snprintf(out, 4, "%%%02x", *p++); /* %xx */
-				
+
 				/* Already decremented */
 				freespace -= 2;
 				out += 3;
@@ -473,30 +452,21 @@ static size_t urlquote_xlat(UNUSED void *instance, REQUEST *request,
 }
 
 /**
- * @brief Equivalent to the old safe-characters functionality in rlm_sql
+ * @brief Equivalent to the old safe_characters functionality in rlm_sql
  *
- * Example: "%{escape:<img>foo.jpg</img>}" == "=60img=62foo.jpg=60=/img=62"
+ * @verbatim Example: "%{escape:<img>foo.jpg</img>}" == "=60img=62foo.jpg=60/img=62" @endverbatim
  */
-static size_t escape_xlat(UNUSED void *instance, REQUEST *request,
-			  const char *fmt, char *out, size_t outlen)
+static ssize_t escape_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+			   char const *fmt, char *out, size_t outlen)
 {
 	rlm_expr_t *inst = instance;
-	char	*p;
-	char 	buffer[1024];
+	char const 	*p;
 	size_t	freespace = outlen;
-	size_t	len;
-	
+
 	if (outlen <= 1) return 0;
 
-	len = radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL);
-	if (!len) {
-		radlog(L_ERR, "rlm_expr: xlat failed.");
-		*out = '\0';
-		return 0;
-	}
-
-	p = buffer;
-	while ((len-- > 0) && (--freespace > 0)) {
+	p = fmt;
+	while (*p && (--freespace > 0)) {
 		/*
 		 *	Non-printable characters get replaced with their
 		 *	mime-encoded equivalents.
@@ -505,43 +475,38 @@ static size_t escape_xlat(UNUSED void *instance, REQUEST *request,
 			*out++ = *p++;
 			continue;
 		}
-		
+
 		if (freespace < 3)
 			break;
 
 		snprintf(out, 4, "=%02X", *p++);
-		
+
 		/* Already decremented */
 		freespace -= 2;
 		out += 3;
 	}
-	
+
 	*out = '\0';
-	
+
 	return outlen - freespace;
 }
 
 /**
  * @brief Convert a string to lowercase
  *
- * Example "%{lc:Bar}" == "bar"
+ * Example "%{tolower:Bar}" == "bar"
  *
  * Probably only works for ASCII
  */
-static size_t lc_xlat(UNUSED void *instance, REQUEST *request,
-		      const char *fmt, char *out, size_t outlen)
+static ssize_t lc_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+		       char const *fmt, char *out, size_t outlen)
 {
-	char *p, *q;
-	char buffer[1024];
+	char *q;
+	char const *p;
 
 	if (outlen <= 1) return 0;
 
-	if (!radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL)) {
-		*out = '\0';
-		return 0;
-	}
-
-	for (p = buffer, q = out; *p != '\0'; p++, outlen--) {
+	for (p = fmt, q = out; *p != '\0'; p++, outlen--) {
 		if (outlen <= 1) break;
 
 		*(q++) = tolower((int) *p);
@@ -555,24 +520,19 @@ static size_t lc_xlat(UNUSED void *instance, REQUEST *request,
 /**
  * @brief Convert a string to uppercase
  *
- * Example: "%{uc:Foo}" == "FOO"
+ * Example: "%{toupper:Foo}" == "FOO"
  *
  * Probably only works for ASCII
  */
-static size_t uc_xlat(UNUSED void *instance, REQUEST *request,
-		      const char *fmt, char *out, size_t outlen)
+static ssize_t uc_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+		       char const *fmt, char *out, size_t outlen)
 {
-	char *p, *q;
-	char buffer[1024];
+	char *q;
+	char const *p;
 
 	if (outlen <= 1) return 0;
 
-	if (!radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL)) {
-		*out = '\0';
-		return 0;
-	}
-
-	for (p = buffer, q = out; *p != '\0'; p++, outlen--) {
+	for (p = fmt, q = out; *p != '\0'; p++, outlen--) {
 		if (outlen <= 1) break;
 
 		*(q++) = toupper((int) *p);
@@ -588,29 +548,33 @@ static size_t uc_xlat(UNUSED void *instance, REQUEST *request,
  *
  * Example: "%{md5:foo}" == "acbd18db4cc2f85cedef654fccc4a4d8"
  */
-static size_t md5_xlat(UNUSED void *instance, REQUEST *request,
-		       const char *fmt, char *out, size_t outlen)
+static ssize_t md5_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+		        char const *fmt, char *out, size_t outlen)
 {
-	char buffer[1024];
 	uint8_t digest[16];
-	int i;
+	int i, len;
 	FR_MD5_CTX ctx;
 
-	if (!radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL)) {
+	/*
+	 *	We need room for at least one octet of output.
+	 */
+	if (outlen < 3) {
 		*out = '\0';
 		return 0;
 	}
 
 	fr_MD5Init(&ctx);
-	fr_MD5Update(&ctx, (void *) buffer, strlen(buffer));
+	fr_MD5Update(&ctx, (const void *) fmt, strlen(fmt));
 	fr_MD5Final(digest, &ctx);
 
-	if (outlen < 33) {
-		snprintf(out, outlen, "md5_overflow");
-		return strlen(out);
-	}
+	/*
+	 *	Each digest octet takes two hex digits, plus one for
+	 *	the terminating NUL.
+	 */
+	len = (outlen / 2) - 1;
+	if (len > 16) len = 16;
 
-	for (i = 0; i < 16; i++) {
+	for (i = 0; i < len; i++) {
 		snprintf(out + i * 2, 3, "%02x", digest[i]);
 	}
 
@@ -618,31 +582,66 @@ static size_t md5_xlat(UNUSED void *instance, REQUEST *request,
 }
 
 /**
+ * @brief Calculate the SHA1 hash of a string.
+ *
+ * Example: "%{sha1:foo}" == "0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33"
+ */
+static ssize_t sha1_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+                         char const *fmt, char *out, size_t outlen)
+{
+        uint8_t digest[20];
+        int i, len;
+        fr_SHA1_CTX ctx;
+
+        /*
+         *      We need room for at least one octet of output.
+         */
+        if (outlen < 3) {
+                *out = '\0';
+                return 0;
+        }
+
+        fr_SHA1Init(&ctx);
+        fr_SHA1Update(&ctx, (const void *) fmt, strlen(fmt));
+        fr_SHA1Final(digest, &ctx);
+
+        /*
+         *      Each digest octet takes two hex digits, plus one for
+         *      the terminating NUL. SHA1 is 160 bits (20 bytes)
+         */
+        len = (outlen / 2) - 1;
+        if (len > 20) len = 20;
+
+        for (i = 0; i < len; i++) {
+                snprintf(out + i * 2, 3, "%02x", digest[i]);
+        }
+
+        return strlen(out);
+}
+
+/**
  * @brief Encode string as base64
  *
  * Example: "%{tobase64:foo}" == "Zm9v"
  */
-static size_t base64_xlat(UNUSED void *instance, REQUEST *request,
-			  const char *fmt, char *out, size_t outlen)
+static ssize_t base64_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+			   char const *fmt, char *out, size_t outlen)
 {
-	size_t len;
-	char buffer[1024];
+	ssize_t len;
 
-	len = radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL);
-	
-	/* 
+	len = strlen(fmt);
+
+	/*
 	 *  We can accurately calculate the length of the output string
 	 *  if it's larger than outlen, the output would be useless so abort.
 	 */
-	if (!len || ((FR_BASE64_ENC_LENGTH(len) + 1) > outlen)) {
-		radlog(L_ERR, "rlm_expr: xlat failed.");
+	if ((len < 0) || ((FR_BASE64_ENC_LENGTH(len) + 1) > (ssize_t) outlen)) {
+		REDEBUG("xlat failed");
 		*out = '\0';
-		return 0;
+		return -1;
 	}
-	
-	fr_base64_encode((uint8_t *) buffer, len, out, outlen);
 
-	return strlen(out);
+	return fr_base64_encode((const uint8_t *) fmt, len, out, outlen);
 }
 
 /**
@@ -650,62 +649,30 @@ static size_t base64_xlat(UNUSED void *instance, REQUEST *request,
  *
  * Example: "%{base64tohex:Zm9v}" == "666f6f"
  */
-static size_t base64_to_hex_xlat(UNUSED void *instance, REQUEST *request,
-				 const char *fmt, char *out, size_t outlen)
-{	
-	char *p;
-	
-	char buffer[1024];
-	char decbuf[1024];
-	
-	size_t declen = sizeof(decbuf);
-	size_t freespace = outlen;
-	size_t len;
-
-	len = radius_xlat(buffer, sizeof(buffer), fmt, request, NULL, NULL);
-	
-	if (!len) {
-		radlog(L_ERR, "rlm_expr: xlat failed.");
-		*out = '\0';
-		return 0;
-	}
-	
-	if (!fr_base64_decode(buffer, len, decbuf, &declen)) {
-		radlog(L_ERR, "rlm_expr: base64 string invalid");
-		*out = '\0';
-		return 0;
-	}
-	
-	p = decbuf;
-	while ((declen-- > 0) && (--freespace > 0)) {
-		if (freespace < 3)
-			break;
-
-		snprintf(out, 3, "%02x", *p++);
-		
-		/* Already decremented */
-		freespace -= 1;
-		out += 2;
-	}
-
-	return outlen - freespace;
-}
-
-
-/*
- * Detach a instance free all ..
- */
-static int expr_detach(void *instance)
+static ssize_t base64_to_hex_xlat(UNUSED void *instance, UNUSED REQUEST *request,
+				  char const *fmt, char *out, size_t outlen)
 {
-	rlm_expr_t	*inst = instance;
+	uint8_t decbuf[1024];
 
-	xlat_unregister(inst->xlat_name, expr_xlat, instance);
-	pair_builtincompare_detach();
-	free(inst->xlat_name);
+	ssize_t declen;
+	ssize_t len = strlen(fmt);
 
-	free(inst);
-	return 0;
+	*out = '\0';
+
+	declen = fr_base64_decode(fmt, len, decbuf, sizeof(decbuf));
+	if (declen < 0) {
+		REDEBUG("Base64 string invalid");
+		return -1;
+	}
+
+	if ((size_t)((declen * 2) + 1) > outlen) {
+		REDEBUG("Base64 conversion failed, output buffer exhausted, needed %zd bytes, have %zd bytes",
+			(declen * 2) + 1, outlen);
+	}
+
+	return fr_bin2hex(out, decbuf, declen);
 }
+
 
 /*
  *	Do any per-module initialization that is separate to each
@@ -717,49 +684,35 @@ static int expr_detach(void *instance)
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int expr_instantiate(CONF_SECTION *conf, void **instance)
+static int mod_instantiate(CONF_SECTION *conf, void *instance)
 {
-	rlm_expr_t	*inst;
-	const char	*xlat_name;
+	rlm_expr_t *inst = instance;
 
-	/*
-	 *	Set up a storage area for instance data
-	 */
-
-	inst = rad_malloc(sizeof(rlm_expr_t));
-	if (!inst)
-		return -1;
-	memset(inst, 0, sizeof(rlm_expr_t));
-	
-	if (cf_section_parse(conf, inst, module_config) < 0) {
-		expr_detach(inst);
-		return -1;
+	inst->xlat_name = cf_section_name2(conf);
+	if (!inst->xlat_name) {
+		inst->xlat_name = cf_section_name1(conf);
 	}
 
-	xlat_name = cf_section_name2(conf);
-	if (xlat_name == NULL)
-		xlat_name = cf_section_name1(conf);
-	if (xlat_name){
-		inst->xlat_name = strdup(xlat_name);
-		xlat_register(xlat_name, expr_xlat, inst);
-	}
-
-	xlat_register("rand", rand_xlat, inst);
-	xlat_register("randstr", randstr_xlat, inst);
-	xlat_register("urlquote", urlquote_xlat, inst);
-	xlat_register("escape", escape_xlat, inst);
-	xlat_register("tolower", lc_xlat, inst);
-	xlat_register("toupper", uc_xlat, inst);
-	xlat_register("md5", md5_xlat, inst);
-	xlat_register("tobase64", base64_xlat, inst);
-	xlat_register("base64tohex", base64_to_hex_xlat, inst);
+	xlat_register(inst->xlat_name, expr_xlat, NULL, inst);
 
 	/*
-	 * Initialize various paircompare functions
+	 *	FIXME: unregister these, too
 	 */
-	pair_builtincompare_init();
-	*instance = inst;
+	xlat_register("rand", rand_xlat, NULL, inst);
+	xlat_register("randstr", randstr_xlat, NULL, inst);
+	xlat_register("urlquote", urlquote_xlat, NULL, inst);
+	xlat_register("escape", escape_xlat, NULL, inst);
+	xlat_register("tolower", lc_xlat, NULL, inst);
+	xlat_register("toupper", uc_xlat, NULL, inst);
+	xlat_register("md5", md5_xlat, NULL, inst);
+	xlat_register("sha1", sha1_xlat, NULL, inst);
+	xlat_register("tobase64", base64_xlat, NULL, inst);
+	xlat_register("base64tohex", base64_to_hex_xlat, NULL, inst);
 
+	/*
+	 *	Initialize various paircompare functions
+	 */
+	pair_builtincompare_add(instance);
 	return 0;
 }
 
@@ -776,8 +729,10 @@ module_t rlm_expr = {
 	RLM_MODULE_INIT,
 	"expr",				/* Name */
 	RLM_TYPE_CHECK_CONFIG_SAFE,   	/* type */
-	expr_instantiate,		/* instantiation */
-	expr_detach,			/* detach */
+	sizeof(rlm_expr_t),
+	module_config,
+	mod_instantiate,		/* instantiation */
+	NULL,				/* detach */
 	{
 		NULL,			/* authentication */
 		NULL,			/* authorization */

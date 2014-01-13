@@ -21,19 +21,9 @@
  * Copyright 2012   Alan DeKok <aland@deployingradius.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/radpaths.h>
-
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
-
-#ifdef HAVE_NETINET_IN_H
-#include <netinet/in.h>
-#endif
 
 #ifdef HAVE_SYS_UN_H
 #include <sys/un.h>
@@ -60,8 +50,6 @@ RCSID("$Id$")
 #define USE_READLINE (1)
 #endif /* !defined(HAVE_READLINE_H) */
 
-#endif /* HAVE_LIBREADLINE */
-
 #ifdef HAVE_READLINE_HISTORY
 #if defined(HAVE_READLINE_HISTORY_H)
 #include <readline/history.h>
@@ -73,12 +61,14 @@ RCSID("$Id$")
 
 #endif /* HAVE_READLINE_HISTORY */
 
+#endif /* HAVE_LIBREADLINE */
+
 /*
  *	For configuration file stuff.
  */
-char *radius_dir = RADDBDIR;
-const char *progname = "radmin";
-const char *radmin_version = "radmin version " RADIUSD_VERSION_STRING
+char const *radius_dir = RADDBDIR;
+char const *progname = "radmin";
+char const *radmin_version = "radmin version " RADIUSD_VERSION_STRING
 #ifdef RADIUSD_VERSION_COMMIT
 " (git #" RADIUSD_VERSION_COMMIT ")"
 #endif
@@ -90,29 +80,52 @@ const char *radmin_version = "radmin version " RADIUSD_VERSION_STRING
  *	they're running inside of the server.  And we don't (yet)
  *	have a "libfreeradius-server", or "libfreeradius-util".
  */
-int debug_flag = 0;
+log_debug_t debug_flag = 0;
 struct main_config_t mainconfig;
-char *request_log_file = NULL;
-char *debug_log_file = NULL;
-size_t radius_xlat(UNUSED char *out, UNUSED int outlen, UNUSED const char *fmt,
-		   UNUSED REQUEST *request,
-		   UNUSED RADIUS_ESCAPE_STRING func, UNUSED void *arg)
-{
-	return -1;
-}
-int check_config = FALSE;
+
+bool check_config = false;
 
 static FILE *outputfp = NULL;
-static int echo = FALSE;
-static const char *secret = "testing123";
+static int echo = false;
+static char const *secret = "testing123";
 
-static int fr_domain_socket(const char *path)
+#include <sys/wait.h>
+pid_t rad_fork(void)
+{
+	return fork();
+}
+
+#ifdef HAVE_PTHREAD_H
+pid_t rad_waitpid(pid_t pid, int *status)
+{
+	return waitpid(pid, status, 0);
+}
+#endif
+
+static void NEVER_RETURNS usage(int status)
+{
+	FILE *output = status ? stderr : stdout;
+	fprintf(output, "Usage: %s [ args ]\n", progname);
+	fprintf(output, "  -d raddb_dir    Configuration files are in \"raddbdir/*\".\n");
+	fprintf(output, "  -e command      Execute 'command' and then exit.\n");
+	fprintf(output, "  -E              Echo commands as they are being executed.\n");
+	fprintf(output, "  -f socket_file  Open socket_file directly, without reading radius.conf\n");
+	fprintf(output, "  -h              Print usage help information.\n");
+	fprintf(output, "  -i input_file   Read commands from 'input_file'.\n");
+	fprintf(output, "  -n name         Read raddb/name.conf instead of raddb/radiusd.conf\n");
+	fprintf(output, "  -o output_file  Write commands to 'output_file'.\n");
+	fprintf(output, "  -q              Quiet mode.\n");
+
+	exit(status);
+}
+
+static int fr_domain_socket(char const *path)
 {
 	int sockfd = -1;
 #ifdef HAVE_SYS_UN_H
 	size_t len;
 	socklen_t socklen;
-        struct sockaddr_un saremote;
+	struct sockaddr_un saremote;
 
 	len = strlen(path);
 	if (len >= sizeof(saremote.sun_path)) {
@@ -120,18 +133,18 @@ static int fr_domain_socket(const char *path)
 		return -1;
 	}
 
-        if ((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+	if ((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
 		fprintf(stderr, "%s: Failed creating socket: %s\n",
 			progname, strerror(errno));
 		return -1;
-        }
+	}
 
-        saremote.sun_family = AF_UNIX;
+	saremote.sun_family = AF_UNIX;
 	memcpy(saremote.sun_path, path, len + 1); /* SUN_LEN does strlen */
-	
+
 	socklen = SUN_LEN(&saremote);
 
-        if (connect(sockfd, (struct sockaddr *)&saremote, socklen) < 0) {
+	if (connect(sockfd, (struct sockaddr *)&saremote, socklen) < 0) {
 		struct stat buf;
 
 		close(sockfd);
@@ -148,19 +161,19 @@ static int fr_domain_socket(const char *path)
 		}
 
 		return -1;
-        }
+	}
 
 #ifdef O_NONBLOCK
 	{
 		int flags;
-		
+
 		if ((flags = fcntl(sockfd, F_GETFL, NULL)) < 0)  {
 			fprintf(stderr, "%s: Failure getting socket flags: %s",
 				progname, strerror(errno));
 			close(sockfd);
 			return -1;
 		}
-		
+
 		flags |= O_NONBLOCK;
 		if( fcntl(sockfd, F_SETFL, flags) < 0) {
 			fprintf(stderr, "%s: Failure setting socket flags: %s",
@@ -174,7 +187,7 @@ static int fr_domain_socket(const char *path)
 	return sockfd;
 }
 
-static int client_socket(const char *server)
+static int client_socket(char const *server)
 {
 	int sockfd, port;
 	fr_ipaddr_t ipaddr;
@@ -202,7 +215,7 @@ static int client_socket(const char *server)
 			progname, server, strerror(errno));
 		exit(1);
 	}
-	
+
 	return sockfd;
 }
 
@@ -215,7 +228,7 @@ static void do_challenge(int sockfd)
 	for (total = 0; total < sizeof(challenge); ) {
 		r = read(sockfd, challenge + total, sizeof(challenge) - total);
 		if (r == 0) exit(1);
-		
+
 		if (r < 0) {
 #ifdef ECONNRESET
 			if (errno == ECONNRESET) {
@@ -225,7 +238,7 @@ static void do_challenge(int sockfd)
 			}
 #endif
 			if (errno == EINTR) continue;
-			
+
 			fprintf(stderr, "%s: Failed reading data: %s\n",
 				progname, strerror(errno));
 			exit(1);
@@ -234,30 +247,16 @@ static void do_challenge(int sockfd)
 		fflush(stdout);
 	}
 
-	fr_hmac_md5((const uint8_t *) secret, strlen(secret), 
+	fr_hmac_md5((uint8_t const *) secret, strlen(secret),
 		    challenge, sizeof(challenge), challenge);
 
-	write(sockfd, challenge, sizeof(challenge));
+	if (write(sockfd, challenge, sizeof(challenge)) < 0) {
+		fprintf(stderr, "%s: Failed writing challenge data: %s\n",
+			progname, strerror(errno));
+	}
 }
 
-
-static int usage(void)
-{
-	printf("Usage: %s [ args ]\n", progname);
-	printf("  -d raddb_dir    Configuration files are in \"raddbdir/*\".\n");
-	printf("  -e command      Execute 'command' and then exit.\n");
-	printf("  -E              Echo commands as they are being executed.\n");
-	printf("  -f socket_file  Open socket_file directly, without reading radius.conf\n");
-	printf("  -h              Print usage help information.\n");
-	printf("  -i input_file   Read commands from 'input_file'.\n");
-	printf("  -n name         Read raddb/name.conf instead of raddb/radiusd.conf\n");
-	printf("  -o output_file  Write commands to 'output_file'.\n");
-	printf("  -q              Quiet mode.\n");
-
-	exit(1);
-}
-
-static ssize_t run_command(int sockfd, const char *command,
+static ssize_t run_command(int sockfd, char const *command,
 			   char *buffer, size_t bufsize)
 {
 	char *p;
@@ -334,7 +333,7 @@ static ssize_t run_command(int sockfd, const char *command,
 		 */
 		p = strstr(buffer, "radmin> ");
 		if (p &&
-		    ((p == buffer) || 
+		    ((p == buffer) ||
 		     (p[-1] == '\n') ||
 		     (p[-1] == '\r'))) {
 			*p = '\0';
@@ -364,16 +363,18 @@ int main(int argc, char **argv)
 	uint32_t magic, needed;
 	char *line = NULL;
 	ssize_t len, size;
-	const char *file = NULL;
-	const char *name = "radiusd";
+	char const *file = NULL;
+	char const *name = "radiusd";
 	char *p, buffer[65536];
-	const char *input_file = NULL;
+	char const *input_file = NULL;
 	FILE *inputfp = stdin;
-	const char *output_file = NULL;
-	const char *server = NULL;
-	
+	char const *output_file = NULL;
+	char const *server = NULL;
+
 	char *commands[MAX_COMMANDS];
 	int num_commands = -1;
+
+	talloc_set_log_stderr();
 
 	outputfp = stdout;	/* stdout is not a constant value... */
 
@@ -407,7 +408,7 @@ int main(int argc, char **argv)
 			break;
 
 		case 'E':
-			echo = TRUE;
+			echo = true;
 			break;
 
 		case 'f':
@@ -417,7 +418,7 @@ int main(int argc, char **argv)
 
 		default:
 		case 'h':
-			usage();
+			usage(0);
 			break;
 
 		case 'i':
@@ -445,7 +446,7 @@ int main(int argc, char **argv)
 		case 's':
 			if (file) {
 				fprintf(stderr, "%s: -s and -f cannot be used together.\n", progname);
-				exit(1);
+				usage(1);
 			}
 			radius_dir = NULL;
 			server = optarg;
@@ -468,16 +469,15 @@ int main(int argc, char **argv)
 
 		cs = cf_file_read(buffer);
 		if (!cs) {
-			fprintf(stderr, "%s: Errors reading or parsing %s\n",
-				progname, buffer);
-			exit(1);
+			fprintf(stderr, "%s: Errors reading or parsing %s\n", progname, buffer);
+			usage(1);
 		}
 
 		subcs = NULL;
 		while ((subcs = cf_subsection_find_next(cs, subcs, "listen")) != NULL) {
-			const char *value;
+			char const *value;
 			CONF_PAIR *cp = cf_pair_find(subcs, "type");
-			
+
 			if (!cp) continue;
 
 			value = cf_pair_value(cp);
@@ -497,16 +497,14 @@ int main(int argc, char **argv)
 			}
 
 			if (!file) {
-				fprintf(stderr, "%s: No path given for socket\n",
-					progname);
-				exit(1);
+				fprintf(stderr, "%s: No path given for socket\n", progname);
+				usage(1);
 			}
 			break;
 		}
 
 		if (!file) {
-			fprintf(stderr, "%s: Could not find control socket in %s\n",
-				progname, buffer);
+			fprintf(stderr, "%s: Could not find control socket in %s\n", progname, buffer);
 			exit(1);
 		}
 	}
@@ -514,8 +512,7 @@ int main(int argc, char **argv)
 	if (input_file) {
 		inputfp = fopen(input_file, "r");
 		if (!inputfp) {
-			fprintf(stderr, "%s: Failed opening %s: %s\n",
-				progname, input_file, strerror(errno));
+			fprintf(stderr, "%s: Failed opening %s: %s\n", progname, input_file, strerror(errno));
 			exit(1);
 		}
 	}
@@ -523,8 +520,7 @@ int main(int argc, char **argv)
 	if (output_file) {
 		outputfp = fopen(output_file, "w");
 		if (!outputfp) {
-			fprintf(stderr, "%s: Failed creating %s: %s\n",
-				progname, output_file, strerror(errno));
+			fprintf(stderr, "%s: Failed creating %s: %s\n", progname, output_file, strerror(errno));
 			exit(1);
 		}
 	}
@@ -574,7 +570,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "%s: Socket %s is not FreeRADIUS administration socket\n", progname, file);
 		exit(1);
 	}
-	
+
 	memcpy(&magic, buffer + 4, 4);
 	magic = ntohl(magic);
 
@@ -602,7 +598,7 @@ int main(int argc, char **argv)
 			size = run_command(sockfd, commands[i],
 					   buffer, sizeof(buffer));
 			if (size < 0) exit(1);
-			
+
 			if (buffer[0]) {
 				fputs(buffer, outputfp);
 				fprintf(outputfp, "\n");
@@ -614,7 +610,7 @@ int main(int argc, char **argv)
 
 	if (!done_license && !quiet) {
 		printf("%s - FreeRADIUS Server administration tool.\n", radmin_version);
-		printf("Copyright (C) 2008-2012 The FreeRADIUS server project and contributors.\n");
+		printf("Copyright (C) 2008-2014 The FreeRADIUS server project and contributors.\n");
 		printf("There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A\n");
 		printf("PARTICULAR PURPOSE.\n");
 		printf("You may redistribute copies of FreeRADIUS under the terms of the\n");
@@ -636,14 +632,14 @@ int main(int argc, char **argv)
 #else
 		if (!quiet) {
 			line = readline("radmin> ");
-			
+
 			if (!line) break;
-			
+
 			if (!*line) {
 				free(line);
 				continue;
 			}
-			
+
 #ifdef USE_READLINE_HISTORY
 			add_history(line);
 #endif
@@ -659,7 +655,7 @@ int main(int argc, char **argv)
 					progname);
 				exit(1);
 			}
-			
+
 			*p = '\0';
 
 			/*

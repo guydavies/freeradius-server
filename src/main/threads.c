@@ -21,8 +21,8 @@
  * Copyright 2000  Alan DeKok <aland@ox.org>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
+USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #include <freeradius-devel/radiusd.h>
 #include <freeradius-devel/process.h>
@@ -77,7 +77,7 @@ RCSID("$Id$")
 #define THREAD_CANCELLED	(2)
 #define THREAD_EXITED		(3)
 
-#define NUM_FIFOS               RAD_LISTEN_MAX
+#define NUM_FIFOS	       RAD_LISTEN_MAX
 
 /*
  *  A data structure which contains the information about
@@ -86,18 +86,18 @@ RCSID("$Id$")
  *  pthread_id     pthread id
  *  thread_num     server thread number, 1...number of threads
  *  semaphore     used to block the thread until a request comes in
- *  status        is the thread running or exited?
+ *  status	is the thread running or exited?
  *  request_count the number of requests that this thread has handled
  *  timestamp     when the thread started executing.
  */
 typedef struct THREAD_HANDLE {
 	struct THREAD_HANDLE *prev;
 	struct THREAD_HANDLE *next;
-	pthread_t            pthread_id;
-	int                  thread_num;
-	int                  status;
-	unsigned int         request_count;
-	time_t               timestamp;
+	pthread_t	    pthread_id;
+	int		  thread_num;
+	int		  status;
+	unsigned int	 request_count;
+	time_t	       timestamp;
 	REQUEST		     *request;
 } THREAD_HANDLE;
 
@@ -131,6 +131,7 @@ typedef struct THREAD_POOL {
 	THREAD_HANDLE *tail;
 
 	int active_threads;	/* protected by queue_mutex */
+	int exited_threads;
 	int total_threads;
 	int max_thread_num;
 	int start_threads;
@@ -157,7 +158,7 @@ typedef struct THREAD_POOL {
 #ifdef WITH_STATS
 	fr_pps_t	pps_in, pps_out;
 #ifdef WITH_ACCOUNTING
-	int		auto_limit_acct;
+	bool		auto_limit_acct;
 #endif
 #endif
 
@@ -179,7 +180,7 @@ typedef struct THREAD_POOL {
 } THREAD_POOL;
 
 static THREAD_POOL thread_pool;
-static int pool_initialized = FALSE;
+static int pool_initialized = false;
 
 #ifndef WITH_GCD
 static time_t last_cleaned = 0;
@@ -192,13 +193,13 @@ static void thread_pool_manage(time_t now);
  *	A mapping of configuration file names to internal integers
  */
 static const CONF_PARSER thread_config[] = {
-	{ "start_servers",           PW_TYPE_INTEGER, 0, &thread_pool.start_threads,           "5" },
-	{ "max_servers",             PW_TYPE_INTEGER, 0, &thread_pool.max_threads,             "32" },
+	{ "start_servers",	   PW_TYPE_INTEGER, 0, &thread_pool.start_threads,	   "5" },
+	{ "max_servers",	     PW_TYPE_INTEGER, 0, &thread_pool.max_threads,	     "32" },
 	{ "min_spare_servers",       PW_TYPE_INTEGER, 0, &thread_pool.min_spare_threads,       "3" },
 	{ "max_spare_servers",       PW_TYPE_INTEGER, 0, &thread_pool.max_spare_threads,       "10" },
 	{ "max_requests_per_server", PW_TYPE_INTEGER, 0, &thread_pool.max_requests_per_thread, "0" },
-	{ "cleanup_delay",           PW_TYPE_INTEGER, 0, &thread_pool.cleanup_delay,           "5" },
-	{ "max_queue_size",          PW_TYPE_INTEGER, 0, &thread_pool.max_queue_size,          "65536" },
+	{ "cleanup_delay",	   PW_TYPE_INTEGER, 0, &thread_pool.cleanup_delay,	   "5" },
+	{ "max_queue_size",	  PW_TYPE_INTEGER, 0, &thread_pool.max_queue_size,	  "65536" },
 #ifdef WITH_STATS
 #ifdef WITH_ACCOUNTING
 	{ "auto_limit_acct",	     PW_TYPE_BOOLEAN, 0, &thread_pool.auto_limit_acct, NULL },
@@ -218,7 +219,7 @@ static const CONF_PARSER thread_config[] = {
  *
  *	Note: this only implements static callbacks.
  *	OpenSSL does not use dynamic locking callbacks
- *	right now, but may in the futiure, so we will have
+ *	right now, but may in the future, so we will have
  *	to add them at some point.
  */
 
@@ -229,11 +230,8 @@ static unsigned long ssl_id_function(void)
 	return (unsigned long) pthread_self();
 }
 
-static void ssl_locking_function(int mode, int n, const char *file, int line)
+static void ssl_locking_function(int mode, int n, UNUSED char const *file, UNUSED int line)
 {
-	file = file;		/* -Wunused */
-	line = line;		/* -Wunused */
-
 	if (mode & CRYPTO_LOCK) {
 		pthread_mutex_lock(&(ssl_mutexes[n]));
 	} else {
@@ -254,7 +252,7 @@ static int setup_ssl_mutexes(void)
 
 	ssl_mutexes = rad_malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
 	if (!ssl_mutexes) {
-		radlog(L_ERR, "Error allocating memory for SSL mutexes!");
+		ERROR("Error allocating memory for SSL mutexes!");
 		return 0;
 	}
 
@@ -329,7 +327,8 @@ int request_enqueue(REQUEST *request)
 	 *	go manage it.
 	 */
 	if ((last_cleaned < request->timestamp) ||
-	    (thread_pool.active_threads == thread_pool.total_threads)) {
+	    (thread_pool.active_threads == thread_pool.total_threads) ||
+	    (thread_pool.exited_threads > 0)) {
 		thread_pool_manage(request->timestamp);
 	}
 
@@ -342,24 +341,74 @@ int request_enqueue(REQUEST *request)
 		struct timeval now;
 
 		/*
-		 *	Throw away accounting requests if we're too busy.
+		 *	Throw away accounting requests if we're too
+		 *	busy.  The NAS should retransmit these, and no
+		 *	one should notice.
+		 *
+		 *	In contrast, we always try to process
+		 *	authentication requests.  Those are more time
+		 *	critical, and it's harder to determine which
+		 *	we can throw away, and which we can keep.
+		 *
+		 *	We allow the queue to get half full before we
+		 *	start worrying.  Even then, we still require
+		 *	that the rate of input packets is higher than
+		 *	the rate of outgoing packets.  i.e. the queue
+		 *	is growing.
+		 *
+		 *	Once that happens, we roll a dice to see where
+		 *	the barrier is for "keep" versus "toss".  If
+		 *	the queue is smaller than the barrier, we
+		 *	allow it.  If the queue is larger than the
+		 *	barrier, we throw the packet away.  Otherwise,
+		 *	we keep it.
+		 *
+		 *	i.e. the probability of throwing the packet
+		 *	away increases from 0 (queue is half full), to
+		 *	100 percent (queue is completely full).
+		 *
+		 *	A probabilistic approach allows us to process
+		 *	SOME of the new accounting packets.
 		 */
-		if ((request->packet->code == PW_ACCOUNTING_REQUEST) &&
-		    (fr_fifo_num_elements(thread_pool.fifo[RAD_LISTEN_ACCT]) > 0) && 
+		if ((request->packet->code == PW_CODE_ACCOUNTING_REQUEST) &&
 		    (thread_pool.num_queued > (thread_pool.max_queue_size / 2)) &&
 		    (thread_pool.pps_in.pps_now > thread_pool.pps_out.pps_now)) {
-			
-			pthread_mutex_unlock(&thread_pool.queue_mutex);
-			return 0;
+			uint32_t prob;
+			int keep;
+
+			/*
+			 *	Take a random value of how full we
+			 *	want the queue to be.  It's OK to be
+			 *	half full, but we get excited over
+			 *	anything more than that.
+			 */
+			keep = (thread_pool.max_queue_size / 2);
+			prob = fr_rand() & ((1 << 10) - 1);
+			keep *= prob;
+			keep >>= 10;
+			keep += (thread_pool.max_queue_size / 2);
+
+			/*
+			 *	If the queue is larger than our dice
+			 *	roll, we throw the packet away.
+			 */
+			if (thread_pool.num_queued > keep) {
+				pthread_mutex_unlock(&thread_pool.queue_mutex);
+				return 0;
+			}
 		}
 
 		gettimeofday(&now, NULL);
-		
+
+		/*
+		 *	Calculate the instantaneous arrival rate into
+		 *	the queue.
+		 */
 		thread_pool.pps_in.pps = rad_pps(&thread_pool.pps_in.pps_old,
 						 &thread_pool.pps_in.pps_now,
 						 &thread_pool.pps_in.time_old,
 						 &now);
-		
+
 		thread_pool.pps_in.pps_now++;
 	}
 #endif	/* WITH_ACCOUNTING */
@@ -368,23 +417,23 @@ int request_enqueue(REQUEST *request)
 	thread_pool.request_count++;
 
 	if (thread_pool.num_queued >= thread_pool.max_queue_size) {
-		int complain = FALSE;
+		int complain = false;
 		time_t now;
 		static time_t last_complained = 0;
 
 		now = time(NULL);
 		if (last_complained != now) {
 			last_complained = now;
-			complain = TRUE;
+			complain = true;
 		}
-		    
+
 		pthread_mutex_unlock(&thread_pool.queue_mutex);
 
 		/*
 		 *	Mark the request as done.
 		 */
 		if (complain) {
-			radlog(L_ERR, "Something is blocking the server.  There are %d packets in the queue, waiting to be processed.  Ignoring the new request.", thread_pool.max_queue_size);
+			ERROR("Something is blocking the server.  There are %d packets in the queue, waiting to be processed.  Ignoring the new request.", thread_pool.max_queue_size);
 		}
 		return 0;
 	}
@@ -396,7 +445,7 @@ int request_enqueue(REQUEST *request)
 	 */
 	if (!fr_fifo_push(thread_pool.fifo[request->priority], request)) {
 		pthread_mutex_unlock(&thread_pool.queue_mutex);
-		radlog(L_ERR, "!!! ERROR !!! Failed inserting request %d into the queue", request->number);
+		ERROR("!!! ERROR !!! Failed inserting request %d into the queue", request->number);
 		return 0;
 	}
 
@@ -425,6 +474,8 @@ static int request_dequeue(REQUEST **prequest)
 {
 	time_t blocked;
 	static time_t last_complained = 0;
+	static time_t total_blocked = 0;
+	int num_blocked;
 	RAD_LISTEN_TYPE i, start;
 	REQUEST *request;
 	reap_children();
@@ -437,7 +488,11 @@ static int request_dequeue(REQUEST **prequest)
 		struct timeval now;
 
 		gettimeofday(&now, NULL);
-		
+
+		/*
+		 *	Calculate the instantaneous departure rate
+		 *	from the queue.
+		 */
 		thread_pool.pps_out.pps  = rad_pps(&thread_pool.pps_out.pps_old,
 						   &thread_pool.pps_out.pps_now,
 						   &thread_pool.pps_out.time_old,
@@ -459,7 +514,7 @@ static int request_dequeue(REQUEST **prequest)
 		request = fr_fifo_peek(thread_pool.fifo[i]);
 		if (!request) continue;
 
-		rad_assert(request->magic == REQUEST_MAGIC);
+		VERIFY_REQUEST(request);
 
 		if (request->master_state != REQUEST_STOP_PROCESSING) {
 			continue;
@@ -470,6 +525,7 @@ static int request_dequeue(REQUEST **prequest)
 		 */
 		request = fr_fifo_pop(thread_pool.fifo[i]);
 		rad_assert(request != NULL);
+		VERIFY_REQUEST(request);
 		request->child_state = REQUEST_DONE;
 		thread_pool.num_queued--;
 	}
@@ -482,6 +538,7 @@ static int request_dequeue(REQUEST **prequest)
 	for (i = start; i < RAD_LISTEN_MAX; i++) {
 		request = fr_fifo_pop(thread_pool.fifo[i]);
 		if (request) {
+			VERIFY_REQUEST(request);
 			start = i;
 			break;
 		}
@@ -501,7 +558,7 @@ static int request_dequeue(REQUEST **prequest)
 	rad_assert(request->magic == REQUEST_MAGIC);
 
 	request->component = "<core>";
-	request->module = "<thread>";
+	request->module = "";
 
 	/*
 	 *	If the request has sat in the queue for too long,
@@ -524,21 +581,24 @@ static int request_dequeue(REQUEST **prequest)
 
 	blocked = time(NULL);
 	if ((blocked - request->timestamp) > 5) {
+		total_blocked++;
 		if (last_complained < blocked) {
 			last_complained = blocked;
 			blocked -= request->timestamp;
+			num_blocked = total_blocked;
 		} else {
 			blocked = 0;
 		}
 	} else {
+		total_blocked = 0;
 		blocked = 0;
 	}
 
 	pthread_mutex_unlock(&thread_pool.queue_mutex);
 
 	if (blocked) {
-		radlog(L_ERR, "(%u) %s has been waiting in the processing queue for %d seconds.  Check that all databases are running properly!",
-		       request->number, fr_packet_codes[request->packet->code], (int) blocked);
+		ERROR("%d requests have been waiting in the processing queue for %d seconds.  Check that all databases are running properly!",
+		      num_blocked, (int) blocked);
 	}
 
 	return 1;
@@ -574,8 +634,8 @@ static void *request_handler_thread(void *arg)
 				DEBUG2("Re-wait %d", self->thread_num);
 				goto re_wait;
 			}
-			radlog(L_ERR, "Thread %d failed waiting for semaphore: %s: Exiting\n",
-			       self->thread_num, strerror(errno));
+			ERROR("Thread %d failed waiting for semaphore: %s: Exiting\n",
+			       self->thread_num, fr_syserror(errno));
 			break;
 		}
 
@@ -609,30 +669,29 @@ static void *request_handler_thread(void *arg)
 		       self->thread_num, self->request->number,
 		       self->request_count);
 
-		if ((self->request->packet->code == PW_ACCOUNTING_REQUEST) &&
+#ifdef WITH_ACCOUNTING
+		if ((self->request->packet->code == PW_CODE_ACCOUNTING_REQUEST) &&
 		    thread_pool.auto_limit_acct) {
 			VALUE_PAIR *vp;
 			REQUEST *request = self->request;
 
 			vp = radius_paircreate(request, &request->config_items,
-					       181, VENDORPEC_FREERADIUS,
-					       PW_TYPE_INTEGER);
+					       181, VENDORPEC_FREERADIUS);
 			if (vp) vp->vp_integer = thread_pool.pps_in.pps;
 
 			vp = radius_paircreate(request, &request->config_items,
-					       182, VENDORPEC_FREERADIUS,
-					       PW_TYPE_INTEGER);
+					       182, VENDORPEC_FREERADIUS);
 			if (vp) vp->vp_integer = thread_pool.pps_in.pps;
-			
+
 			vp = radius_paircreate(request, &request->config_items,
-					       183, VENDORPEC_FREERADIUS,
-					       PW_TYPE_INTEGER);
+					       183, VENDORPEC_FREERADIUS);
 			if (vp) {
 				vp->vp_integer = thread_pool.max_queue_size - thread_pool.num_queued;
 				vp->vp_integer *= 100;
 				vp->vp_integer /= thread_pool.max_queue_size;
 			}
 		}
+#endif
 
 		self->request->process(self->request, FR_ACTION_RUN);
 		self->request = NULL;
@@ -644,6 +703,17 @@ static void *request_handler_thread(void *arg)
 		rad_assert(thread_pool.active_threads > 0);
 		thread_pool.active_threads--;
 		pthread_mutex_unlock(&thread_pool.queue_mutex);
+
+		/*
+		 *	If the thread has handled too many requests, then make it
+		 *	exit.
+		 */
+		if ((thread_pool.max_requests_per_thread > 0) &&
+		    (self->request_count >= thread_pool.max_requests_per_thread)) {
+			DEBUG2("Thread %d handled too many requests",
+			       self->thread_num);
+			break;
+		}
 	} while (self->status != THREAD_CANCELLED);
 
 	DEBUG2("Thread %d exiting...", self->thread_num);
@@ -657,12 +727,16 @@ static void *request_handler_thread(void *arg)
 	ERR_remove_state(0);
 #endif
 
+	pthread_mutex_lock(&thread_pool.queue_mutex);
+	thread_pool.exited_threads++;
+	pthread_mutex_unlock(&thread_pool.queue_mutex);
+
 	/*
 	 *  Do this as the LAST thing before exiting.
 	 */
 	self->request = NULL;
 	self->status = THREAD_EXITED;
-	exec_trigger(NULL, NULL, "server.thread.stop", TRUE);
+	exec_trigger(NULL, NULL, "server.thread.stop", true);
 
 	return NULL;
 }
@@ -728,7 +802,7 @@ static THREAD_HANDLE *spawn_thread(time_t now, int do_trigger)
 	 */
 	if (thread_pool.total_threads >= thread_pool.max_threads) {
 		DEBUG2("Thread spawn failed.  Maximum number of threads (%d) already running.", thread_pool.max_threads);
-		exec_trigger(NULL, NULL, "server.thread.max_threads", TRUE);
+		exec_trigger(NULL, NULL, "server.thread.max_threads", true);
 		return NULL;
 	}
 
@@ -754,8 +828,8 @@ static THREAD_HANDLE *spawn_thread(time_t now, int do_trigger)
 	rcode = pthread_create(&handle->pthread_id, 0,
 			request_handler_thread, handle);
 	if (rcode != 0) {
-		radlog(L_ERR, "Thread create failed: %s",
-		       strerror(rcode));
+		ERROR("Thread create failed: %s",
+		       fr_syserror(rcode));
 		return NULL;
 	}
 
@@ -765,7 +839,7 @@ static THREAD_HANDLE *spawn_thread(time_t now, int do_trigger)
 	thread_pool.total_threads++;
 	DEBUG2("Thread spawned new child %d. Total threads in pool: %d",
 			handle->thread_num, thread_pool.total_threads);
-	if (do_trigger) exec_trigger(NULL, NULL, "server.thread.start", TRUE);
+	if (do_trigger) exec_trigger(NULL, NULL, "server.thread.start", true);
 
 	/*
 	 *	Add the thread handle to the tail of the thread pool list.
@@ -793,17 +867,17 @@ static THREAD_HANDLE *spawn_thread(time_t now, int do_trigger)
 
 
 #ifdef WNOHANG
-static uint32_t pid_hash(const void *data)
+static uint32_t pid_hash(void const *data)
 {
-	const thread_fork_t *tf = data;
+	thread_fork_t const *tf = data;
 
 	return fr_hash(&tf->pid, sizeof(tf->pid));
 }
 
-static int pid_cmp(const void *one, const void *two)
+static int pid_cmp(void const *one, void const *two)
 {
-	const thread_fork_t *a = one;
-	const thread_fork_t *b = two;
+	thread_fork_t const *a = one;
+	thread_fork_t const *b = two;
 
 	return (a->pid - b->pid);
 }
@@ -815,7 +889,7 @@ static int pid_cmp(const void *one, const void *two)
  *
  *	FIXME: What to do on a SIGHUP???
  */
-int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
+int thread_pool_init(UNUSED CONF_SECTION *cs, int *spawn_flag)
 {
 #ifndef WITH_GCD
 	int		i, rcode;
@@ -823,17 +897,15 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 #endif
 	time_t		now;
 
-	cs = cs;		/* -Wunused */
-
 	now = time(NULL);
 
 	rad_assert(spawn_flag != NULL);
-	rad_assert(*spawn_flag == TRUE);
-	rad_assert(pool_initialized == FALSE); /* not called on HUP */
+	rad_assert(*spawn_flag == true);
+	rad_assert(pool_initialized == false); /* not called on HUP */
 
 #ifndef WITH_GCD
 	pool_cf = cf_subsection_find_next(cs, NULL, "thread");
-	if (!pool_cf) *spawn_flag = FALSE;
+	if (!pool_cf) *spawn_flag = false;
 #endif
 
 	/*
@@ -849,17 +921,17 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 	thread_pool.stop_flag = 0;
 #endif
 	thread_pool.spawn_flag = *spawn_flag;
-	
+
 	/*
 	 *	Don't bother initializing the mutexes or
 	 *	creating the hash tables.  They won't be used.
 	 */
 	if (!*spawn_flag) return 0;
-	
+
 #ifdef WNOHANG
 	if ((pthread_mutex_init(&thread_pool.wait_mutex,NULL) != 0)) {
-		radlog(L_ERR, "FATAL: Failed to initialize wait mutex: %s",
-		       strerror(errno));
+		ERROR("FATAL: Failed to initialize wait mutex: %s",
+		       fr_syserror(errno));
 		return -1;
 	}
 
@@ -870,7 +942,7 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 						   pid_cmp,
 						   free);
 	if (!thread_pool.waiters) {
-		radlog(L_ERR, "FATAL: Failed to set up wait hash");
+		ERROR("FATAL: Failed to set up wait hash");
 		return -1;
 	}
 #endif
@@ -891,15 +963,15 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 		thread_pool.max_spare_threads = thread_pool.min_spare_threads;
 	if (thread_pool.max_threads == 0)
 		thread_pool.max_threads = 256;
-	if ((thread_pool.max_queue_size < 2) || (thread_pool.max_queue_size > 1048576)) {
-		radlog(L_ERR, "FATAL: max_queue_size value must be in range 2-1048576");
+	if ((thread_pool.max_queue_size < 2) || (thread_pool.max_queue_size > 1024*1024)) {
+		ERROR("FATAL: max_queue_size value must be in range 2-1048576");
 		return -1;
 	}
 #endif	/* WITH_GCD */
 
 	/*
 	 *	The pool has already been initialized.  Don't spawn
-	 *	new threads, and don't forget about forked children,
+	 *	new threads, and don't forget about forked children.
 	 */
 	if (pool_initialized) {
 		return 0;
@@ -912,15 +984,15 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 	memset(&thread_pool.semaphore, 0, sizeof(thread_pool.semaphore));
 	rcode = sem_init(&thread_pool.semaphore, 0, SEMAPHORE_LOCKED);
 	if (rcode != 0) {
-		radlog(L_ERR, "FATAL: Failed to initialize semaphore: %s",
-		       strerror(errno));
+		ERROR("FATAL: Failed to initialize semaphore: %s",
+		       fr_syserror(errno));
 		return -1;
 	}
 
 	rcode = pthread_mutex_init(&thread_pool.queue_mutex,NULL);
 	if (rcode != 0) {
-		radlog(L_ERR, "FATAL: Failed to initialize queue mutex: %s",
-		       strerror(errno));
+		ERROR("FATAL: Failed to initialize queue mutex: %s",
+		       fr_syserror(errno));
 		return -1;
 	}
 
@@ -930,7 +1002,7 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 	for (i = 0; i < RAD_LISTEN_MAX; i++) {
 		thread_pool.fifo[i] = fr_fifo_create(thread_pool.max_queue_size, NULL);
 		if (!thread_pool.fifo[i]) {
-			radlog(L_ERR, "FATAL: Failed to set up request fifo");
+			ERROR("FATAL: Failed to set up request fifo");
 			return -1;
 		}
 	}
@@ -942,7 +1014,7 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 	 *	to set up the mutexes and enable the thread callbacks.
 	 */
 	if (!setup_ssl_mutexes()) {
-		radlog(L_ERR, "FATAL: Failed to set up SSL mutexes");
+		ERROR("FATAL: Failed to set up SSL mutexes");
 		return -1;
 	}
 #endif
@@ -962,14 +1034,14 @@ int thread_pool_init(CONF_SECTION *cs, int *spawn_flag)
 #else
 	thread_pool.queue = dispatch_queue_create("org.freeradius.threads", NULL);
 	if (!thread_pool.queue) {
-		radlog(L_ERR, "Failed creating dispatch queue: %s\n",
-		       strerror(errno));
-		exit(1);
+		ERROR("Failed creating dispatch queue: %s\n",
+		       fr_syserror(errno));
+		fr_exit(1);
 	}
 #endif
 
 	DEBUG2("Thread pool initialized");
-	pool_initialized = TRUE;
+	pool_initialized = true;
 	return 0;
 }
 
@@ -1016,7 +1088,7 @@ int request_enqueue(REQUEST *request)
 	dispatch_block_t block;
 
 	block = ^{
-		request->process(request, fun);
+		request->process(request, FR_ACTION_RUN);
 	};
 
 	dispatch_async(thread_pool.queue, block);
@@ -1038,6 +1110,25 @@ static void thread_pool_manage(time_t now)
 	int i, total;
 	THREAD_HANDLE *handle, *next;
 	int active_threads;
+
+	/*
+	 *	Loop over the thread pool, deleting exited threads.
+	 */
+	for (handle = thread_pool.head; handle; handle = next) {
+		next = handle->next;
+
+		/*
+		 *	Maybe we've asked the thread to exit, and it
+		 *	has agreed.
+		 */
+		if (handle->status == THREAD_EXITED) {
+			pthread_join(handle->pthread_id, NULL);
+			delete_thread(handle);
+			pthread_mutex_lock(&thread_pool.queue_mutex);
+			thread_pool.exited_threads--;
+			pthread_mutex_unlock(&thread_pool.queue_mutex);
+		}
+	}
 
 	/*
 	 *	We don't need a mutex lock here, as we're reading
@@ -1096,22 +1187,6 @@ static void thread_pool_manage(time_t now)
 	last_cleaned = now;
 
 	/*
-	 *	Loop over the thread pool, deleting exited threads.
-	 */
-	for (handle = thread_pool.head; handle; handle = next) {
-		next = handle->next;
-
-		/*
-		 *	Maybe we've asked the thread to exit, and it
-		 *	has agreed.
-		 */
-		if (handle->status == THREAD_EXITED) {
-			pthread_join(handle->pthread_id, NULL);
-			delete_thread(handle);
-		}
-	}
-
-	/*
 	 *	Only delete the spare threads if sufficient time has
 	 *	passed since we last created one.  This helps to minimize
 	 *	the amount of create/delete cycles.
@@ -1163,27 +1238,6 @@ static void thread_pool_manage(time_t now)
 	}
 
 	/*
-	 *	If the thread has handled too many requests, then make it
-	 *	exit.
-	 */
-	if (thread_pool.max_requests_per_thread > 0) {
-		for (handle = thread_pool.head; handle; handle = next) {
-			next = handle->next;
-
-			/*
-			 *	Not handling a request, but otherwise
-			 *	live, we can kill it.
-			 */
-			if ((handle->request == NULL) &&
-			    (handle->status == THREAD_RUNNING) &&
-			    (handle->request_count > thread_pool.max_requests_per_thread)) {
-				handle->status = THREAD_CANCELLED;
-				sem_post(&thread_pool.semaphore);
-			}
-		}
-	}
-
-	/*
 	 *	Otherwise everything's kosher.  There are not too few,
 	 *	or too many spare threads.  Exit happily.
 	 */
@@ -1225,7 +1279,7 @@ pid_t rad_fork(void)
 		pthread_mutex_unlock(&thread_pool.wait_mutex);
 
 		if (!rcode) {
-			radlog(L_ERR, "Failed to store PID, creating what will be a zombie process %d",
+			ERROR("Failed to store PID, creating what will be a zombie process %d",
 			       (int) child_pid);
 			free(tf);
 		}
@@ -1321,3 +1375,106 @@ void thread_pool_queue_stats(int array[RAD_LISTEN_MAX], int pps[2])
 	}
 }
 #endif /* HAVE_PTHREAD_H */
+
+static void time_free(void *data)
+{
+	free(data);
+}
+
+void exec_trigger(REQUEST *request, CONF_SECTION *cs, char const *name, int quench)
+{
+	CONF_SECTION *subcs;
+	CONF_ITEM *ci;
+	CONF_PAIR *cp;
+	char const *attr;
+	char const *value;
+	VALUE_PAIR *vp;
+
+	/*
+	 *	Use global "trigger" section if no local config is given.
+	 */
+	if (!cs) {
+		cs = mainconfig.config;
+		attr = name;
+	} else {
+		/*
+		 *	Try to use pair name, rather than reference.
+		 */
+		attr = strrchr(name, '.');
+		if (attr) {
+			attr++;
+		} else {
+			attr = name;
+		}
+	}
+
+	/*
+	 *	Find local "trigger" subsection.  If it isn't found,
+	 *	try using the global "trigger" section, and reset the
+	 *	reference to the full path, rather than the sub-path.
+	 */
+	subcs = cf_section_sub_find(cs, "trigger");
+	if (!subcs && (cs != mainconfig.config)) {
+		subcs = cf_section_sub_find(mainconfig.config, "trigger");
+		attr = name;
+	}
+
+	if (!subcs) return;
+
+	ci = cf_reference_item(subcs, mainconfig.config, attr);
+	if (!ci) {
+		RDEBUG3("No such item in trigger section: %s", attr);
+		return;
+	}
+
+	if (!cf_item_is_pair(ci)) {
+		RDEBUG2("Trigger is not a configuration variable: %s", attr);
+		return;
+	}
+
+	cp = cf_itemtopair(ci);
+	if (!cp) return;
+
+	value = cf_pair_value(cp);
+	if (!value) {
+		RDEBUG2("Trigger has no value: %s", name);
+		return;
+	}
+
+	/*
+	 *	May be called for Status-Server packets.
+	 */
+	vp = NULL;
+	if (request && request->packet) vp = request->packet->vps;
+
+	/*
+	 *	Perform periodic quenching.
+	 */
+	if (quench) {
+		time_t *last_time;
+
+		last_time = cf_data_find(cs, value);
+		if (!last_time) {
+			last_time = rad_malloc(sizeof(*last_time));
+			*last_time = 0;
+
+			if (cf_data_add(cs, value, last_time, time_free) < 0) {
+				free(last_time);
+				last_time = NULL;
+			}
+		}
+
+		/*
+		 *	Send the quenched traps at most once per second.
+		 */
+		if (last_time) {
+			time_t now = time(NULL);
+			if (*last_time == now) return;
+
+			*last_time = now;
+		}
+	}
+
+	RDEBUG("Trigger %s -> %s", name, value);
+	radius_exec_program(request, value, false, true, NULL, 0, EXEC_TIMEOUT, vp, NULL);
+}

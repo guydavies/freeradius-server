@@ -20,7 +20,6 @@
  *  Copyright 2004,2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/libradius.h>
@@ -30,6 +29,9 @@ RCSID("$Id$")
 
 #define PTHREAD_MUTEX_LOCK(_x) if (_x->lock) pthread_mutex_lock(&((_x)->mutex))
 #define PTHREAD_MUTEX_UNLOCK(_x) if (_x->lock) pthread_mutex_unlock(&((_x)->mutex))
+#else
+#define PTHREAD_MUTEX_LOCK(_x)
+#define PTHREAD_MUTEX_UNLOCK(_x)
 #endif
 
 /* red-black tree description */
@@ -43,7 +45,7 @@ struct rbnode_t {
     void	*Data;		/* data stored in node */
 };
 
-#define NIL &Sentinel           /* all leafs are sentinels */
+#define NIL &Sentinel	   /* all leafs are sentinels */
 static rbnode_t Sentinel = { NIL, NIL, NULL, Black, NULL};
 
 struct rbtree_t {
@@ -52,7 +54,7 @@ struct rbtree_t {
 #endif
 	rbnode_t *Root;
 	int	num_elements;
-	int (*Compare)(const void *, const void *);
+	int (*Compare)(void const *, void const *);
 	int replace_flag;
 	void (*freeNode)(void *);
 #ifdef HAVE_PTHREAD_H
@@ -72,7 +74,7 @@ static void FreeWalker(rbtree_t *tree, rbnode_t *X)
 	if (X->Right != NIL) FreeWalker(tree, X->Right);
 
 	if (tree->freeNode) tree->freeNode(X->Data);
-	free(X);
+	talloc_free(X);
 }
 
 void rbtree_free(rbtree_t *tree)
@@ -95,13 +97,13 @@ void rbtree_free(rbtree_t *tree)
 	if (tree->lock) pthread_mutex_destroy(&tree->mutex);
 #endif
 
-	free(tree);
+	talloc_free(tree);
 }
 
 /*
  *	Create a new red-black tree.
  */
-rbtree_t *rbtree_create(int (*Compare)(const void *, const void *),
+rbtree_t *rbtree_create(int (*Compare)(void const *, void const *),
 			void (*freeNode)(void *),
 			int flags)
 {
@@ -109,10 +111,9 @@ rbtree_t *rbtree_create(int (*Compare)(const void *, const void *),
 
 	if (!Compare) return NULL;
 
-	tree = malloc(sizeof(*tree));
+	tree = talloc_zero(NULL, rbtree_t);
 	if (!tree) return NULL;
 
-	memset(tree, 0, sizeof(*tree));
 #ifndef NDEBUG
 	tree->magic = RBTREE_MAGIC;
 #endif
@@ -191,7 +192,7 @@ static void InsertFixup(rbtree_t *tree, rbnode_t *X)
 {
 	/*************************************
 	 *  maintain red-black tree balance  *
-	 *  after inserting node X           *
+	 *  after inserting node X	   *
 	 *************************************/
 
 	/* check red-black properties */
@@ -295,8 +296,10 @@ rbnode_t *rbtree_insertnode(rbtree_t *tree, void *Data)
 	}
 
 	/* setup new node */
-	if ((X = malloc (sizeof(*X))) == NULL) {
-		exit(1);	/* FIXME! */
+	X = talloc_zero(tree, rbnode_t);
+	if (!X) {
+		PTHREAD_MUTEX_UNLOCK(tree);
+		return NULL;
 	}
 
 	X->Data = Data;
@@ -323,17 +326,17 @@ rbnode_t *rbtree_insertnode(rbtree_t *tree, void *Data)
 	return X;
 }
 
-int rbtree_insert(rbtree_t *tree, void *Data)
+bool rbtree_insert(rbtree_t *tree, void *Data)
 {
-	if (rbtree_insertnode(tree, Data)) return 1;
-	return 0;
+	if (rbtree_insertnode(tree, Data)) return true;
+	return false;
 }
 
 static void DeleteFixup(rbtree_t *tree, rbnode_t *X, rbnode_t *Parent)
 {
 	/*************************************
 	 *  maintain red-black tree balance  *
-	 *  after deleting node X            *
+	 *  after deleting node X	    *
 	 *************************************/
 
 	while (X != tree->Root && X->Color == Black) {
@@ -393,13 +396,13 @@ static void DeleteFixup(rbtree_t *tree, rbnode_t *X, rbnode_t *Parent)
 			}
 		}
 	}
-	X->Color = Black;
+	if (X != NIL) X->Color = Black; /* Avoid cache-dirty on NIL */
 }
 
 /*
  *	Delete an element from the tree.
  */
-void rbtree_delete(rbtree_t *tree, rbnode_t *Z)
+static void rbtree_delete_internal(rbtree_t *tree, rbnode_t *Z, int skiplock)
 {
 	rbnode_t *X, *Y;
 	rbnode_t *Parent;
@@ -410,7 +413,9 @@ void rbtree_delete(rbtree_t *tree, rbnode_t *Z)
 
 	if (!Z || Z == NIL) return;
 
-	PTHREAD_MUTEX_LOCK(tree);
+	if (!skiplock) {
+		PTHREAD_MUTEX_LOCK(tree);
+	}
 
 	if (Z->Left == NIL || Z->Right == NIL) {
 		/* Y has a NIL node as a child */
@@ -444,7 +449,7 @@ void rbtree_delete(rbtree_t *tree, rbnode_t *Z)
 		Z->Data = Y->Data;
 		Y->Data = NULL;
 
-		if (Y->Color == Black && X != NIL)
+		if ((Y->Color == Black) && Parent)
 			DeleteFixup(tree, X, Parent);
 
 		/*
@@ -465,41 +470,46 @@ void rbtree_delete(rbtree_t *tree, rbnode_t *Z)
 		if (Y->Left->Parent == Z) Y->Left->Parent = Y;
 		if (Y->Right->Parent == Z) Y->Right->Parent = Y;
 
-		free(Z);
+		talloc_free(Z);
 
 	} else {
 		if (tree->freeNode) tree->freeNode(Y->Data);
 
-		if (Y->Color == Black && X != NIL)
+		if (Y->Color == Black)
 			DeleteFixup(tree, X, Parent);
 
-		free(Y);
+		talloc_free(Y);
 	}
 
 	tree->num_elements--;
-	PTHREAD_MUTEX_UNLOCK(tree);
+	if (!skiplock) {
+		PTHREAD_MUTEX_UNLOCK(tree);
+	}
+}
+void rbtree_delete(rbtree_t *tree, rbnode_t *Z) {
+	rbtree_delete_internal(tree, Z, 0);
 }
 
 /*
  *	Delete a node from the tree, based on given data, which MUST
  *	have come from rbtree_finddata().
  */
-int rbtree_deletebydata(rbtree_t *tree, const void *data)
+bool rbtree_deletebydata(rbtree_t *tree, void const *data)
 {
 	rbnode_t *node = rbtree_find(tree, data);
 
-	if (!node) return 0;	/* false */
+	if (!node) return false;
 
 	rbtree_delete(tree, node);
 
-	return 1;
+	return true;
 }
 
 
 /*
  *	Find an element in the tree, returning the data, not the node.
  */
-rbnode_t *rbtree_find(rbtree_t *tree, const void *Data)
+rbnode_t *rbtree_find(rbtree_t *tree, void const *Data)
 {
 	/*******************************
 	 *  find node containing Data  *
@@ -530,7 +540,7 @@ rbnode_t *rbtree_find(rbtree_t *tree, const void *Data)
 /*
  *	Find the user data.
  */
-void *rbtree_finddata(rbtree_t *tree, const void *Data)
+void *rbtree_finddata(rbtree_t *tree, void const *Data)
 {
 	rbnode_t *X;
 
@@ -538,6 +548,46 @@ void *rbtree_finddata(rbtree_t *tree, const void *Data)
 	if (!X) return NULL;
 
 	return X->Data;
+}
+
+/*
+ * Find a node by data, perform a callback, and perhaps delete the node.
+ */
+void *rbtree_callbydata(rbtree_t *tree, void const *Data,
+			int (*callback)(void *, void *), void *context) {
+
+	/*******************************
+	 *  find node containing Data  *
+	 *******************************/
+
+	rbnode_t *Current;
+
+
+	PTHREAD_MUTEX_LOCK(tree);
+	Current = tree->Root;
+
+	while (Current != NIL) {
+		int result = tree->Compare(Data, Current->Data);
+
+		if (result == 0) {
+			void *data = Current->Data;
+
+			if (callback(context, data) > 0) {
+				rbtree_delete_internal(tree, Current, 1);
+				if (tree->freeNode) {
+					data = NULL;
+				}
+			}
+			PTHREAD_MUTEX_UNLOCK(tree);
+			return data;
+		} else {
+			Current = (result < 0) ?
+				Current->Left : Current->Right;
+		}
+	}
+
+	PTHREAD_MUTEX_UNLOCK(tree);
+	return NULL;
 }
 
 /*
@@ -608,12 +658,12 @@ static int WalkNodePostOrder(rbnode_t *X,
 	int rcode;
 
 	if (X->Left != NIL) {
-		rcode = WalkNodeInOrder(X->Left, callback, context);
+		rcode = WalkNodePostOrder(X->Left, callback, context);
 		if (rcode != 0) return rcode;
 	}
 
 	if (X->Right != NIL) {
-		rcode = WalkNodeInOrder(X->Right, callback, context);
+		rcode = WalkNodePostOrder(X->Right, callback, context);
 		if (rcode != 0) return rcode;
 	}
 
@@ -622,6 +672,62 @@ static int WalkNodePostOrder(rbnode_t *X,
 
 	return 0;		/* we know everything returned zero */
 }
+
+
+/*
+ *	DeleteOrder
+ *
+ *	This executes an InOrder-like walk that adapts to changes in the
+ *	tree above it, which may occur because we allow the callback to
+ *	tell us to delete the current node.
+ */
+static int WalkDeleteOrder(rbtree_t *tree, int (*callback)(void *, void *),
+			   void *context)
+{
+	rbnode_t *Solid, *X;
+	int rcode = 0;
+
+	/* Keep track of last node that refused deletion. */
+	Solid = NIL;
+	while (Solid == NIL) {
+		X = tree->Root;
+		if (X == NIL) break;
+	descend:
+		while (X->Left != NIL) {
+			X = X->Left;
+		}
+	visit:
+		rcode = callback(context, X->Data);
+		if (rcode < 0) {
+			return rcode;
+		}
+		if (rcode) {
+			rbtree_delete_internal(tree, X, 1);
+			if (rcode != 2) {
+				return rcode;
+			}
+		}
+		else {
+			Solid = X;
+		}
+	}
+	if (Solid != NIL) {
+		X = Solid;
+		if (X->Right != NIL) {
+			X = X->Right;
+			goto descend;
+		}
+		while (X->Parent) {
+			if (X->Parent->Left == X) {
+				X = X->Parent;
+				goto visit;
+			}
+			X = X->Parent;
+		}
+	}
+	return rcode;
+}
+
 
 /*
  *	Walk the entire tree.  The callback function CANNOT modify
@@ -648,6 +754,9 @@ int rbtree_walk(rbtree_t *tree, RBTREE_ORDER order,
 	case PostOrder:
 		rcode = WalkNodePostOrder(tree->Root, callback, context);
 		break;
+	case DeleteOrder:
+		rcode = WalkDeleteOrder(tree, callback, context);
+		break;
 	default:
 		rcode = -1;
 		break;
@@ -668,10 +777,8 @@ int rbtree_num_elements(rbtree_t *tree)
 /*
  *	Given a Node, return the data.
  */
-void *rbtree_node2data(rbtree_t *tree, rbnode_t *node)
+void *rbtree_node2data(UNUSED rbtree_t *tree, rbnode_t *node)
 {
-	tree = tree;		/* -Wunused */
-
 	if (!node) return NULL;
 
 	return node->Data;

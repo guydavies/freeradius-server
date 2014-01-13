@@ -4,8 +4,8 @@ ifneq "$(TARGETNAME)" ""
 TARGET		:= $(TARGETNAME).a
 endif
 
-SOURCES		:= $(TARGETNAME).c
+SOURCES		:= $(TARGETNAME).c sql_fbapi.c
 
-SRC_CFLAGS	:= @sql_firebird_cflags@
+SRC_CFLAGS	:= @mod_cflags@
 SRC_CFLAGS	+= -I${top_srcdir}/src/modules/rlm_sql
-TGT_LDLIBS	:= @sql_firebird_ldflags@
+TGT_LDLIBS	:= @mod_ldflags@

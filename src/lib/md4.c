@@ -7,7 +7,6 @@
  *  from public domain source code.
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 /*
@@ -18,8 +17,8 @@ RCSID("$Id$")
 
 void fr_md4_calc(output, input, inlen)
 unsigned char *output;
-const unsigned char *input;                       /* input block */
-unsigned int inlen;                     /* length of input block */
+const unsigned char *input;		       /* input block */
+unsigned int inlen;		     /* length of input block */
 {
 	FR_MD4_CTX	context;
 
@@ -143,7 +142,7 @@ fr_MD4Init(FR_MD4_CTX *ctx)
  * of bytes.
  */
 void
-fr_MD4Update(FR_MD4_CTX *ctx, const unsigned char *buf, size_t len)
+fr_MD4Update(FR_MD4_CTX *ctx, unsigned char const *buf, size_t len)
 {
 	uint32_t count;
 
@@ -253,10 +252,10 @@ fr_MD4Final(unsigned char digest[MD4_DIGEST_LENGTH], FR_MD4_CTX *ctx)
  * the data and converts bytes into longwords for this routine.
  */
 void
-fr_MD4Transform(uint32_t buf[4], const unsigned char inc[MD4_BLOCK_LENGTH])
+fr_MD4Transform(uint32_t buf[4], unsigned char const inc[MD4_BLOCK_LENGTH])
 {
 	uint32_t a, b, c, d;
-	const uint32_t *in = (const uint32_t *)inc;
+	uint32_t const *in = (uint32_t const *)inc;
 
 	a = buf[0];
 	b = buf[1];

@@ -22,13 +22,13 @@
  * Copyright 2000  Chris Parker <cparker@starnetusa.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
-
+USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef HAVE_OPENSSL_CRYPTO_H
+
 #include <openssl/crypto.h>
 #include <openssl/opensslv.h>
 
@@ -44,18 +44,18 @@ static long ssl_built = OPENSSL_VERSION_NUMBER;
 int ssl_check_version(void)
 {
 	long ssl_linked;
-	
+
 	ssl_linked = SSLeay();
-	
+
 	if (ssl_linked != ssl_built) {
-		radlog(L_ERR, "libssl version mismatch."
+		ERROR("libssl version mismatch."
 		       "  Built with: %lx\n  Linked: %lx",
 		       (unsigned long) ssl_built,
 		       (unsigned long) ssl_linked);
-	
+
 		return -1;
 	};
-	
+
 	return 0;
 }
 
@@ -63,18 +63,18 @@ int ssl_check_version(void)
  *
  * Print the currently linked version of the OpenSSL library.
  */
-const char *ssl_version(void)
+char const *ssl_version(void)
 {
-	return SSLeay_version(SSLEAY_VERSION); 
+	return SSLeay_version(SSLEAY_VERSION);
 }
 #else
-int ssl_version_check(void) {
+int ssl_check_version(void) {
 	return 0;
 }
 
-const char *ssl_version()
+char const *ssl_version()
 {
-	return "not linked"
+	return "not linked";
 }
 #endif
 
@@ -83,10 +83,10 @@ const char *ssl_version()
  */
 void version(void)
 {
-	radlog(L_INFO, "%s: %s", progname, radiusd_version);
-	
+	INFO("%s: %s", progname, radiusd_version);
+
 	DEBUG3("Server was built with: ");
-		
+
 #ifdef WITH_ACCOUNTING
 	DEBUG3("  accounting");
 #endif
@@ -147,15 +147,18 @@ void version(void)
 #endif
 
 	DEBUG3("Server core libs:");
-	DEBUG3("  ssl: %s", ssl_version());
+	DEBUG3("  talloc : %i.%i.*", talloc_version_major(),
+	       talloc_version_minor());
+	DEBUG3("  ssl    : %s", ssl_version());
 
-	radlog(L_INFO, "Copyright (C) 1999-2013 The FreeRADIUS server project and contributors.");
-	radlog(L_INFO, "There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A");
-	radlog(L_INFO, "PARTICULAR PURPOSE.");
-	radlog(L_INFO, "You may redistribute copies of FreeRADIUS under the terms of the");
-	radlog(L_INFO, "GNU General Public License.");
-	radlog(L_INFO, "For more information about these matters, see the file named COPYRIGHT.");
-	
+
+	INFO("Copyright (C) 1999-2014 The FreeRADIUS server project and contributors");
+	INFO("There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A");
+	INFO("PARTICULAR PURPOSE");
+	INFO("You may redistribute copies of FreeRADIUS under the terms of the");
+	INFO("GNU General Public License");
+	INFO("For more information about these matters, see the file named COPYRIGHT");
+
 	fflush(NULL);
 }
 

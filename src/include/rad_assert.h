@@ -22,19 +22,18 @@
  * Copyright 2000,2001,2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
 RCSIDH(rad_assert_h, "$Id$")
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-extern void rad_assert_fail (const char *file, unsigned int line, const char *expr);
+extern void rad_assert_fail (char const *file, unsigned int line, char const *expr);
 
 #ifdef NDEBUG
 	#define rad_assert(expr) ((void) (0))
 
-#elif !defined(FR_SCAN_BUILD)
+#elif !defined(__clang_analyzer__)
 	#define rad_assert(expr) \
 		((void) ((expr) ? (void) 0 : \
 			(void) rad_assert_fail (__FILE__, __LINE__, #expr)))

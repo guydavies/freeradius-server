@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_utf8.c
@@ -20,7 +20,6 @@
  *
  * @copyright 2000,2006  The FreeRADIUS server project
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -29,18 +28,16 @@ RCSID("$Id$")
 /*
  *	Reject any non-UTF8 data.
  */
-static rlm_rcode_t utf8_clean(void *instance, REQUEST *request)
+static rlm_rcode_t utf8_clean(UNUSED void *instance, REQUEST *request)
 {
 	size_t i, len;
-	VALUE_PAIR *vp, *next;
+	VALUE_PAIR *vp;
+	vp_cursor_t cursor;
 
-	/* quiet the compiler */
-	instance = instance;
-
-	for (vp = request->packet->vps; vp != NULL; vp = next) {
-		next = vp->next;
-
-		if (vp->type != PW_TYPE_STRING) continue;
+	for (vp = fr_cursor_init(&cursor, &request->packet->vps);
+	     vp;
+	     vp = fr_cursor_next(&cursor)) {
+		if (vp->da->type != PW_TYPE_STRING) continue;
 
 		for (i = 0; i < vp->length; i += len) {
 			len = fr_utf8_char(&vp->vp_octets[i]);
@@ -64,6 +61,8 @@ module_t rlm_utf8 = {
 	RLM_MODULE_INIT,
 	"utf8",
 	RLM_TYPE_THREAD_SAFE,		/* type */
+	0,
+	NULL,				/* CONF_PARSER */
 	NULL,				/* instantiation */
 	NULL,				/* detach */
 	{

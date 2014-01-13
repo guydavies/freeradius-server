@@ -18,10 +18,8 @@
  * Copyright 2007  The FreeRADIUS server project
  * Copyright 2007  Alan DeKok <aland@ox.org>
  */
-#include <freeradius-devel/ident.h>
 RCSIDH(rlm_expr_h, "$Id$")
 
-void pair_builtincompare_init(void);
-void pair_builtincompare_detach(void);
+void pair_builtincompare_add(void *instance);
 
 #endif

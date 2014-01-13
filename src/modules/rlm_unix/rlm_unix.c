@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_unix.c
@@ -26,8 +26,8 @@
  * @copyright 2000  Jeff Carneal <jeff@apex.net>
  * @copyright 2000  Alan Curry <pacman@world.std.com>
  */
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
+USES_APPLE_DEPRECATED_API
 
 #include	<freeradius-devel/radiusd.h>
 
@@ -59,11 +59,11 @@ static char trans[64] =
 #define ENC(c) trans[c]
 
 struct unix_instance {
-	const char *radwtmp;
+	char const *radwtmp;
 };
 
 static const CONF_PARSER module_config[] = {
-	{ "radwtmp",  PW_TYPE_STRING_PTR,
+	{ "radwtmp",  PW_TYPE_FILE_OUTPUT | PW_TYPE_REQUIRED,
 	  offsetof(struct unix_instance,radwtmp), NULL,   "NULL" },
 
 	{ NULL, -1, 0, NULL, NULL }		/* end the list */
@@ -73,18 +73,14 @@ static const CONF_PARSER module_config[] = {
 /*
  *	The Group = handler.
  */
-static int groupcmp(void *instance, REQUEST *req, UNUSED VALUE_PAIR *request,
-		    VALUE_PAIR *check, VALUE_PAIR *check_pairs,
-		    VALUE_PAIR **reply_pairs)
+static int groupcmp(UNUSED void *instance, REQUEST *req, UNUSED VALUE_PAIR *request,
+		    VALUE_PAIR *check, UNUSED VALUE_PAIR *check_pairs,
+		    UNUSED VALUE_PAIR **reply_pairs)
 {
 	struct passwd	*pwd;
 	struct group	*grp;
 	char		**member;
 	int		retval;
-
-	instance = instance;
-	check_pairs = check_pairs;
-	reply_pairs = reply_pairs;
 
 	/*
 	 *	No user name, doesn't compare.
@@ -94,13 +90,13 @@ static int groupcmp(void *instance, REQUEST *req, UNUSED VALUE_PAIR *request,
 	}
 
 	pwd = getpwnam(req->username->vp_strvalue);
-	if (pwd == NULL)
+	if (!pwd)
 		return -1;
 
 	grp = getgrnam(check->vp_strvalue);
-	if (grp == NULL)
+	if (!grp)
 		return -1;
-	
+
 	retval = (pwd->pw_gid == grp->gr_gid) ? 0 : -1;
 	if (retval < 0) {
 		for (member = grp->gr_mem; *member && retval; member++) {
@@ -113,53 +109,19 @@ static int groupcmp(void *instance, REQUEST *req, UNUSED VALUE_PAIR *request,
 
 
 /*
- *	Detach.
- */
-static int unix_detach(void *instance)
-{
-#define inst ((struct unix_instance *)instance)
-
-	paircompare_unregister(PW_GROUP, groupcmp);
-#ifdef PW_GROUP_NAME
-	paircompare_unregister(PW_GROUP_NAME, groupcmp);
-#endif
-#undef inst
-	free(instance);
-	return 0;
-}
-
-/*
  *	Read the config
  */
-static int unix_instantiate(CONF_SECTION *conf, void **instance)
+static int mod_instantiate(UNUSED CONF_SECTION *conf, void *instance)
 {
-	struct unix_instance *inst;
-
-	/*
-	 *	Allocate room for the instance.
-	 */
-	inst = *instance = rad_malloc(sizeof(*inst));
-	if (!inst) {
-		return -1;
-	}
-	memset(inst, 0, sizeof(*inst));
-
-	/*
-	 *	Parse the configuration, failing if we can't do so.
-	 */
-	if (cf_section_parse(conf, inst, module_config) < 0) {
-		unix_detach(inst);
-		return -1;
-	}
+	struct unix_instance *inst = instance;
 
 	/* FIXME - delay these until a group file has been read so we know
 	 * groupcmp can actually do something */
-	paircompare_register(PW_GROUP, PW_USER_NAME, groupcmp, NULL);
+	paircompare_register(dict_attrbyvalue(PW_GROUP, 0), dict_attrbyvalue(PW_USER_NAME, 0), false, groupcmp, inst);
 #ifdef PW_GROUP_NAME /* compat */
-	paircompare_register(PW_GROUP_NAME, PW_USER_NAME, groupcmp, NULL);
+	paircompare_register(dict_attrbyvalue(PW_GROUP_NAME, 0), dict_attrbyvalue(PW_USER_NAME, 0),
+			true, groupcmp, inst);
 #endif
-
-#undef inst
 
 	return 0;
 }
@@ -169,11 +131,10 @@ static int unix_instantiate(CONF_SECTION *conf, void **instance)
  *	Pull the users password from where-ever, and add it to
  *	the given vp list.
  */
-static int unix_getpw(UNUSED void *instance, REQUEST *request,
-		      VALUE_PAIR **vp_list)
+static rlm_rcode_t mod_authorize(UNUSED void *instance, REQUEST *request)
 {
-	const char	*name;
-	const char	*encrypted_pass;
+	char const	*name;
+	char const	*encrypted_pass;
 #ifdef HAVE_GETSPNAM
 	struct spwd	*spwd = NULL;
 #endif
@@ -195,7 +156,7 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 		return RLM_MODULE_NOOP;
 	}
 
-	name = (char *)request->username->vp_strvalue;
+	name = request->username->vp_strvalue;
 	encrypted_pass = NULL;
 
 #ifdef OSFC2
@@ -207,7 +168,7 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 	 *	Check if account is locked.
 	 */
 	if (pr_pw->uflg.fg_lock!=1) {
-		radlog(L_AUTH, "rlm_unix: [%s]: account locked", name);
+		AUTH("rlm_unix: [%s]: account locked", name);
 		return RLM_MODULE_USERLOCK;
 	}
 #else /* OSFC2 */
@@ -227,7 +188,7 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 	 *	prevents users from using NULL password fields as things
 	 *	stand right now.
 	 */
-	if ((encrypted_pass == NULL) || (strlen(encrypted_pass) < 10)) {
+	if ((!encrypted_pass) || (strlen(encrypted_pass) < 10)) {
 		if ((spwd = getspnam(name)) == NULL) {
 			return RLM_MODULE_NOTFOUND;
 		}
@@ -244,8 +205,7 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 	 *	Users with a particular shell are denied access
 	 */
 	if (strcmp(pwd->pw_shell, DENY_SHELL) == 0) {
-		radlog_request(L_AUTH, 0, request,
-			       "rlm_unix: [%s]: invalid shell", name);
+		RAUTH("rlm_unix: [%s]: invalid shell", name);
 		return RLM_MODULE_REJECT;
 	}
 #endif
@@ -262,8 +222,8 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 		}
 	}
 	endusershell();
-	if (shell == NULL) {
-		radlog_request(L_AUTH, 0, request, "[%s]: invalid shell [%s]",
+	if (!shell) {
+		RAUTH("[%s]: invalid shell [%s]",
 		       name, pwd->pw_shell);
 		return RLM_MODULE_REJECT;
 	}
@@ -276,7 +236,7 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 	 */
 	if (spwd && spwd->sp_lstchg > 0 && spwd->sp_max >= 0 &&
 	    (request->timestamp / 86400) > (spwd->sp_lstchg + spwd->sp_max)) {
-		radlog_request(L_AUTH, 0, request, "[%s]: password has expired", name);
+		RAUTH("[%s]: password has expired", name);
 		return RLM_MODULE_REJECT;
 	}
 	/*
@@ -284,7 +244,7 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 	 */
 	if (spwd && spwd->sp_expire > 0 &&
 	    (request->timestamp / 86400) > spwd->sp_expire) {
-		radlog_request(L_AUTH, 0, request, "[%s]: account has expired", name);
+		RAUTH("[%s]: account has expired", name);
 		return RLM_MODULE_REJECT;
 	}
 #endif
@@ -295,7 +255,7 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 	 */
 	if ((pwd->pw_expire > 0) &&
 	    (request->timestamp > pwd->pw_expire)) {
-		radlog_request(L_AUTH, 0, request, "[%s]: password has expired", name);
+		RAUTH("[%s]: password has expired", name);
 		return RLM_MODULE_REJECT;
 	}
 #endif
@@ -308,75 +268,10 @@ static int unix_getpw(UNUSED void *instance, REQUEST *request,
 	if (encrypted_pass[0] == 0)
 		return RLM_MODULE_NOOP;
 
-	vp = pairmake("Crypt-Password", encrypted_pass, T_OP_SET);
+	vp = pairmake_config("Crypt-Password", encrypted_pass, T_OP_SET);
 	if (!vp) return RLM_MODULE_FAIL;
 
-	pairmove(vp_list, &vp);
-	pairfree(&vp);		/* might not be NULL; */
-
 	return RLM_MODULE_UPDATED;
-}
-
-
-/*
- *	Pull the users password from where-ever, and add it to
- *	the given vp list.
- */
-static rlm_rcode_t unix_authorize(void *instance, REQUEST *request)
-{
-	return unix_getpw(instance, request, &request->config_items);
-}
-
-/*
- *	Pull the users password from where-ever, and add it to
- *	the given vp list.
- */
-static rlm_rcode_t unix_authenticate(void *instance, REQUEST *request)
-{
-#ifdef OSFSIA
-	char		*info[2];
-	char		*progname = "radius";
-	SIAENTITY	*ent = NULL;
-
-	info[0] = progname;
-	info[1] = NULL;
-	if (sia_ses_init (&ent, 1, info, NULL, name, NULL, 0, NULL) !=
-	    SIASUCCESS)
-		return RLM_MODULE_NOTFOUND;
-	if ((ret = sia_ses_authent (NULL, passwd, ent)) != SIASUCCESS) {
-		if (ret & SIASTOP)
-			sia_ses_release (&ent);
-		return RLM_MODULE_NOTFOUND;
-	}
-	if (sia_ses_estab (NULL, ent) != SIASUCCESS) {
-		sia_ses_release (&ent);
-		return RLM_MODULE_NOTFOUND;
-	}
-#else  /* OSFSIA */
-	int rcode;
-	VALUE_PAIR *vp = NULL;
-
-	if (!request->password ||
-	    (request->password->attribute != PW_USER_PASSWORD)) {
-		radlog_request(L_AUTH, 0, request, "Attribute \"User-Password\" is required for authentication.");
-		return RLM_MODULE_INVALID;
-	}
-
-	rcode = unix_getpw(instance, request, &vp);
-	if (rcode != RLM_MODULE_UPDATED) return rcode;
-
-	/*
-	 *	0 means "ok"
-	 */
-	if (fr_crypt_check((char *) request->password->vp_strvalue,
-			     (char *) vp->vp_strvalue) != 0) {
-		radlog_request(L_AUTH, 0, request, "invalid password \"%s\"",
-			       request->password->vp_strvalue);
-		return RLM_MODULE_REJECT;
-	}
-#endif /* OSFFIA */
-
-	return RLM_MODULE_OK;
 }
 
 
@@ -412,14 +307,15 @@ static char *uue(void *in)
 /*
  *	Unix accounting - write a wtmp file.
  */
-static rlm_rcode_t unix_accounting(void *instance, REQUEST *request)
+static rlm_rcode_t mod_accounting(void *instance, REQUEST *request)
 {
 	VALUE_PAIR	*vp;
+	vp_cursor_t	cursor;
 	FILE		*fp;
 	struct utmp	ut;
 	time_t		t;
 	char		buf[64];
-	const char	*s;
+	char const	*s;
 	int		delay = 0;
 	int		status = -1;
 	int		nas_address = 0;
@@ -435,7 +331,7 @@ static rlm_rcode_t unix_accounting(void *instance, REQUEST *request)
 	 *	No radwtmp.  Don't do anything.
 	 */
 	if (!inst->radwtmp) {
-		RDEBUG2("No radwtmp file configured.  Ignoring accounting request.");
+		RDEBUG2("No radwtmp file configured.  Ignoring accounting request");
 		return RLM_MODULE_NOOP;
 	}
 
@@ -448,7 +344,7 @@ static rlm_rcode_t unix_accounting(void *instance, REQUEST *request)
 	 *	Which type is this.
 	 */
 	if ((vp = pairfind(request->packet->vps, PW_ACCT_STATUS_TYPE, 0, TAG_ANY))==NULL) {
-		RDEBUG("no Accounting-Status-Type attribute in request.");
+		RDEBUG("no Accounting-Status-Type attribute in request");
 		return RLM_MODULE_NOOP;
 	}
 	status = vp->vp_integer;
@@ -473,13 +369,15 @@ static rlm_rcode_t unix_accounting(void *instance, REQUEST *request)
 	/*
 	 *	First, find the interesting attributes.
 	 */
-	for (vp = request->packet->vps; vp; vp = vp->next) {
-		switch (vp->attribute) {
+	for (vp = fr_cursor_init(&cursor, &request->packet->vps);
+	     vp;
+	     vp = fr_cursor_next(&cursor)) {
+		if (!vp->da->vendor) switch (vp->da->attr) {
 			case PW_USER_NAME:
 				if (vp->length >= sizeof(ut.ut_name)) {
-					memcpy(ut.ut_name, (char *)vp->vp_strvalue, sizeof(ut.ut_name));
+					memcpy(ut.ut_name, vp->vp_strvalue, sizeof(ut.ut_name));
 				} else {
-					strlcpy(ut.ut_name, (char *)vp->vp_strvalue, sizeof(ut.ut_name));
+					strlcpy(ut.ut_name, vp->vp_strvalue, sizeof(ut.ut_name));
 				}
 				break;
 			case PW_LOGIN_IP_HOST:
@@ -588,14 +486,16 @@ module_t rlm_unix = {
 	RLM_MODULE_INIT,
 	"System",
 	RLM_TYPE_THREAD_UNSAFE | RLM_TYPE_CHECK_CONFIG_SAFE,
-	unix_instantiate,		/* instantiation */
-	unix_detach,                 	/* detach */
+	sizeof(struct unix_instance),
+	module_config,
+	mod_instantiate,		/* instantiation */
+	NULL,				/* detach */
 	{
-		unix_authenticate,    /* authentication */
-		unix_authorize,       /* authorization */
-		NULL,                 /* preaccounting */
-		unix_accounting,      /* accounting */
-		NULL,                  /* checksimul */
+		NULL,		    /* authentication */
+		mod_authorize,       /* authorization */
+		NULL,		 /* preaccounting */
+		mod_accounting,      /* accounting */
+		NULL,		  /* checksimul */
 		NULL,			/* pre-proxy */
 		NULL,			/* post-proxy */
 		NULL			/* post-auth */

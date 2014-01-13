@@ -28,53 +28,48 @@
  *
  */
 
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include	<freeradius-devel/radiusd.h>
 #include	<freeradius-devel/modules.h>
 #include	<freeradius-devel/rad_assert.h>
-#include        <freeradius-devel/md5.h>
-#include        <freeradius-devel/sha1.h>
+#include	<freeradius-devel/md5.h>
+#include	<freeradius-devel/sha1.h>
 
 #include 	<ctype.h>
 
 #include	"smbdes.h"
 #include	"mschap.h"
 
-/*
- *	ntpwdhash converts Unicode password to 16-byte NT hash
- *	with MD4
+/** Converts Unicode password to 16-byte NT hash with MD4
+ *
+ * @param[out] out Pointer to 16 byte output buffer.
+ * @param[in] password to encode.
+ * @return 0 on success else -1 on failure.
  */
-void mschap_ntpwdhash (uint8_t *szHash, const char *szPassword)
+int mschap_ntpwdhash(uint8_t *out, char const *password)
 {
-	char szUnicodePass[513];
-	int nPasswordLen;
-	int i;
+	ssize_t len;
+	uint8_t ucs2_password[512];
 
-	/*
-	 *	NT passwords are unicode.  Convert plain text password
-	 *	to unicode by inserting a zero every other byte
-	 */
-	nPasswordLen = strlen(szPassword);
-	for (i = 0; i < nPasswordLen; i++) {
-		szUnicodePass[i << 1] = szPassword[i];
-		szUnicodePass[(i << 1) + 1] = 0;
+    	len = fr_utf8_to_ucs2(ucs2_password, sizeof(ucs2_password), password, strlen(password));
+	if (len < 0) {
+		*out = '\0';
+		return -1;
 	}
+	fr_md4_calc(out, (uint8_t *) ucs2_password, len);
 
-	/* Encrypt Unicode password to a 16-byte MD4 hash */
-	fr_md4_calc(szHash, (uint8_t *) szUnicodePass, (nPasswordLen<<1) );
+	return 0;
 }
-
 
 /*
  *	challenge_hash() is used by mschap2() and auth_response()
  *	implements RFC2759 ChallengeHash()
  *	generates 64 bit challenge
  */
-void mschap_challenge_hash( const uint8_t *peer_challenge,
-			    const uint8_t *auth_challenge,
-			    const char *user_name, uint8_t *challenge )
+void mschap_challenge_hash(uint8_t const *peer_challenge,
+			    uint8_t const *auth_challenge,
+			    char const *user_name, uint8_t *challenge )
 {
 	fr_SHA1_CTX Context;
 	uint8_t hash[20];
@@ -82,7 +77,7 @@ void mschap_challenge_hash( const uint8_t *peer_challenge,
 	fr_SHA1Init(&Context);
 	fr_SHA1Update(&Context, peer_challenge, 16);
 	fr_SHA1Update(&Context, auth_challenge, 16);
-	fr_SHA1Update(&Context, (const uint8_t *) user_name,
+	fr_SHA1Update(&Context, (uint8_t const *) user_name,
 		      strlen(user_name));
 	fr_SHA1Final(hash, &Context);
 	memcpy(challenge, hash, 8);
@@ -93,10 +88,10 @@ void mschap_challenge_hash( const uint8_t *peer_challenge,
  *	according to RFC 2759 GenerateAuthenticatorResponse()
  *	returns 42-octet response string
  */
-void mschap_auth_response(const char *username,
-			  const uint8_t *nt_hash_hash,
-			  uint8_t *ntresponse,
-			  uint8_t *peer_challenge, uint8_t *auth_challenge,
+void mschap_auth_response(char const *username,
+			  uint8_t const *nt_hash_hash,
+			  uint8_t const *ntresponse,
+			  uint8_t const *peer_challenge, uint8_t const *auth_challenge,
 			  char *response)
 {
 	fr_SHA1_CTX Context;
@@ -113,10 +108,10 @@ void mschap_auth_response(const char *username,
 	 0x65, 0x20, 0x69, 0x74, 0x65, 0x72, 0x61, 0x74, 0x69, 0x6F,
 	 0x6E};
 
-	static const char hex[16] = "0123456789ABCDEF";
+	static char const hex[16] = "0123456789ABCDEF";
 
 	size_t i;
-        uint8_t challenge[8];
+	uint8_t challenge[8];
 	uint8_t digest[20];
 
 	fr_SHA1Init(&Context);

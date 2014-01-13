@@ -19,7 +19,6 @@
  * Copyright 2012  Alan DeKok <aland@networkradius.com>
  */
 
-#include <freeradius-devel/ident.h>
 #include <stdio.h>
 #include "rlm_securid.h"
 
@@ -40,7 +39,7 @@ SECURID_SESSION* securid_session_alloc(void)
 	return session;
 }
 
-void securid_session_free(rlm_securid_t *inst,REQUEST *request,
+void securid_session_free(UNUSED rlm_securid_t *inst,REQUEST *request,
 			  SECURID_SESSION *session)
 {
 	if (!session)
@@ -121,7 +120,7 @@ int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request,
 		securid_sessionlist_clean_expired(inst, request, session->timestamp);
 		goto done;
 	}
-	
+
 	if (session->session_id == 0) {
 		/* this is a NEW session (we are not inserting an updated session) */
 		inst->last_session_id++;
@@ -137,11 +136,9 @@ int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request,
 	 *	Generate State, since we've been asked to add it to
 	 *	the list.
 	 */
-	state = pairmake("State", session->state, T_OP_EQ);
+	state = pairmake_reply("State", session->state, T_OP_EQ);
 	if (!state) return -1;
 	state->length = SECURID_STATE_LEN;
-
-
 
 	status = rbtree_insert(inst->session_tree, session);
 	if (status) {
@@ -157,7 +154,7 @@ int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request,
 			session->next = NULL;
 			inst->session_tail = session;
 		} else {
-		        /* 1st time */
+			/* 1st time */
 			inst->session_head = inst->session_tail = session;
 			session->next = session->prev = NULL;
 		}
@@ -172,11 +169,9 @@ int securid_sessionlist_add(rlm_securid_t *inst,REQUEST *request,
 
 	if (!status) {
 		pairfree(&state);
-		radlog(L_ERR, "rlm_securid: Failed to store session");
+		ERROR("rlm_securid: Failed to store session");
 		return -1;
 	}
-
-	pairadd(&(request->reply->vps), state);
 
 	return 0;
 }
@@ -192,7 +187,7 @@ SECURID_SESSION *securid_sessionlist_find(rlm_securid_t *inst, REQUEST *request)
 	VALUE_PAIR	*state;
 	SECURID_SESSION* session;
 	SECURID_SESSION mySession;
-	
+
 	/* clean expired sessions if any */
 	pthread_mutex_lock(&(inst->session_mutex));
 	securid_sessionlist_clean_expired(inst, request, request->timestamp);
@@ -207,7 +202,7 @@ SECURID_SESSION *securid_sessionlist_find(rlm_securid_t *inst, REQUEST *request)
 	}
 
 	if (state->length != SECURID_STATE_LEN) {
-		radlog(L_ERR,"rlm_securid: Invalid State variable. length=%d",state->length);
+	  ERROR("rlm_securid: Invalid State variable. length=%d", (int) state->length);
 		return NULL;
 	}
 
@@ -227,7 +222,7 @@ SECURID_SESSION *securid_sessionlist_find(rlm_securid_t *inst, REQUEST *request)
 	 *	Might not have been there.
 	 */
 	if (!session) {
-		radlog(L_ERR,"rlm_securid: No SECURID session matching the State variable.");
+		ERROR("rlm_securid: No SECURID session matching the State variable");
 		return NULL;
 	}
 
@@ -258,7 +253,7 @@ static SECURID_SESSION *securid_sessionlist_delete(rlm_securid_t *inst, SECURID_
 	 *	Delete old session from the tree.
 	 */
 	rbtree_delete(inst->session_tree, node);
-	
+
 	/*
 	 *	And unsplice it from the linked list.
 	 */

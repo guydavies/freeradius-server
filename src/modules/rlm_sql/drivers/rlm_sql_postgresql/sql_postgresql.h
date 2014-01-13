@@ -3,7 +3,6 @@
 #ifndef _SQL_POSTGRESQL_H_
 #define _SQL_POSTGRESQL_H_
 
-#include <freeradius-devel/ident.h>
 RCSIDH(sql_postgresql_h, "$Id$")
 
 /**************************************************
@@ -11,8 +10,8 @@ RCSIDH(sql_postgresql_h, "$Id$")
 * Does this shite ever needed? Lets c..
 ***************************************************/
 typedef struct pgsql_error{
-	const char *errorcode;
-	const char *meaning;
+	char const *errorcode;
+	char const *meaning;
 	int  shouldreconnect;
 }pgerror;
 

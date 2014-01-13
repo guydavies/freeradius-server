@@ -25,7 +25,6 @@
  * Copyright 2008 The FreeRADIUS server project
  * Copyright 2008 Alan DeKok <aland@deployingradius.com>
  */
-#include <freeradius-devel/ident.h>
 RCSIDH(dhcp_h, "$Id$")
 
 #ifdef __cplusplus
@@ -38,10 +37,11 @@ extern "C" {
 RADIUS_PACKET *fr_dhcp_recv(int sockfd);
 int fr_dhcp_send(RADIUS_PACKET *packet);
 
-int fr_dhcp_add_arp_entry(int fd, const char *interface, VALUE_PAIR *hwvp, VALUE_PAIR *clvp);
+int fr_dhcp_add_arp_entry(int fd, char const *interface, VALUE_PAIR *hwvp, VALUE_PAIR *clvp);
 
-int fr_dhcp_encode(RADIUS_PACKET *packet, RADIUS_PACKET *original);
-ssize_t fr_dhcp_decode_options(uint8_t *data, size_t len, VALUE_PAIR **head);
+int fr_dhcp_encode(RADIUS_PACKET *packet);
+ssize_t fr_dhcp_decode_options(RADIUS_PACKET *packet,
+			       uint8_t const *data, size_t len, VALUE_PAIR **head);
 int fr_dhcp_decode(RADIUS_PACKET *packet);
 
 /*

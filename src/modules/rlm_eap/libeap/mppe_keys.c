@@ -22,38 +22,18 @@
  * Authors: Henrik Eriksson <henriken@axis.com> & Lars Viklund <larsv@axis.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
+USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
-#include <openssl/hmac.h>
 #include "eap_tls.h"
-
-/*
- * Add value pair to reply
- */
-static void add_reply(VALUE_PAIR** vp,
-		      const char* name, const uint8_t * value, int len)
-{
-	VALUE_PAIR *reply_attr;
-	reply_attr = pairmake(name, "", T_OP_EQ);
-	if (!reply_attr) {
-		DEBUG("rlm_eap_tls: "
-		      "add_reply failed to create attribute %s: %s\n",
-		      name, fr_strerror());
-		return;
-	}
-
-	memcpy(reply_attr->vp_octets, value, len);
-	reply_attr->length = len;
-	pairadd(vp, reply_attr);
-}
+#include <openssl/hmac.h>
 
 /*
  * TLS PRF from RFC 2246
  */
-static void P_hash(const EVP_MD *evp_md,
-		   const unsigned char *secret, unsigned int secret_len,
-		   const unsigned char *seed,   unsigned int seed_len,
+static void P_hash(EVP_MD const *evp_md,
+		   unsigned char const *secret, unsigned int secret_len,
+		   unsigned char const *seed,   unsigned int seed_len,
 		   unsigned char *out, unsigned int out_len)
 {
 	HMAC_CTX ctx_a, ctx_out;
@@ -100,20 +80,20 @@ static void P_hash(const EVP_MD *evp_md,
 	memset(a, 0, sizeof(a));
 }
 
-static void PRF(const unsigned char *secret, unsigned int secret_len,
-		const unsigned char *seed,   unsigned int seed_len,
+static void PRF(unsigned char const *secret, unsigned int secret_len,
+		unsigned char const *seed,   unsigned int seed_len,
 		unsigned char *out, unsigned char *buf, unsigned int out_len)
 {
-        unsigned int i;
-        unsigned int len = (secret_len + 1) / 2;
-	const unsigned char *s1 = secret;
-	const unsigned char *s2 = secret + (secret_len - len);
+	unsigned int i;
+	unsigned int len = (secret_len + 1) / 2;
+	uint8_t const *s1 = secret;
+	uint8_t const *s2 = secret + (secret_len - len);
 
 	P_hash(EVP_md5(),  s1, len, seed, seed_len, out, out_len);
 	P_hash(EVP_sha1(), s2, len, seed, seed_len, buf, out_len);
 
 	for (i=0; i < out_len; i++) {
-	        out[i] ^= buf[i];
+		out[i] ^= buf[i];
 	}
 }
 
@@ -124,13 +104,18 @@ static void PRF(const unsigned char *secret, unsigned int secret_len,
 /*
  *	Generate keys according to RFC 2716 and add to reply
  */
-void eaptls_gen_mppe_keys(VALUE_PAIR **reply_vps, SSL *s,
-			  const char *prf_label)
+void eaptls_gen_mppe_keys(REQUEST *request, SSL *s,
+			  char const *prf_label)
 {
 	unsigned char out[4*EAPTLS_MPPE_KEY_LEN], buf[4*EAPTLS_MPPE_KEY_LEN];
 	unsigned char seed[64 + 2*SSL3_RANDOM_SIZE];
 	unsigned char *p = seed;
 	size_t prf_size;
+
+	if (!s->s3) {
+		EDEBUG("No SSLv3 information");
+		return;
+	}
 
 	prf_size = strlen(prf_label);
 
@@ -148,16 +133,16 @@ void eaptls_gen_mppe_keys(VALUE_PAIR **reply_vps, SSL *s,
 	    seed, prf_size, out, buf, sizeof(out));
 
 	p = out;
-	add_reply(reply_vps, "MS-MPPE-Recv-Key", p, EAPTLS_MPPE_KEY_LEN);
+	eap_add_reply(request, "MS-MPPE-Recv-Key", p, EAPTLS_MPPE_KEY_LEN);
 	p += EAPTLS_MPPE_KEY_LEN;
-	add_reply(reply_vps, "MS-MPPE-Send-Key", p, EAPTLS_MPPE_KEY_LEN);
+	eap_add_reply(request, "MS-MPPE-Send-Key", p, EAPTLS_MPPE_KEY_LEN);
 
-	add_reply(reply_vps, "EAP-MSK", out, 64);
-	add_reply(reply_vps, "EAP-EMSK", out + 64, 64);
+	eap_add_reply(request, "EAP-MSK", out, 64);
+	eap_add_reply(request, "EAP-EMSK", out + 64, 64);
 }
 
 
-#define FR_TLS_PRF_CHALLENGE        "ttls challenge"
+#define FR_TLS_PRF_CHALLENGE	"ttls challenge"
 
 /*
  *	Generate the TTLS challenge
@@ -171,6 +156,11 @@ void eapttls_gen_challenge(SSL *s, uint8_t *buffer, size_t size)
 	uint8_t seed[sizeof(FR_TLS_PRF_CHALLENGE)-1 + 2*SSL3_RANDOM_SIZE];
 	uint8_t *p = seed;
 
+	if (!s->s3) {
+		EDEBUG("No SSLv3 information");
+		return;
+	}
+
 	memcpy(p, FR_TLS_PRF_CHALLENGE, sizeof(FR_TLS_PRF_CHALLENGE)-1);
 	p += sizeof(FR_TLS_PRF_CHALLENGE)-1;
 	memcpy(p, s->s3->client_random, SSL3_RANDOM_SIZE);
@@ -181,4 +171,32 @@ void eapttls_gen_challenge(SSL *s, uint8_t *buffer, size_t size)
 	    seed, sizeof(seed), out, buf, sizeof(out));
 
 	memcpy(buffer, out, size);
+}
+
+/*
+ *	Actually generates EAP-Session-Id, which is an internal server
+ *	attribute.  Not all systems want to send EAP-Key-Nam
+ */
+void eaptls_gen_eap_key(RADIUS_PACKET *packet, SSL *s, uint32_t header)
+{
+	VALUE_PAIR *vp;
+	uint8_t *p;
+
+	if (!s->s3) {
+		EDEBUG("No SSLv3 information");
+		return;
+	}
+
+	vp = paircreate(packet, PW_EAP_SESSION_ID, 0);
+	if (!vp) return;
+
+	vp->length = 1 + 2 * SSL3_RANDOM_SIZE;
+	p = talloc_array(vp, uint8_t, vp->length);
+
+	p[0] = header & 0xff;
+	memcpy(p + 1, s->s3->client_random, SSL3_RANDOM_SIZE);
+	memcpy(p + 1 + SSL3_RANDOM_SIZE,
+	       s->s3->server_random, SSL3_RANDOM_SIZE);
+	vp->vp_octets = p;
+	pairadd(&packet->vps, vp);
 }

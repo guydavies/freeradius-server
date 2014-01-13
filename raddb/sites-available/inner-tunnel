@@ -43,7 +43,7 @@ listen {
 #  The order of the realm modules will determine the order that
 #  we try to find a matching realm.
 #
-#  Make *sure* that 'preprocess' comes before any realm if you 
+#  Make *sure* that 'preprocess' comes before any realm if you
 #  need to setup hints for the remote radius server
 authorize {
 	#
@@ -129,7 +129,7 @@ authorize {
 	#  is meant to mirror the "users" file.
 	#
 	#  See "Authorization Queries" in sql.conf
-#	sql
+	-sql
 
 	#
 	#  If you are using /etc/smbpasswd, and are also doing
@@ -138,17 +138,12 @@ authorize {
 #	etc_smbpasswd
 
 	#
-	#  The ldap module will set Auth-Type to LDAP if it has not
-	#  already been set
-#	ldap
+	#  The ldap module reads passwords from the LDAP database.
+	-ldap
 
 	#
 	#  Enforce daily limits on time spent logged in.
 #	daily
-
-	#
-	# Use the checkval module
-#	checkval
 
 	expiration
 	logintime
@@ -175,7 +170,7 @@ authorize {
 #  Note that it does NOT mean 'try each module in order'.  It means
 #  that a module from the 'authorize' section adds a configuration
 #  attribute 'Auth-Type := FOO'.  That authentication type is then
-#  used to pick the apropriate module from the list below.
+#  used to pick the appropriate module from the list below.
 #
 
 #  In general, you SHOULD NOT set the Auth-Type attribute.  The server
@@ -215,19 +210,17 @@ authenticate {
 	#  Pluggable Authentication Modules.
 #	pam
 
-	#
-	#  See 'man getpwent' for information on how the 'unix'
-	#  module checks the users password.  Note that packets
-	#  containing CHAP-Password attributes CANNOT be authenticated
-	#  against /etc/passwd!  See the FAQ for details.
-	#  
-	unix
-
 	# Uncomment it if you want to use ldap for authentication
 	#
 	# Note that this means "check plain-text password against
 	# the ldap database", which means that EAP won't work,
 	# as it does not supply a plain-text password.
+	#
+	#  We do NOT recommend using this.  LDAP servers are databases.
+	#  They are NOT authentication servers.  FreeRADIUS is an
+	#  authentication server, and knows what to do with authentication.
+	#  LDAP servers do not.
+	#
 #	Auth-Type LDAP {
 #		ldap
 #	}
@@ -245,7 +238,7 @@ authenticate {
 ######################################################################
 
 
-#  Session database, used for checking Simultaneous-Use. Either the radutmp 
+#  Session database, used for checking Simultaneous-Use. Either the radutmp
 #  or rlm_sql module can handle this.
 #  The rlm_sql module is *much* faster
 session {
@@ -261,21 +254,22 @@ session {
 #  Once we KNOW that the user has been authenticated, there are
 #  additional steps we can take.
 post-auth {
-	# Note that we do NOT assign IP addresses here.
-	# If you try to assign IP addresses for EAP authentication types,
-	# it WILL NOT WORK.  You MUST use DHCP.
+	#  If you want privacy to remain, see the
+	#  Chargeable-User-Identity attribute from RFC 4372.
+	#  If you want to use it just uncomment the line below.
+#       cui-inner
 
 	#
 	#  If you want to have a log of authentication replies,
-	#  un-comment the following line, and the 'detail reply_log'
-	#  section, above.
+	#  un-comment the following line, and enable the
+	#  'detail reply_log' module.
 #	reply_log
 
 	#
 	#  After authenticating the user, do another SQL query.
 	#
 	#  See "Authentication Logging Queries" in sql.conf
-#	sql
+	-sql
 
 	#
 	#  Instead of sending the query to the SQL server,
@@ -294,12 +288,12 @@ post-auth {
 	#  Access-Reject packets are sent through the REJECT sub-section of the
 	#  post-auth section.
 	#
-	#  Add the ldap module name (or instance) if you have set 
+	#  Add the ldap module name (or instance) if you have set
 	#  'edir_account_policy_check = yes' in the ldap module configuration
 	#
 	Post-Auth-Type REJECT {
 		# log failed authentications in SQL, too.
-#		sql
+		-sql
 		attr_filter.access_reject
 	}
 
@@ -325,18 +319,14 @@ post-auth {
 	#  to contain the real user name removes ALL privacy from
 	#  their session.
 	#
-        #  If you still want to use the inner tunnel User-Name then
-        #  uncomment the section below, otherwise you may want
-        #  to use  Chargeable-User-Identity attribute from RFC 4372.
-        #  See further on.
+	#  If you still want to use the inner tunnel User-Name then
+	#  uncomment the section below, otherwise you may want
+	#  to use  Chargeable-User-Identity attribute from RFC 4372.
+	#  See further on.
     	#update outer.reply {
-        #  User-Name = "%{request:User-Name}"
-        #}
-        #
-        #  If you want privacy to remain, see the
-        #  Chargeable-User-Identity attribute from RFC 4372.
-        #  If you want to use it just uncomment the line below.
-#       cui
+	#  User-Name = "%{request:User-Name}"
+	#}
+	#
 }
 
 #
@@ -348,8 +338,6 @@ post-auth {
 #  Only a few modules currently have this method.
 #
 pre-proxy {
-#	attr_rewrite
-
 	#  Uncomment the following line if you want to change attributes
 	#  as defined in the preproxy_users file.
 #	files
@@ -376,8 +364,6 @@ post-proxy {
 	#  un-comment the following line, and the 'detail post_proxy_log'
 	#  section, above.
 #	post_proxy_log
-
-#	attr_rewrite
 
 	#  Uncomment the following line if you want to filter replies from
 	#  remote proxies based on the rules defined in the 'attrs' file.

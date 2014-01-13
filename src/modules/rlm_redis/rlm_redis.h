@@ -24,7 +24,6 @@
 #ifndef RLM_REDIS_H
 #define	RLM_REDIS_H
 
-#include <freeradius-devel/ident.h>
 RCSIDH(rlm_redis_h, "$Id$")
 
 #ifdef HAVE_PTHREAD_H
@@ -36,29 +35,30 @@ RCSIDH(rlm_redis_h, "$Id$")
 
 typedef struct redis_socket_t {
 	redisContext	*conn;
-        redisReply      *reply;
+	redisReply      *reply;
 } REDISSOCK;
 
 typedef struct rlm_redis_t REDIS_INST;
 
 typedef struct rlm_redis_t {
-        char            *xlat_name;
+	char const	    *xlat_name;
 
-        char            *hostname;
-        int             port;
+	char	    *hostname;
+	int	     port;
 	int		database;
 	char		*password;
 	fr_connection_pool_t *pool;
 
-        int (*redis_query)(REDISSOCK **dissocket_p, REDIS_INST *inst, char *query);
-        int (*redis_finish_query)(REDISSOCK *dissocket);
-        size_t (*redis_escape_func)(REQUEST *request, char *out, size_t outlen, const char *in, void *);
+	int (*redis_query)(REDISSOCK **dissocket_p, REDIS_INST *inst, char const *query, REQUEST *request);
+	int (*redis_finish_query)(REDISSOCK *dissocket);
 
 } rlm_redis_t;
 
 #define MAX_QUERY_LEN			4096
+#define MAX_REDIS_ARGS			16
 
-int rlm_redis_query(REDISSOCK **dissocket_p, REDIS_INST *inst, char *query);
+int rlm_redis_query(REDISSOCK **dissocket_p, REDIS_INST *inst,
+		    char const *query, REQUEST *request);
 int rlm_redis_finish_query(REDISSOCK *dissocket);
 
 #endif	/* RLM_REDIS_H */

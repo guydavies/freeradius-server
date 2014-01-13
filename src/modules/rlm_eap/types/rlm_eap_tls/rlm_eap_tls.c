@@ -23,8 +23,8 @@
  *
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
+USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #ifdef HAVE_OPENSSL_RAND_H
 #include <openssl/rand.h>
@@ -35,23 +35,20 @@ RCSID("$Id$")
 #endif
 
 #include "rlm_eap_tls.h"
-#include "config.h"
 
 #ifdef HAVE_SYS_STAT_H
 #include <sys/stat.h>
 #endif
 
-/*
- *	Detach the EAP-TLS module.
- */
-static int eaptls_detach(void *arg)
-{
-	rlm_eap_tls_t *inst = (rlm_eap_tls_t *) arg;
+static CONF_PARSER module_config[] = {
+	{ "tls", PW_TYPE_STRING_PTR,
+	  offsetof(rlm_eap_tls_t, tls_conf_name), NULL, NULL },
 
-	free(inst);
+	{ "virtual_server", PW_TYPE_STRING_PTR,
+	  offsetof(rlm_eap_tls_t, virtual_server), NULL, NULL },
 
-	return 0;
-}
+ 	{ NULL, -1, 0, NULL, NULL }	   /* end the list */
+};
 
 
 /*
@@ -64,27 +61,19 @@ static int eaptls_attach(CONF_SECTION *cs, void **instance)
 	/*
 	 *	Parse the config file & get all the configured values
 	 */
-	inst = rad_malloc(sizeof(*inst));
-	if (!inst) {
-		radlog(L_ERR, "rlm_eap_tls: out of memory");
-		return -1;
-	}
-	memset(inst, 0, sizeof(*inst));
+	*instance = inst = talloc_zero(cs, rlm_eap_tls_t);
+	if (!inst) return -1;
 
 	if (cf_section_parse(cs, inst, module_config) < 0) {
-		eaptls_detach(inst);
 		return -1;
 	}
 
 	inst->tls_conf = eaptls_conf_parse(cs, "tls");
 
 	if (!inst->tls_conf) {
-		radlog(L_ERR, "rlm_eap_tls: Failed initializing SSL context");
-		eaptls_detach(inst);
+		ERROR("rlm_eap_tls: Failed initializing SSL context");
 		return -1;
 	}
-
-	*instance = inst;
 
 	return 0;
 }
@@ -93,7 +82,7 @@ static int eaptls_attach(CONF_SECTION *cs, void **instance)
 /*
  *	Send an initial eap-tls request to the peer, using the libeap functions.
  */
-static int eaptls_initiate(void *type_arg, EAP_HANDLER *handler)
+static int eaptls_initiate(void *type_arg, eap_handler_t *handler)
 {
 	int		status;
 	tls_session_t	*ssn;
@@ -102,13 +91,13 @@ static int eaptls_initiate(void *type_arg, EAP_HANDLER *handler)
 
 	inst = type_arg;
 
-	handler->tls = TRUE;
-	handler->finished = FALSE;
+	handler->tls = true;
+	handler->finished = false;
 
 	/*
 	 *	EAP-TLS always requires a client certificate.
 	 */
-	ssn = eaptls_session(inst->tls_conf, handler, TRUE);
+	ssn = eaptls_session(inst->tls_conf, handler, true);
 	if (!ssn) {
 		return 0;
 	}
@@ -142,7 +131,7 @@ static int eaptls_initiate(void *type_arg, EAP_HANDLER *handler)
 /*
  *	Do authentication, by letting EAP-TLS do most of the work.
  */
-static int eaptls_authenticate(void *type_arg, EAP_HANDLER *handler)
+static int mod_authenticate(void *type_arg, eap_handler_t *handler)
 {
 	fr_tls_status_t	status;
 	tls_session_t *tls_session = (tls_session_t *) handler->opaque;
@@ -150,6 +139,8 @@ static int eaptls_authenticate(void *type_arg, EAP_HANDLER *handler)
 	rlm_eap_tls_t *inst;
 
 	inst = type_arg;
+
+	rad_assert(request != NULL);
 
 	RDEBUG2("Authenticate");
 
@@ -170,9 +161,9 @@ static int eaptls_authenticate(void *type_arg, EAP_HANDLER *handler)
 
 			/* create a fake request */
 			fake = request_alloc_fake(request);
-			rad_assert(fake->packet->vps == NULL);
+			rad_assert(!fake->packet->vps);
 
-			fake->packet->vps = paircopy(request->packet->vps);
+			fake->packet->vps = paircopy(fake->packet, request->packet->vps);
 
 			/* set the virtual server to use */
 			if ((vp = pairfind(request->config_items, PW_VIRTUAL_SERVER, 0, TAG_ANY)) != NULL) {
@@ -191,12 +182,12 @@ static int eaptls_authenticate(void *type_arg, EAP_HANDLER *handler)
 			RDEBUG("} # server %s", fake->server);
 
 			/* copy the reply vps back to our reply */
-			pairadd(&request->reply->vps, fake->reply->vps);
-			fake->reply->vps = NULL;
+			pairfilter(request->reply, &request->reply->vps,
+				  &fake->reply->vps, 0, 0, TAG_ANY);
 
 			/* reject if virtual server didn't return accept */
-			if (fake->reply->code != PW_AUTHENTICATION_ACK) {
-				RDEBUG2("Certifictes were rejected by the virtual server");
+			if (fake->reply->code != PW_CODE_AUTHENTICATION_ACK) {
+				RDEBUG2("Certificates were rejected by the virtual server");
 				request_free(&fake);
 				eaptls_fail(handler, 0);
 				return 0;
@@ -220,7 +211,7 @@ static int eaptls_authenticate(void *type_arg, EAP_HANDLER *handler)
 		 *	data.
 		 */
 	case FR_TLS_OK:
-		RDEBUG2("Received unexpected tunneled data after successful handshake.");
+		RDEBUG2("Received unexpected tunneled data after successful handshake");
 #ifndef NDEBUG
 		if ((debug_flag > 2) && fr_log_fp) {
 			unsigned int i;
@@ -229,7 +220,7 @@ static int eaptls_authenticate(void *type_arg, EAP_HANDLER *handler)
 
 			data_len = (tls_session->record_minus)(&tls_session->dirty_in,
 						buffer, sizeof(buffer));
-			log_debug("  Tunneled data (%u bytes)\n", data_len);
+			DEBUG("  Tunneled data (%u bytes)", data_len);
 			for (i = 0; i < data_len; i++) {
 				if ((i & 0x0f) == 0x00) fprintf(fr_log_fp, "  %x: ", i);
 				if ((i & 0x0f) == 0x0f) fprintf(fr_log_fp, "\n");
@@ -266,11 +257,11 @@ static int eaptls_authenticate(void *type_arg, EAP_HANDLER *handler)
  *	The module name should be the only globally exported symbol.
  *	That is, everything else should be 'static'.
  */
-EAP_TYPE rlm_eap_tls = {
+rlm_eap_module_t rlm_eap_tls = {
 	"eap_tls",
 	eaptls_attach,			/* attach */
 	eaptls_initiate,		/* Start the initial request */
 	NULL,				/* authorization */
-	eaptls_authenticate,		/* authentication */
-	eaptls_detach			/* detach */
+	mod_authenticate,		/* authentication */
+	NULL				/* detach */
 };

@@ -20,7 +20,6 @@
  * Copyright 2000-2006  The FreeRADIUS server project
  */
 
-#include	<freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include	<freeradius-devel/libradius.h>
@@ -38,7 +37,7 @@ RCSID("$Id$")
  *	That's because if the authentication vector is different,
  *	it means that the NAS has given up on the earlier request.
  */
-int fr_packet_cmp(const RADIUS_PACKET *a, const RADIUS_PACKET *b)
+int fr_packet_cmp(RADIUS_PACKET const *a, RADIUS_PACKET const *b)
 {
 	int rcode;
 
@@ -67,14 +66,14 @@ int fr_inaddr_any(fr_ipaddr_t *ipaddr)
 		if (ipaddr->ipaddr.ip4addr.s_addr == INADDR_ANY) {
 			return 1;
 		}
-		
+
 #ifdef HAVE_STRUCT_SOCKADDR_IN6
 	} else if (ipaddr->af == AF_INET6) {
 		if (IN6_IS_ADDR_UNSPECIFIED(&(ipaddr->ipaddr.ip6addr))) {
 			return 1;
 		}
 #endif
-		
+
 	} else {
 		fr_strerror_printf("Unknown address family");
 		return -1;
@@ -88,7 +87,7 @@ int fr_inaddr_any(fr_ipaddr_t *ipaddr)
  *	Create a fake "request" from a reply, for later lookup.
  */
 void fr_request_from_reply(RADIUS_PACKET *request,
-			     const RADIUS_PACKET *reply)
+			     RADIUS_PACKET const *reply)
 {
 	request->sockfd = reply->sockfd;
 	request->id = reply->id;
@@ -130,7 +129,7 @@ int fr_socket(fr_ipaddr_t *ipaddr, int port)
 
 	sockfd = socket(ipaddr->af, SOCK_DGRAM, 0);
 	if (sockfd < 0) {
-		fr_strerror_printf("cannot open socket: %s", strerror(errno));
+		fr_strerror_printf("cannot open socket: %s", fr_syserror(errno));
 		return sockfd;
 	}
 
@@ -140,15 +139,10 @@ int fr_socket(fr_ipaddr_t *ipaddr, int port)
 	 */
 	if (udpfromto_init(sockfd) != 0) {
 		close(sockfd);
-		fr_strerror_printf("cannot initialize udpfromto: %s", strerror(errno));
+		fr_strerror_printf("cannot initialize udpfromto: %s", fr_syserror(errno));
 		return -1;
 	}
 #endif
-
-	if (fr_nonblock(sockfd) < 0) {
-		close(sockfd);
-		return -1;
-	}
 
 	if (!fr_ipaddr2sockaddr(ipaddr, port, &salocal, &salen)) {
 		return sockfd;
@@ -167,8 +161,14 @@ int fr_socket(fr_ipaddr_t *ipaddr, int port)
 		if (IN6_IS_ADDR_UNSPECIFIED(&ipaddr->ipaddr.ip6addr)) {
 			int on = 1;
 
-			setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY,
-				   (char *)&on, sizeof(on));
+			if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY,
+				       (char *)&on, sizeof(on)) < 0) {
+				close(sockfd);
+				fr_strerror_printf("Failed setting sockopt "
+						   "IPPROTO_IPV6 - IPV6_V6ONLY"
+						   ": %s", fr_syserror(errno));
+				return -1;
+			}
 		}
 #endif /* IPV6_V6ONLY */
 	}
@@ -176,7 +176,7 @@ int fr_socket(fr_ipaddr_t *ipaddr, int port)
 
 	if (ipaddr->af == AF_INET) {
 		UNUSED int flag;
-		
+
 #if defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_DONT)
 		/*
 		 *	Disable PMTU discovery.  On Linux, this
@@ -184,8 +184,14 @@ int fr_socket(fr_ipaddr_t *ipaddr, int port)
 		 *	flag is zero.
 		 */
 		flag = IP_PMTUDISC_DONT;
-		setsockopt(sockfd, IPPROTO_IP, IP_MTU_DISCOVER,
-			   &flag, sizeof(flag));
+		if (setsockopt(sockfd, IPPROTO_IP, IP_MTU_DISCOVER,
+			       &flag, sizeof(flag)) < 0) {
+			close(sockfd);
+			fr_strerror_printf("Failed setting sockopt "
+					   "IPPROTO_IP - IP_MTU_DISCOVER: %s",
+					   fr_syserror(errno));
+			return -1;
+		}
 #endif
 
 #if defined(IP_DONTFRAG)
@@ -193,14 +199,20 @@ int fr_socket(fr_ipaddr_t *ipaddr, int port)
 		 *	Ensure that the "don't fragment" flag is zero.
 		 */
 		flag = 0;
-		setsockopt(sockfd, IPPROTO_IP, IP_DONTFRAG,
-			   &flag, sizeof(flag));
+		if (setsockopt(sockfd, IPPROTO_IP, IP_DONTFRAG,
+			   &flag, sizeof(flag)) < 0) {
+			close(sockfd);
+			fr_strerror_printf("Failed setting sockopt "
+					   "IPPROTO_IP - IP_DONTFRAG: %s",
+					   fr_syserror(errno));
+			return -1;
+		}
 #endif
 	}
 
 	if (bind(sockfd, (struct sockaddr *) &salocal, salen) < 0) {
 		close(sockfd);
-		fr_strerror_printf("cannot bind socket: %s", strerror(errno));
+		fr_strerror_printf("cannot bind socket: %s", fr_syserror(errno));
 		return -1;
 	}
 
@@ -247,7 +259,7 @@ typedef struct fr_packet_socket_t {
  *	that should be managed.
  */
 struct fr_packet_list_t {
-	rbtree_t        *tree;
+	rbtree_t	*tree;
 
 	int		alloc_id;
 	int		num_outgoing;
@@ -277,83 +289,80 @@ static fr_packet_socket_t *fr_socket_find(fr_packet_list_t *pl,
 	return NULL;
 }
 
-int fr_packet_list_socket_freeze(fr_packet_list_t *pl, int sockfd)
+bool fr_packet_list_socket_freeze(fr_packet_list_t *pl, int sockfd)
 {
 	fr_packet_socket_t *ps;
 
 	if (!pl) {
 		fr_strerror_printf("Invalid argument");
-		return 0;
+		return false;
 	}
 
 	ps = fr_socket_find(pl, sockfd);
 	if (!ps) {
 		fr_strerror_printf("No such socket");
-		return 0;
+		return false;
 	}
 
 	ps->dont_use = 1;
-	return 1;
+	return true;
 }
 
-int fr_packet_list_socket_thaw(fr_packet_list_t *pl, int sockfd)
+bool fr_packet_list_socket_thaw(fr_packet_list_t *pl, int sockfd)
 {
 	fr_packet_socket_t *ps;
 
-	if (!pl) return 0;
+	if (!pl) return false;
 
 	ps = fr_socket_find(pl, sockfd);
-	if (!ps) return 0;
+	if (!ps) return false;
 
 	ps->dont_use = 0;
-	return 1;
+	return true;
 }
 
-int fr_packet_list_socket_remove(fr_packet_list_t *pl, int sockfd,
-				 void **pctx)
+
+bool fr_packet_list_socket_del(fr_packet_list_t *pl, int sockfd)
 {
 	fr_packet_socket_t *ps;
 
-	if (!pl) return 0;
+	if (!pl) return false;
 
 	ps = fr_socket_find(pl, sockfd);
-	if (!ps) return 0;
+	if (!ps) return false;
 
-	/*
-	 *	FIXME: Allow the caller forcibly discard these?
-	 */
-	if (ps->num_outgoing != 0) return 0;
+	if (ps->num_outgoing != 0) return false;
 
 	ps->sockfd = -1;
 	pl->num_sockets--;
-	if (pctx) *pctx = ps->ctx;
 
-	return 1;
+	return true;
 }
 
-int fr_packet_list_socket_add(fr_packet_list_t *pl, int sockfd, int proto,
+
+bool fr_packet_list_socket_add(fr_packet_list_t *pl, int sockfd, int proto,
 			      fr_ipaddr_t *dst_ipaddr, int dst_port,
 			      void *ctx)
 {
 	int i, start;
 	struct sockaddr_storage	src;
-	socklen_t	        sizeof_src;
+	socklen_t		sizeof_src;
 	fr_packet_socket_t	*ps;
 
 	if (!pl || !dst_ipaddr || (dst_ipaddr->af == AF_UNSPEC)) {
 		fr_strerror_printf("Invalid argument");
-		return 0;
+		return false;
 	}
 
 	if (pl->num_sockets >= MAX_SOCKETS) {
 		fr_strerror_printf("Too many open sockets");
-		return 0;
+		return false;
 	}
 
 #ifndef WITH_TCP
 	if (proto != IPPROTO_UDP) {
 		fr_strerror_printf("only UDP is supported");
-		return 0;
+		return false;
 	}
 #endif
 
@@ -371,7 +380,7 @@ int fr_packet_list_socket_add(fr_packet_list_t *pl, int sockfd, int proto,
 
 	if (!ps) {
 		fr_strerror_printf("All socket entries are full");
-		return 0;
+		return false;
 	}
 
 	memset(ps, 0, sizeof(*ps));
@@ -391,24 +400,24 @@ int fr_packet_list_socket_add(fr_packet_list_t *pl, int sockfd, int proto,
 	memset(&src, 0, sizeof_src);
 	if (getsockname(sockfd, (struct sockaddr *) &src,
 			&sizeof_src) < 0) {
-		fr_strerror_printf("%s", strerror(errno));
-		return 0;
+		fr_strerror_printf("%s", fr_syserror(errno));
+		return false;
 	}
 
 	if (!fr_sockaddr2ipaddr(&src, sizeof_src, &ps->src_ipaddr,
 				&ps->src_port)) {
 		fr_strerror_printf("Failed to get IP");
-		return 0;
+		return false;
 	}
 
 	ps->dst_ipaddr = *dst_ipaddr;
 	ps->dst_port = dst_port;
 
 	ps->src_any = fr_inaddr_any(&ps->src_ipaddr);
-	if (ps->src_any < 0) return 0;
+	if (ps->src_any < 0) return false;
 
 	ps->dst_any = fr_inaddr_any(&ps->dst_ipaddr);
-	if (ps->dst_any < 0) return 0;
+	if (ps->dst_any < 0) return false;
 
 	/*
 	 *	As the last step before returning.
@@ -416,13 +425,13 @@ int fr_packet_list_socket_add(fr_packet_list_t *pl, int sockfd, int proto,
 	ps->sockfd = sockfd;
 	pl->num_sockets++;
 
-	return 1;
+	return true;
 }
 
-static int packet_entry_cmp(const void *one, const void *two)
+static int packet_entry_cmp(void const *one, void const *two)
 {
-	const RADIUS_PACKET * const *a = one;
-	const RADIUS_PACKET * const *b = two;
+	RADIUS_PACKET const * const *a = one;
+	RADIUS_PACKET const * const *b = two;
 
 	return fr_packet_cmp(*a, *b);
 }
@@ -468,7 +477,7 @@ fr_packet_list_t *fr_packet_list_create(int alloc_id)
  *	If pl->alloc_id is set, then fr_packet_list_id_alloc() MUST
  *	be called before inserting the packet into the list!
  */
-int fr_packet_list_insert(fr_packet_list_t *pl,
+bool fr_packet_list_insert(fr_packet_list_t *pl,
 			    RADIUS_PACKET **request_p)
 {
 	if (!pl || !request_p || !*request_p) return 0;
@@ -525,16 +534,17 @@ RADIUS_PACKET **fr_packet_list_find_byreply(fr_packet_list_t *pl,
 }
 
 
-void fr_packet_list_yank(fr_packet_list_t *pl, RADIUS_PACKET *request)
+bool fr_packet_list_yank(fr_packet_list_t *pl, RADIUS_PACKET *request)
 {
 	rbnode_t *node;
 
-	if (!pl || !request) return;
+	if (!pl || !request) return false;
 
 	node = rbtree_find(pl->tree, &request);
-	if (!node) return;
+	if (!node) return false;
 
 	rbtree_delete(pl->tree, node);
+	return true;
 }
 
 int fr_packet_list_num_elements(fr_packet_list_t *pl)
@@ -547,8 +557,7 @@ int fr_packet_list_num_elements(fr_packet_list_t *pl)
 
 /*
  *	1 == ID was allocated & assigned
- *	0 == error allocating memory
- *	-1 == all ID's are used, caller should open a new socket.
+ *	0 == couldn't allocate ID.
  *
  *	Note that this ALSO assigns a socket to use, and updates
  *	packet->request->src_ipaddr && packet->request->src_port
@@ -565,23 +574,24 @@ int fr_packet_list_num_elements(fr_packet_list_t *pl)
  *	We also assume that the sender doesn't care which protocol
  *	should be used.
  */
-int fr_packet_list_id_alloc(fr_packet_list_t *pl, int proto,
-			    RADIUS_PACKET *request, void **pctx)
+bool fr_packet_list_id_alloc(fr_packet_list_t *pl, int proto,
+			    RADIUS_PACKET **request_p, void **pctx)
 {
 	int i, j, k, fd, id, start_i, start_j, start_k;
 	int src_any = 0;
 	fr_packet_socket_t *ps;
+	RADIUS_PACKET *request = *request_p;
 
 	if ((request->dst_ipaddr.af == AF_UNSPEC) ||
 	    (request->dst_port == 0)) {
 		fr_strerror_printf("No destination address/port specified");
-		return 0;
+		return false;
 	}
 
 #ifndef WITH_TCP
 	if ((proto != 0) && (proto != IPPROTO_UDP)) {
 		fr_strerror_printf("Invalid destination protocol");
-		return 0;
+		return false;
 	}
 #endif
 
@@ -594,12 +604,18 @@ int fr_packet_list_id_alloc(fr_packet_list_t *pl, int proto,
 	}
 
 	src_any = fr_inaddr_any(&request->src_ipaddr);
-	if (src_any < 0) return 0;
+	if (src_any < 0) {
+		fr_strerror_printf("Can't check src_ipaddr");
+		return false;
+	}
 
 	/*
 	 *	MUST specify a destination address.
 	 */
-	if (fr_inaddr_any(&request->dst_ipaddr) != 0) return 0;
+	if (fr_inaddr_any(&request->dst_ipaddr) != 0) {
+		fr_strerror_printf("Must specify a dst_ipaddr");
+		return false;
+	}
 
 	/*
 	 *	FIXME: Go to an LRU system.  This prevents ID re-use
@@ -654,13 +670,13 @@ int fr_packet_list_id_alloc(fr_packet_list_t *pl, int proto,
 		/*
 		 *	MUST match dst port, if we have one.
 		 */
-		if ((ps->dst_port != 0) && 
+		if ((ps->dst_port != 0) &&
 		    (ps->dst_port != request->dst_port)) continue;
 
 		/*
 		 *	MUST match requested src port, if one has been given.
 		 */
-		if ((request->src_port != 0) && 
+		if ((request->src_port != 0) &&
 		    (ps->src_port != request->src_port)) continue;
 
 		/*
@@ -691,7 +707,7 @@ int fr_packet_list_id_alloc(fr_packet_list_t *pl, int proto,
 		if (!ps->dst_any &&
 		    (fr_ipaddr_cmp(&request->dst_ipaddr,
 				   &ps->dst_ipaddr) != 0)) continue;
-		
+
 		/*
 		 *	Otherwise, this socket is OK to use.
 		 */
@@ -727,10 +743,10 @@ int fr_packet_list_id_alloc(fr_packet_list_t *pl, int proto,
 	/*
 	 *	Ask the caller to allocate a new ID.
 	 */
-	if (fd < 0) return 0;
-
-	ps->num_outgoing++;
-	pl->num_outgoing++;
+	if (fd < 0) {
+		fr_strerror_printf("Failed finding socket, caller must allocate a new one");
+		return false;
+	}
 
 	/*
 	 *	Set the ID, source IP, and source port.
@@ -741,28 +757,49 @@ int fr_packet_list_id_alloc(fr_packet_list_t *pl, int proto,
 	request->src_ipaddr = ps->src_ipaddr;
 	request->src_port = ps->src_port;
 
-	if (pctx) *pctx = ps->ctx;
+	/*
+	 *	If we managed to insert it, we're done.
+	 */
+	if (fr_packet_list_insert(pl, request_p)) {
+		if (pctx) *pctx = ps->ctx;
+		ps->num_outgoing++;
+		pl->num_outgoing++;
+		return true;
+	}
 
-	return 1;
+	/*
+	 *	Mark the ID as free.  This is the one line from
+	 *	id_free() that we care about here.
+	 */
+	ps->id[(request->id >> 3) & 0x1f] &= ~(1 << (request->id & 0x07));
+
+	request->id = -1;
+	request->sockfd = -1;
+	request->src_ipaddr.af = AF_UNSPEC;
+	request->src_port = 0;
+
+	return false;
 }
 
 /*
  *	Should be called AFTER yanking it from the list, so that
  *	any newly inserted entries don't collide with this one.
  */
-int fr_packet_list_id_free(fr_packet_list_t *pl,
-			     RADIUS_PACKET *request)
+bool fr_packet_list_id_free(fr_packet_list_t *pl,
+			    RADIUS_PACKET *request, bool yank)
 {
 	fr_packet_socket_t *ps;
 
-	if (!pl || !request) return 0;
+	if (!pl || !request) return false;
+
+	if (yank && !fr_packet_list_yank(pl, request)) return false;
 
 	ps = fr_socket_find(pl, request->sockfd);
-	if (!ps) return 0;
+	if (!ps) return false;
 
 #if 0
 	if (!ps->id[(request->id >> 3) & 0x1f] & (1 << (request->id & 0x07))) {
-		exit(1);
+		fr_exit(1);
 	}
 #endif
 
@@ -771,15 +808,24 @@ int fr_packet_list_id_free(fr_packet_list_t *pl,
 	ps->num_outgoing--;
 	pl->num_outgoing--;
 
-	return 1;
+	request->id = -1;
+
+	return true;
 }
 
+/*
+ *	We always walk DeleteOrder, which is like InOrder, except that
+ *	<0 means error, stop
+ *	0  means OK, continue
+ *	1  means delete current node and stop
+ *	2  means delete current node and continue
+ */
 int fr_packet_list_walk(fr_packet_list_t *pl, void *ctx,
-			  fr_hash_table_walk_t callback)
+			fr_hash_table_walk_t callback)
 {
 	if (!pl || !callback) return 0;
 
-	return rbtree_walk(pl->tree, InOrder, callback, ctx);
+	return rbtree_walk(pl->tree, DeleteOrder, callback, ctx);
 }
 
 int fr_packet_list_fd_set(fr_packet_list_t *pl, fd_set *set)

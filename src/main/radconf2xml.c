@@ -21,11 +21,9 @@
  * Copyright 2008   Alan DeKok <aland@deployingradius.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
-#include <freeradius-devel/radpaths.h>
 
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
@@ -34,31 +32,39 @@ RCSID("$Id$")
 /*
  *	For configuration file stuff.
  */
-const char *raddb_dir = RADDBDIR;
-const char *progname = "radconf2xml";
+char const *raddb_dir = RADDBDIR;
+char const *progname = "radconf2xml";
 
 /*
  *	The rest of this is because the conffile.c, etc. assume
  *	they're running inside of the server.  And we don't (yet)
  *	have a "libfreeradius-server", or "libfreeradius-util".
  */
-int debug_flag = 0;
+log_debug_t debug_flag = 0;
 struct main_config_t mainconfig;
 char *request_log_file = NULL;
 char *debug_log_file = NULL;
-size_t radius_xlat(UNUSED char *out, UNUSED int outlen, UNUSED const char *fmt,
-		   UNUSED REQUEST *request,
-		   UNUSED RADIUS_ESCAPE_STRING func, UNUSED void *arg)
+
+#include <sys/wait.h>
+pid_t rad_fork(void)
 {
-	return -1;
+	return fork();
 }
-int check_config = FALSE;
+
+#ifdef HAVE_PTHREAD_H
+pid_t rad_waitpid(pid_t pid, int *status)
+{
+	return waitpid(pid, status, 0);
+}
+#endif
+
+bool check_config = false;
 
 static int usage(void)
 {
 	printf("Usage: %s [ -d raddb_dir ] [ -o output_file ] [ -n name ]\n", progname);
 	printf("  -d raddb_dir    Configuration files are in \"raddbdir/*\".\n");
-	printf("  -n name         Read raddb/name.conf instead of raddb/radiusd.conf\n");
+	printf("  -n name	 Read raddb/name.conf instead of raddb/radiusd.conf\n");
 	printf("  -o output_file  File where XML output will be written.\n");
 
 	exit(1);
@@ -68,8 +74,8 @@ int main(int argc, char **argv)
 {
 	int argval;
 	CONF_SECTION *cs;
-	const char *file = NULL;
-	const char *name = "radiusd";
+	char const *file = NULL;
+	char const *name = "radiusd";
 	FILE *fp;
 	char buffer[2048];
 

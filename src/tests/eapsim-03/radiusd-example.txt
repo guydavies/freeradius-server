@@ -220,17 +220,6 @@ hostname_lookups = no
 #
 allow_core_dumps = yes
 
-#  Regular expressions
-#
-#  These items are set at configure time.  If they're set to "yes",
-#  then setting them to "no" turns off regular expression support.
-#
-#  If they're set to "no" at configure time, then setting them to "yes"
-#  WILL NOT WORK.  It will give you an error.
-#
-regular_expressions	= yes
-extended_expressions	= yes
-
 #  Log the full User-Name attribute, as it was found in the request.
 #
 # allowed values: {no, yes}
@@ -635,7 +624,7 @@ modules {
 		#	certificate_file = /path/filename
 
 		#	Trusted Root CA list
-			#CA_file = /path/filename
+			#ca_file = /path/filename
 
 		#	dh_file = /path/filename
 			#random_file = /path/filename
@@ -753,10 +742,10 @@ modules {
 	#            of attributes.
 	#   authtype - if record found this Auth-Type is used to authenticate
 	#            user
-	#   hashsize - hashtable size. If 0 or not specified records are not
+	#   hash_size - hashtable size. If 0 or not specified records are not
 	#            stored in memory and file is red on every request.
-	#   allowmultiplekeys - if few records for every key are allowed
-	#   ignorenislike - ignore NIS-related records
+	#   allow_multiple_keys - if few records for every key are allowed
+	#   ignore_nislike - ignore NIS-related records
 	#   delimiter - symbol to use as a field separator in passwd file,
 	#            for format ':' symbol is always used. '\0', '\n' are
         #	     not allowed 
@@ -768,9 +757,9 @@ modules {
 	#	filename = /etc/smbpasswd
 	#	format = "*User-Name::LM-Password:NT-Password:SMB-Account-CTRL-TEXT::"
 	#	authtype = MS-CHAP
-	#	hashsize = 100
-	#	ignorenislike = no
-	#	allowmultiplekeys = no
+	#	hash_size = 100
+	#	ignore_nislike = no
+	#	allow_multiple_keys = no
 	#}
 
 	#  Similar configuration, for the /etc/group file. Adds a Group-Name
@@ -779,9 +768,9 @@ modules {
 	#passwd etc_group {
 	#	filename = /etc/group
 	#	format = "=Group-Name:::*,User-Name"
-	#	hashsize = 50
-	#	ignorenislike = yes
-	#	allowmultiplekeys = yes
+	#	hash_size = 50
+	#	ignore_nislike = yes
+	#	allow_multiple_keys = yes
 	#	delimiter = ":"
 	#}
 
@@ -818,34 +807,6 @@ modules {
 		delimiter = "%"
 	}
 	
-	#  rewrite arbitrary packets.  Useful in accounting and authorization.
-	#
-	## This module is highly experimental at the moment.  Please give 
-	## feedback to the mailing list.
-	#
-	#  The module can also use the Rewrite-Rule attribute. If it
-	#  is set and matches the name of the module instance, then
-	#  that module instance will be the only one which runs.
-	#
-	#  Also if new_attribute is set to yes then a new attribute
-	#  will be created containing the value replacewith and it
-	#  will be added to searchin (packet, reply or config).
-	# searchfor,ignore_case and max_matches will be ignored in that case.
-
-	#
-	#attr_rewrite sanecallerid {
-	#	attribute = Called-Station-Id
-		# may be "packet", "reply", or "config"
-	#	searchin = packet
-	#	searchfor = "[+ ]"
-	#	replacewith = ""
-	#	ignore_case = no
-	#	new_attribute = no
-	#	max_matches = 10
-	#	## If set to yes then the replace string will be appended to the original string
-	#	append = no
-	#}
-
 	# Preprocess the incoming RADIUS request, before handing it off
 	# to other modules.
 	#
@@ -1002,7 +963,7 @@ modules {
 		# are usually private.
 		perm = 0600
 
-		callerid = "yes"
+		caller_id = "yes"
 	}
 
 	# "Safe" radutmp - does not contain caller ID, so it can be
@@ -1015,7 +976,7 @@ modules {
 	radutmp sradutmp {
 		filename = ${logdir}/sradutmp
 		perm = 0644
-		callerid = "no"
+		caller_id = "no"
 	}
 
 	# attr_filter - filters the attributes received in replies from
@@ -1026,7 +987,7 @@ modules {
 	}
 
 	#  counter module:
-	#  This module takes an attribute (count-attribute).
+	#  This module takes an attribute (count_attribute).
 	#  It also takes a key, and creates a counter for each unique
 	#  key.  The count is incremented when accounting packets are
 	#  received by the server.  The value of the increment depends
@@ -1051,7 +1012,7 @@ modules {
 	#  reset = 12  (reset every 12 days)
 	#
 	#
-	#  The check-name attribute defines an attribute which will be
+	#  The check_name attribute defines an attribute which will be
 	#  registered by the counter module and can be used to set the
 	#  maximum allowed value for the counter after which the user
 	#  is rejected.
@@ -1061,16 +1022,16 @@ modules {
 	#          Fall-Through = 1
 	#
 	#  You should add the counter module in the instantiate
-	#  section so that it registers check-name before the files
+	#  section so that it registers check_name before the files
 	#  module reads the users file.
 	#
-	#  If check-name is set and the user is to be rejected then we
+	#  If check_name is set and the user is to be rejected then we
 	#  send back a Reply-Message and we log a Failure-Message in
 	#  the radius.log
 	#  If the count attribute is Acct-Session-Time then on each login
 	#  we send back the remaining online time as a Session-Timeout attribute
 	#
-	#  The counter-name can also be used instead of using the check-name
+	#  The counter-name can also be used instead of using the check_name
 	#  like below:
 	#
 	#  DEFAULT  Daily-Session-Time > 3600, Auth-Type = Reject
@@ -1085,17 +1046,17 @@ modules {
 	#  The module should be added in the instantiate, authorize and
 	#  accounting sections.  Make sure that in the authorize
 	#  section it comes after any module which sets the
-	#  'check-name' attribute.
+	#  'check_name' attribute.
 	#
 	counter daily {
 		filename = ${raddbdir}/db.daily
 		key = User-Name
-		count-attribute = Acct-Session-Time
+		count_attribute = Acct-Session-Time
 		reset = daily
-		counter-name = Daily-Session-Time
-		check-name = Max-Daily-Session
-		allowed-servicetype = Framed-User
-		cache-size = 5000
+		counter_name = Daily-Session-Time
+		check_name = Max-Daily-Session
+		allowed_service_type = Framed-User
+		cache_size = 5000
 	}
 
 	# The "always" module is here for debugging purposes. Each
@@ -1227,7 +1188,7 @@ modules {
 	#  Do server side ip pool management. Should be added in post-auth and
 	#  accounting sections.
 	#
-	#  The module also requires the existance of the Pool-Name
+	#  The module also requires the existence of the Pool-Name
 	#  attribute. That way the administrator can add the Pool-Name
 	#  attribute in the user profiles and use different pools
 	#  for different users. The Pool-Name attribute is a *check* item not
@@ -1243,16 +1204,16 @@ modules {
 
 		#  range-start,range-stop: The start and end ip
 		#  addresses for the ip pool
-		range-start = 192.168.1.1
-		range-stop = 192.168.3.254
+		range-start = 192.0.2.1
+		range-stop = 192.0.2.254
 
 		#  netmask: The network mask used for the ip's
 		netmask = 255.255.255.0
 
-		#  cache-size: The gdbm cache size for the db
+		#  cache_size: The gdbm cache size for the db
 		#  files. Should be equal to the number of ip's
 		#  available in the ip pool
-		cache-size = 800
+		cache_size = 800
 
 		# session-db: The main db file used to allocate ip's to clients
 		session-db = ${raddbdir}/db.ippool
@@ -1301,7 +1262,7 @@ instantiate {
 
 	#
 	# We add the counter module here so that it registers
-	# the check-name attribute before any module which sets
+	# the check_name attribute before any module which sets
 	# it
 #	daily
 }
@@ -1381,7 +1342,7 @@ authorize {
 #  Note that it does NOT mean 'try each module in order'.  It means
 #  that you have to have a module from the 'authorize' section add
 #  a configuration attribute 'Auth-Type := FOO'.  That authentication type
-#  is then used to pick the apropriate module from the list below.
+#  is then used to pick the appropriate module from the list below.
 #
 #  The default Auth-Type is Local.  That is, whatever is not included inside
 # an authtype section will be called only if Auth-Type is set to Local.
@@ -1522,7 +1483,6 @@ post-auth {
 #  Only a few modules currently have this method.
 #
 pre-proxy {
-	# attr_rewrite
 }
 
 #
@@ -1531,8 +1491,6 @@ pre-proxy {
 #  post-proxy stage.
 #
 post-proxy {
-	# attr_rewrite
-
 	#
 	#  If you are proxing LEAP, you MUST configure the EAP
 	#  module, and you MUST list it here, in the post-proxy

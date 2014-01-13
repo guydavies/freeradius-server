@@ -1,4 +1,3 @@
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/libradius.h>
@@ -43,7 +42,7 @@ void fr_heap_delete(fr_heap_t *hp)
 }
 
 fr_heap_t *fr_heap_create(fr_heap_cmp_t cmp, size_t offset)
-{       
+{
 	fr_heap_t *fh;
 
 	if (!cmp) return NULL;
@@ -91,18 +90,18 @@ fr_heap_t *fr_heap_create(fr_heap_cmp_t cmp, size_t offset)
 	    *((int *)(((uint8_t *)heap->p[node]) + heap->offset)) = -1
 
 int fr_heap_insert(fr_heap_t *hp, void *data)
-{   
+{
 	int child = hp->num_elements;
-	
+
 	/*
 	 *	Heap is full.  Double it's size.
 	 */
 	if (child == hp->size) {
 		void **p;
-		
+
 		p = malloc(2 * hp->size * sizeof(*p));
 		if (!p) return 0;
-		
+
 		memcpy(p, hp->p, sizeof(*p) * hp->size);
 		free(hp->p);
 		hp->p = p;
@@ -111,7 +110,7 @@ int fr_heap_insert(fr_heap_t *hp, void *data)
 
 	hp->p[child] = data;
 	hp->num_elements++;
-	
+
 	return fr_heap_bubble(hp, child);
 }
 
@@ -123,12 +122,12 @@ static int fr_heap_bubble(fr_heap_t *hp, int child)
 	 */
 	while (child > 0) {
 		int parent = HEAP_PARENT(child);
-		
+
 		/*
 		 *	Parent is smaller than the child.  We're done.
 		 */
 		if (hp->cmp(hp->p[parent], hp->p[child]) < 0) break;
-		
+
 		/*
 		 *	Child is smaller than the parent, repeat.
 		 */
@@ -146,14 +145,14 @@ static int fr_heap_bubble(fr_heap_t *hp, int child)
  *	Remove the top element, or object.
  */
 int fr_heap_extract(fr_heap_t *hp, void *data)
-{  
+{
 	int child, parent;
 	int max;
 
 	if (!hp || (hp->num_elements == 0)) return 0;
-	
+
 	max = hp->num_elements - 1;
-	
+
 	/*
 	 *	Extract element.  Default is the first one.
 	 */
@@ -229,12 +228,7 @@ int fr_heap_num_elements(fr_heap_t *hp)
  *
  *  ./heap
  */
-
-#include <stdio.h>
-#include <stdlib.h>
-
-
-static int heap_cmp(const void *a, const void *b)
+static int heap_cmp(void const *a, void const *b)
 {
 	return *(int *)a - *(int *) b;
 
@@ -249,14 +243,14 @@ int main(int argc, char **arg)
 	hp = fr_heap_create(heap_cmp, 0);
 	if (!hp) {
 		fprintf(stderr, "Failed creating heap!\n");
-		exit(1);
+		fr_exit(1);
 	}
 
 	for (i = 0; i < 1024; i++) {
 		array[i] = (i * 257) % 65537;
 		if (!fr_heap_insert(hp, &array[i])) {
 			fprintf(stderr, "Failed inserting %d\n", i);
-			exit(1);
+			fr_exit(1);
 		}
 	}
 
@@ -265,19 +259,19 @@ int main(int argc, char **arg)
 
 		if (!p) {
 			fprintf(stderr, "Failed peeking %d\n", i);
-			exit(1);
+			fr_exit(1);
 		}
 
 		printf("%d\t%d\n", i, *p);
 
 		if (!fr_heap_extract(hp, NULL)) {
 			fprintf(stderr, "Failed extracting %d\n", i);
-			exit(1);
+			fr_exit(1);
 		}
 	}
 
 	fr_heap_delete(hp);
-	
+
 	return 0;
 }
 #endif

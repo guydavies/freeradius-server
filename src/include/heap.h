@@ -22,14 +22,13 @@
  * Copyright 2007 Alan DeKok
  */
 
-#include <freeradius-devel/ident.h>
 RCSIDH(heap_h, "$Id$")
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef int (*fr_heap_cmp_t)(const void *, const void *);
+typedef int (*fr_heap_cmp_t)(void const *, void const *);
 
 typedef struct fr_heap_t fr_heap_t;
 fr_heap_t *fr_heap_create(fr_heap_cmp_t cmp, size_t offset);

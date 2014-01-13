@@ -75,7 +75,7 @@ eap {
 	md5 {
 	}
 
-	# 
+	#
 	# EAP-pwd -- secure password-based authentication
 	#
 #	pwd {
@@ -87,7 +87,7 @@ eap {
 		#  This has the same meaning as for TLS.
 #		fragment_size = 1020
 
-		# The virtual server which determines the 
+		# The virtual server which determines the
 		# "known good" password for the user.
 		# Note that unlike TLS, only the "authorize"
 		# section is processed.  EAP-PWD requests can be
@@ -151,10 +151,13 @@ eap {
 	#  built, the "tls", "ttls", and "peap" sections will
 	#  be ignored.
 	#
-	#  Otherwise, when the server first starts in debugging
-	#  mode, test certificates will be created.  See the
-	#  "make_cert_command" below for details, and the README
-	#  file in raddb/certs
+	#  If you do not currently have certificates signed by
+	#  a trusted CA you may use the 'snakeoil' certificates.
+	#  Included with the server in raddb/certs.
+	#
+	#  If these certificates have not been auto-generated:
+	#    cd raddb/certs
+	#    make
 	#
 	#  These test certificates SHOULD NOT be used in a normal
 	#  deployment.  They are created only to make it easier
@@ -178,7 +181,7 @@ eap {
 		#  certificate_file must contain the same file
 		#  name.
 		#
-		#  If CA_file (below) is not used, then the
+		#  If ca_file (below) is not used, then the
 		#  certificate_file below MUST include not
 		#  only the server certificate, but ALSO all
 		#  of the CA certificates used to sign the
@@ -200,7 +203,7 @@ eap {
 		#  not use client certificates, and you do not want
 		#  to permit EAP-TLS authentication, then delete
 		#  this configuration item.
-		CA_file = ${cadir}/ca.pem
+		ca_file = ${cadir}/ca.pem
 
 		#
 		#  If OpenSSL supports TLS-PSK, then we can use
@@ -212,8 +215,8 @@ eap {
 		#	private_key_password
 		#	private_key_file
 		#	certificate_file
-		#	CA_file
-		#	CA_path
+		#	ca_file
+		#	ca_path
 		#
 		#  For now, the identity is fixed, and must be the
 		#  same on the client.  The passphrase must be a hex
@@ -233,12 +236,22 @@ eap {
 		#  	openssl dhparam -out certs/dh 1024
 		#
 		dh_file = ${certdir}/dh
-		random_file = ${certdir}/random
+
+		#
+		#  If your system doesn't have /dev/urandom,
+		#  you will need to create this file, and
+		#  periodically change its contents.
+		#
+		#  For security reasons, FreeRADIUS doesn't
+		#  write to files in its configuration
+		#  directory.
+		#
+#		random_file = ${certdir}/random
 
 		#
 		#  This can never exceed the size of a RADIUS
 		#  packet (4096 bytes), and is preferably half
-		#  that, to accomodate other attributes in
+		#  that, to accommodate other attributes in
 		#  RADIUS packet.  On most APs the MAX packet
 		#  length is configured between 1500 - 1600
 		#  In these cases, fragment size should be
@@ -264,13 +277,13 @@ eap {
 		#  3) uncomment the line below.
 		#  5) Restart radiusd
 	#	check_crl = yes
-		CA_path = ${cadir}
+		ca_path = ${cadir}
 
 	       #
 	       #  If check_cert_issuer is set, the value will
 	       #  be checked against the DN of the issuer in
 	       #  the client certificate.  If the values do not
-	       #  match, the cerficate verification will fail,
+	       #  match, the certificate verification will fail,
 	       #  rejecting the user.
 	       #
 	       #  In 2.1.10 and later, this check can be done
@@ -304,23 +317,6 @@ eap {
 		cipher_list = "DEFAULT"
 
 		#
-
-		# This command creates the initial "snake oil"
-		# certificates when the server is run as root,
-		# and via "radiusd -X".
-		#
-		# As of 2.1.11, it *also* checks the server
-		# certificate for validity, including expiration.
-		# This means that radiusd will refuse to start
-		# when the certificate has expired.  The alternative
-		# is to have the 802.1X clients refuse to connect
-		# when they discover the certificate has expired.
-		#
-		# Debugging client issues is hard, so it's better
-		# for the server to print out an error message,
-		# and refuse to start.
-		#
-		make_cert_command = "${certdir}/bootstrap"
 
 		#
 		#  Elliptical cryptography configuration
@@ -445,15 +441,15 @@ eap {
 			#  We recommend using the OpenSSL command-line
 			#  tool.
 			#
-			#  The ${..CA_path} text is a reference to
-			#  the CA_path variable defined above.
+			#  The ${..ca_path} text is a reference to
+			#  the ca_path variable defined above.
 			#
 			#  The %{TLS-Client-Cert-Filename} is the name
 			#  of the temporary file containing the cert
 			#  in PEM format.  This file is automatically
 			#  deleted by the server when the command
 			#  returns.
-	#    		client = "/path/to/openssl verify -CApath ${..CA_path} %{TLS-Client-Cert-Filename}"
+	#    		client = "/path/to/openssl verify -CApath ${..ca_path} %{TLS-Client-Cert-Filename}"
 		}
 
 		#
@@ -461,7 +457,7 @@ eap {
 		#  Certificates can be verified against an OCSP
 		#  Responder. This makes it possible to immediately
 		#  revoke certificates without the distribution of
-		#  new Certificate Revokation Lists (CRLs).
+		#  new Certificate Revocation Lists (CRLs).
 		#
 		ocsp {
 		      #
@@ -475,7 +471,7 @@ eap {
 		      #  The OCSP Responder URL can be automatically
 		      #  extracted from the certificate in question.
 		      #  To override the OCSP Responder URL set
-		      #  "override_cert_url = yes". 
+		      #  "override_cert_url = yes".
 		      #
 		      override_cert_url = yes
 
@@ -524,7 +520,7 @@ eap {
 		      # To treat these errors as 'soft' failures and
 		      # still accept the certificate, enable this
 		      # option.
-		      # 
+		      #
 		      # Warning: this may enable clients with revoked
 		      # certificates to connect if the OCSP responder
 		      # is not available. Use with caution.
@@ -569,7 +565,7 @@ eap {
 		#  section may also appear instead in the 'tls' section
 		#  above. If that is done, the tls= option here (and in
 		#  tls above) MUST be commented out.
-		# 
+		#
 		tls = tls-common
 
 		#  The tunneled EAP session needs a default EAP type
@@ -693,7 +689,7 @@ eap {
 		#  section may also appear instead in the 'tls' section
 		#  above. If that is done, the tls= option here (and in
 		#  tls above) MUST be commented out.
-		# 
+		#
 		tls = tls-common
 
 		#  The tunneled EAP session needs a default

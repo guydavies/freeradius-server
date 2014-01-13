@@ -13,7 +13,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /*
  * $Id$
  *
@@ -26,7 +26,6 @@
 #ifndef RADIUS_MODULES_H
 #define RADIUS_MODULES_H
 
-#include <freeradius-devel/ident.h>
 RCSIDH(modules_h, "$Id$")
 
 #include <freeradius-devel/conffile.h>
@@ -57,7 +56,7 @@ typedef enum rlm_rcodes {
 
 /** The different section components of the server
  *
- * Used as indexes in the methods array in the module_t struct. 
+ * Used as indexes in the methods array in the module_t struct.
  */
 typedef enum rlm_components {
 	RLM_COMPONENT_AUTH = 0,	//!< 0 methods index for authenticate section.
@@ -76,14 +75,14 @@ typedef enum rlm_components {
 } rlm_components_t;
 
 /** Map a section name, to a section typename, to an attribute number
- * 
+ *
  * Used by modules.c to define the mappings between names, types and control
  * attributes.
  */
 typedef struct section_type_value_t {
-        const char      *section;	//!< Section name e.g. "Authorize".
-        const char      *typename;	//!< Type name e.g. "Auth-Type".
-        int             attr;		//!< Attribute number.
+	char const      *section;	//!< Section name e.g. "Authorize".
+	char const      *typename;	//!< Type name e.g. "Auth-Type".
+	int	     attr;		//!< Attribute number.
 } section_type_value_t;
 
 /** Mappings between section names, typenames and control attributes
@@ -93,8 +92,8 @@ typedef struct section_type_value_t {
 extern const section_type_value_t section_type_value[];
 
 #define RLM_TYPE_THREAD_SAFE	(0 << 0) 	//!< Module is threadsafe.
-#define RLM_TYPE_THREAD_UNSAFE	(1 << 0) 	//!< Module is not threadsafe. 
-						//!< Server will protect calls 
+#define RLM_TYPE_THREAD_UNSAFE	(1 << 0) 	//!< Module is not threadsafe.
+						//!< Server will protect calls
 						//!< with mutex.
 #define RLM_TYPE_CHECK_CONFIG_SAFE (1 << 1) 	//!< Instantiate module on -C.
 						//!< Module will be
@@ -103,14 +102,14 @@ extern const section_type_value_t section_type_value[];
 						//!< check mode.
 #define RLM_TYPE_HUP_SAFE	(1 << 2) 	//!< Will be restarted on HUP.
 						//!< Server will instantiated
-						//!< new instance, and then 
+						//!< new instance, and then
 						//!< destroy old instance.
 
 #define RLM_MODULE_MAGIC_NUMBER ((uint32_t) (0xf4ee4ad3))
 #define RLM_MODULE_INIT RLM_MODULE_MAGIC_NUMBER
 
 /** Module section callback
- * 
+ *
  * Is called when the module is listed in a particular section of a virtual
  * server, and the request has reached the module call.
  *
@@ -121,7 +120,7 @@ extern const section_type_value_t section_type_value[];
 typedef rlm_rcode_t (*packetmethod)(void *instance, REQUEST *request);
 
 /** Module instantiation callback
- * 
+ *
  * Is called once per module instance. Is not called when new threads are
  * spawned. Modules that require separate thread contexts should use the
  * connection pool API.
@@ -131,10 +130,10 @@ typedef rlm_rcode_t (*packetmethod)(void *instance, REQUEST *request);
  *		alloced by by callback and freed by detach.
  * @return -1 if instantiation failed, else 0.
  */
-typedef int (*instantiate_t)(CONF_SECTION *mod_cs, void **instance);
+typedef int (*instantiate_t)(CONF_SECTION *mod_cs, void *instance);
 
 /** Module detach callback
- * 
+ *
  * Is called just before the server exits, and after re-instantiation on HUP,
  * to free the old module instance.
  *
@@ -147,46 +146,44 @@ typedef int (*instantiate_t)(CONF_SECTION *mod_cs, void **instance);
 typedef int (*detach_t)(void *instance);
 
 /** Metadata exported by the module
- * 
+ *
  * This determines the capabilities of the module, and maps internal functions
  * within the module to different sections.
  */
 typedef struct module_t {
-	uint32_t 	magic;	//!< Used to validate module struct.
-	const char	*name;	//!< The name of the module (without rlm_ 
-				//!< prefix).
-	int		type;	//!< One or more of the RLM_TYPE_* constants.
-	instantiate_t	instantiate;	//!< Function to use for instantiation.
-	detach_t	detach;	//!< Function to use to free module instance.
-	packetmethod	methods[RLM_COMPONENT_COUNT]; //!< Pointers to the
-				//!< various section functions, ordering
-				//!< determines which function is mapped to
-				//!< which section.
-						      
+	uint32_t 		magic;				//!< Used to validate module struct.
+	char const		*name;				//!< The name of the module (without rlm_ prefix).
+	int			type;				//!< One or more of the RLM_TYPE_* constants.
+	size_t			inst_size;			//!< Size of the instance data
+	CONF_PARSER const	*config;			//!< Configuration information
+	instantiate_t		instantiate;			//!< Function to use for instantiation.
+	detach_t		detach;				//!< Function to use to free module instance.
+	packetmethod		methods[RLM_COMPONENT_COUNT];	//!< Pointers to the various section functions, ordering
+								//!< determines which function is mapped to
+								//!< which section.
+
 } module_t;
 
 int setup_modules(int, CONF_SECTION *);
 int detach_modules(void);
 int module_hup(CONF_SECTION *modules);
-rlm_rcode_t module_authorize(int type, REQUEST *request);
-rlm_rcode_t module_authenticate(int type, REQUEST *request);
+rlm_rcode_t process_authorize(int type, REQUEST *request);
+rlm_rcode_t process_authenticate(int type, REQUEST *request);
 rlm_rcode_t module_preacct(REQUEST *request);
-rlm_rcode_t module_accounting(int type, REQUEST *request);
-int module_checksimul(int type, REQUEST *request, int maxsimul);
-rlm_rcode_t module_pre_proxy(int type, REQUEST *request);
-rlm_rcode_t module_post_proxy(int type, REQUEST *request);
-rlm_rcode_t module_post_auth(int type, REQUEST *request);
+rlm_rcode_t process_accounting(int type, REQUEST *request);
+int process_checksimul(int type, REQUEST *request, int maxsimul);
+rlm_rcode_t process_pre_proxy(int type, REQUEST *request);
+rlm_rcode_t process_post_proxy(int type, REQUEST *request);
+rlm_rcode_t process_post_auth(int type, REQUEST *request);
 #ifdef WITH_COA
-rlm_rcode_t module_recv_coa(int type, REQUEST *request);
-rlm_rcode_t module_send_coa(int type, REQUEST *request);
+rlm_rcode_t process_recv_coa(int type, REQUEST *request);
+rlm_rcode_t process_send_coa(int type, REQUEST *request);
 #define MODULE_NULL_COA_FUNCS ,NULL,NULL
 #else
 #define MODULE_NULL_COA_FUNCS
 #endif
 
-char *module_failure_msg(REQUEST *request, const char *fmt, ...);
-
-rlm_rcode_t indexed_modcall(int comp, int idx, REQUEST *request);
+rlm_rcode_t indexed_modcall(rlm_components_t comp, int idx, REQUEST *request);
 
 /*
  *	For now, these are strongly tied together.

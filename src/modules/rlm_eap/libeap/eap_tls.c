@@ -26,58 +26,24 @@
  *
  *  TLS Packet Format in EAP
  *  --- ------ ------ -- ---
- * 0                   1                   2                   3
+ * 0		   1		   2		   3
  * 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |     Code      |   Identifier  |            Length             |
+ * |     Code      |   Identifier  |	    Length	     |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  * |     Type      |     Flags     |      TLS Message Length
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- * |     TLS Message Length        |       TLS Data...
+ * |     TLS Message Length	|       TLS Data...
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  *
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
+USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 
 #include <assert.h>
+
 #include "eap_tls.h"
-
-/*
- *      Allocate a new TLS_PACKET
- */
-EAPTLS_PACKET *eaptls_alloc(void)
-{
-	EAPTLS_PACKET   *rp;
-
-	if ((rp = malloc(sizeof(EAPTLS_PACKET))) == NULL) {
-		radlog(L_ERR, "rlm_eap_tls: out of memory");
-		return NULL;
-	}
-	memset(rp, 0, sizeof(EAPTLS_PACKET));
-	return rp;
-}
-
-/*
- *      Free EAPTLS_PACKET
- */
-void eaptls_free(EAPTLS_PACKET **eaptls_packet_ptr)
-{
-	EAPTLS_PACKET *eaptls_packet;
-
-	if (!eaptls_packet_ptr) return;
-	eaptls_packet = *eaptls_packet_ptr;
-	if (eaptls_packet == NULL) return;
-
-	if (eaptls_packet->data) {
-		free(eaptls_packet->data);
-		eaptls_packet->data = NULL;
-	}
-
-	free(eaptls_packet);
-	*eaptls_packet_ptr = NULL;
-}
 
 /*
  *	Send an initial eap-tls request to the peer.
@@ -96,14 +62,14 @@ void eaptls_free(EAPTLS_PACKET **eaptls_packet_ptr)
  *
  *	Fragment length is Framed-MTU - 4.
  */
-tls_session_t *eaptls_session(fr_tls_server_conf_t *tls_conf, EAP_HANDLER *handler, int client_cert)
+tls_session_t *eaptls_session(fr_tls_server_conf_t *tls_conf, eap_handler_t *handler, int client_cert)
 {
 	tls_session_t	*ssn;
 	int		verify_mode = 0;
 	REQUEST		*request = handler->request;
 
-	handler->tls = TRUE;
-	handler->finished = FALSE;
+	handler->tls = true;
+	handler->finished = false;
 
 	/*
 	 *	Every new session is started only from EAP-TLS-START.
@@ -143,8 +109,9 @@ tls_session_t *eaptls_session(fr_tls_server_conf_t *tls_conf, EAP_HANDLER *handl
 #ifdef HAVE_OPENSSL_OCSP_H
 	SSL_set_ex_data(ssn->ssl, FR_TLS_EX_INDEX_STORE, (void *)tls_conf->ocsp_store);
 #endif
+	SSL_set_ex_data(ssn->ssl, FR_TLS_EX_INDEX_SSN, (void *)ssn);
 
-	return ssn;
+	return talloc_steal(handler, ssn); /* ssn */
 }
 
 /*
@@ -169,13 +136,13 @@ int eaptls_start(EAP_DS *eap_ds, int peap_flag)
 	return 1;
 }
 
-int eaptls_success(EAP_HANDLER *handler, int peap_flag)
+int eaptls_success(eap_handler_t *handler, int peap_flag)
 {
 	EAPTLS_PACKET	reply;
 	REQUEST *request = handler->request;
 	tls_session_t *tls_session = handler->opaque;
 
-	handler->finished = TRUE;
+	handler->finished = true;
 	reply.code = FR_TLS_SUCCESS;
 	reply.length = TLS_HEADER_LEN;
 	reply.flags = peap_flag;
@@ -193,21 +160,23 @@ int eaptls_success(EAP_HANDLER *handler, int peap_flag)
 	 *	Automatically generate MPPE keying material.
 	 */
 	if (tls_session->prf_label) {
-		eaptls_gen_mppe_keys(&handler->request->reply->vps,
+		eaptls_gen_mppe_keys(handler->request,
 				     tls_session->ssl, tls_session->prf_label);
 	} else {
-		RDEBUG("WARNING: Not adding MPPE keys because there is no PRF label");
+		RWDEBUG("Not adding MPPE keys because there is no PRF label");
 	}
 
+	eaptls_gen_eap_key(handler->request->reply, tls_session->ssl,
+			   handler->type);
 	return 1;
 }
 
-int eaptls_fail(EAP_HANDLER *handler, int peap_flag)
+int eaptls_fail(eap_handler_t *handler, int peap_flag)
 {
 	EAPTLS_PACKET	reply;
 	tls_session_t *tls_session = handler->opaque;
 
-	handler->finished = TRUE;
+	handler->finished = true;
 	reply.code = FR_TLS_FAIL;
 	reply.length = TLS_HEADER_LEN;
 	reply.flags = peap_flag;
@@ -244,11 +213,11 @@ int eaptls_request(EAP_DS *eap_ds, tls_session_t *ssn)
 		EVERY packet we send and add corresponding
 		"TLS Message Length" field.
 
-	length_flag = TRUE;
+	length_flag = true;
 		This means we include L flag and "TLS Msg Len" in EVERY
 		packet we send out.
 
-	length_flag = FALSE;
+	length_flag = false;
 		This means we include L flag and "TLS Msg Len" **ONLY**
 		in First packet of a fragment series. We do not use
 		it anywhere else.
@@ -283,7 +252,9 @@ int eaptls_request(EAP_DS *eap_ds, tls_session_t *ssn)
 	reply.dlen = lbit + size;
 	reply.length = TLS_HEADER_LEN + 1/*flags*/ + reply.dlen;
 
-	reply.data = malloc(reply.dlen);
+	reply.data = talloc_array(eap_ds, uint8_t, reply.length);
+	if (!reply.data) return 0;
+
 	if (lbit) {
 		nlen = htonl(ssn->tls_msg_len);
 		memcpy(reply.data, &nlen, lbit);
@@ -292,7 +263,7 @@ int eaptls_request(EAP_DS *eap_ds, tls_session_t *ssn)
 	(ssn->record_minus)(&ssn->dirty_out, reply.data + lbit, size);
 
 	eaptls_compose(eap_ds, &reply);
-	free(reply.data);
+	talloc_free(reply.data);
 	reply.data = NULL;
 
 	return 1;
@@ -338,7 +309,7 @@ static int eaptls_send_ack(EAP_DS *eap_ds, int peap_flag)
  *	EAP-Type=EAP-TLS and no data. This serves as a fragment
  *	ACK. The EAP peer MUST wait.
  */
-static fr_tls_status_t eaptls_verify(EAP_HANDLER *handler)
+static fr_tls_status_t eaptls_verify(eap_handler_t *handler)
 {
 	EAP_DS *eap_ds = handler->eap_ds;
 	EAP_DS *prev_eap_ds = handler->prev_eapds;
@@ -354,9 +325,9 @@ static fr_tls_status_t eaptls_verify(EAP_HANDLER *handler)
 	 *	NULL, of if it's NOT an EAP-Response, or if the packet
 	 *	is too short.  See eap_validation()., in ../../eap.c
 	 *
-	 *	Also, eaptype_select() takes care of selecting the
+	 *	Also, eap_method_select() takes care of selecting the
 	 *	appropriate type, so we don't need to check
-	 *	eap_ds->response->type.type == PW_EAP_TLS, or anything
+	 *	eap_ds->response->type.num == PW_EAP_TLS, or anything
 	 *	else.
 	 */
 	eaptls_packet = (eaptls_packet_t *)eap_ds->response->type.data;
@@ -371,7 +342,7 @@ static fr_tls_status_t eaptls_verify(EAP_HANDLER *handler)
 	 *
 	 *	Find if this is a reply to the previous request sent
 	 */
-	if ((eaptls_packet == NULL) ||
+	if ((!eaptls_packet) ||
 	    ((eap_ds->response->length == EAP_HEADER_LEN + 2) &&
 	     ((eaptls_packet->flags & 0xc0) == 0x00))) {
 
@@ -383,7 +354,7 @@ static fr_tls_status_t eaptls_verify(EAP_HANDLER *handler)
 			RDEBUG2("Received TLS ACK");
 			return tls_ack_handler(handler->opaque, request);
 		} else {
-			radlog_request(L_ERR, 0, request, "Received Invalid TLS ACK");
+			RERROR("Received Invalid TLS ACK");
 			return FR_TLS_INVALID;
 		}
 	}
@@ -420,8 +391,8 @@ static fr_tls_status_t eaptls_verify(EAP_HANDLER *handler)
 			 * 	(It is because Last fragment will not have M bit set)
 			 */
 			if (!prev_eap_ds ||
-			    (prev_eap_ds->response == NULL) ||
-			    (eaptls_prev == NULL) ||
+			    (!prev_eap_ds->response) ||
+			    (!eaptls_prev) ||
 			    !TLS_MORE_FRAGMENTS(eaptls_prev->flags)) {
 
 				RDEBUG2("Received EAP-TLS First Fragment of the message");
@@ -454,13 +425,13 @@ static fr_tls_status_t eaptls_verify(EAP_HANDLER *handler)
  * code   =  EAP-code
  * id     =  EAP-id
  * length = code + id + length + flags + tlsdata
- *        =  1   +  1 +   2    +  1    +  X
+ *	=  1   +  1 +   2    +  1    +  X
  * length = EAP-length - 1(EAP-Type = 1 octet)
  * flags  = EAP-typedata[0] (1 octet)
  * dlen   = EAP-typedata[1-4] (4 octets), if L flag set
- *        = length - 5(code+id+length+flags), otherwise
+ *	= length - 5(code+id+length+flags), otherwise
  * data   = EAP-typedata[5-n], if L flag set
- *        = EAP-typedata[1-n], otherwise
+ *	= EAP-typedata[1-n], otherwise
  * packet = EAP-typedata (complete typedata)
  *
  * Points to consider during EAP-TLS data extraction
@@ -469,14 +440,14 @@ static fr_tls_status_t eaptls_verify(EAP_HANDLER *handler)
  *
  *  RFC 2716 Section 4.2.  PPP EAP TLS Request Packet
  *
- *  0                   1                   2                   3
+ *  0		   1		   2		   3
  *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
  *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *  |     Code      |   Identifier  |            Length             |
+ *  |     Code      |   Identifier  |	    Length	     |
  *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  *  |     Type      |     Flags     |      TLS Message Length
  *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- *  |     TLS Message Length        |       TLS Data...
+ *  |     TLS Message Length	|       TLS Data...
  *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  *
  *  The Length field is two octets and indicates the length of the EAP
@@ -508,8 +479,8 @@ static EAPTLS_PACKET *eaptls_extract(REQUEST *request, EAP_DS *eap_ds, fr_tls_st
 	 */
 	assert(eap_ds->response->length > 2);
 
-	tlspacket = eaptls_alloc();
-	if (tlspacket == NULL) return NULL;
+	tlspacket = talloc(eap_ds, EAPTLS_PACKET);
+	if (!tlspacket) return NULL;
 
 	/*
 	 *	Code & id for EAPTLS & EAP are same
@@ -530,7 +501,7 @@ static EAPTLS_PACKET *eaptls_extract(REQUEST *request, EAP_DS *eap_ds, fr_tls_st
 	if (TLS_LENGTH_INCLUDED(tlspacket->flags) &&
 	    (tlspacket->length < 5)) { /* flags + TLS message length */
 		RDEBUG("Invalid EAP-TLS packet received.  (Length bit is set, but no length was found.)");
-		eaptls_free(&tlspacket);
+		talloc_free(tlspacket);
 		return NULL;
 	}
 
@@ -548,8 +519,8 @@ static EAPTLS_PACKET *eaptls_extract(REQUEST *request, EAP_DS *eap_ds, fr_tls_st
 		memcpy(&data_len, &eap_ds->response->type.data[1], 4);
 		data_len = ntohl(data_len);
 		if (data_len > MAX_RECORD_SIZE) {
-			RDEBUG("The EAP-TLS packet will contain more data than we can process.");
-			eaptls_free(&tlspacket);
+			RDEBUG("The EAP-TLS packet will contain more data than we can process");
+			talloc_free(tlspacket);
 			return NULL;
 		}
 
@@ -557,8 +528,8 @@ static EAPTLS_PACKET *eaptls_extract(REQUEST *request, EAP_DS *eap_ds, fr_tls_st
 		DEBUG2(" TLS: %d %d\n", data_len, tlspacket->length);
 
 		if (data_len < tlspacket->length) {
-			RDEBUG("EAP-TLS packet claims to be smaller than the encapsulating EAP packet.");
-			eaptls_free(&tlspacket);
+			RDEBUG("EAP-TLS packet claims to be smaller than the encapsulating EAP packet");
+			talloc_free(tlspacket);
 			return NULL;
 		}
 #endif
@@ -579,7 +550,7 @@ static EAPTLS_PACKET *eaptls_extract(REQUEST *request, EAP_DS *eap_ds, fr_tls_st
 	case FR_TLS_MORE_FRAGMENTS_WITH_LENGTH:
 		if (tlspacket->length < 5) { /* flags + TLS message length */
 			RDEBUG("Invalid EAP-TLS packet received.  (Expected length, got none.)");
-			eaptls_free(&tlspacket);
+			talloc_free(tlspacket);
 			return NULL;
 		}
 
@@ -612,16 +583,16 @@ static EAPTLS_PACKET *eaptls_extract(REQUEST *request, EAP_DS *eap_ds, fr_tls_st
 
 	default:
 		RDEBUG("Invalid EAP-TLS packet received");
-		eaptls_free(&tlspacket);
+		talloc_free(tlspacket);
 		return NULL;
 	}
 
 	tlspacket->dlen = data_len;
 	if (data_len) {
-		tlspacket->data = (unsigned char *)malloc(data_len);
-		if (tlspacket->data == NULL) {
-			RDEBUG("out of memory");
-			eaptls_free(&tlspacket);
+		tlspacket->data = talloc_array(tlspacket, uint8_t,
+					       data_len);
+		if (!tlspacket->data) {
+			talloc_free(tlspacket);
 			return NULL;
 		}
 		memcpy(tlspacket->data, data, data_len);
@@ -655,7 +626,7 @@ static EAPTLS_PACKET *eaptls_extract(REQUEST *request, EAP_DS *eap_ds, fr_tls_st
  *	then how to let SSL API know about these sessions.)
  */
 static fr_tls_status_t eaptls_operation(fr_tls_status_t status,
-					EAP_HANDLER *handler)
+					eap_handler_t *handler)
 {
 	tls_session_t *tls_session;
 
@@ -698,23 +669,23 @@ static fr_tls_status_t eaptls_operation(fr_tls_status_t status,
 		eaptls_request(handler->eap_ds, tls_session);
 		return FR_TLS_HANDLED;
 	}
-		
-	/* 
+
+	/*
 	 *	If there is no data to send i.e
 	 *	dirty_out.used <=0 and if the SSL
 	 *	handshake is finished, then return a
 	 *	EPTLS_SUCCESS
 	 */
-	
+
 	if (SSL_is_init_finished(tls_session->ssl)) {
 		/*
 		 *	Init is finished.  The rest is
 		 *	application data.
 		 */
-		tls_session->info.content_type = application_data; 
+		tls_session->info.content_type = application_data;
 		return FR_TLS_SUCCESS;
 	}
-	
+
 	/*
 	 *	Who knows what happened...
 	 */
@@ -750,7 +721,7 @@ static fr_tls_status_t eaptls_operation(fr_tls_status_t status,
 /*
  *	Process an EAP request
  */
-fr_tls_status_t eaptls_process(EAP_HANDLER *handler)
+fr_tls_status_t eaptls_process(eap_handler_t *handler)
 {
 	tls_session_t *tls_session = (tls_session_t *) handler->opaque;
 	EAPTLS_PACKET	*tlspacket;
@@ -763,7 +734,7 @@ fr_tls_status_t eaptls_process(EAP_HANDLER *handler)
 	SSL_set_ex_data(tls_session->ssl, FR_TLS_EX_INDEX_REQUEST, request);
 
 	if (handler->certs) pairadd(&request->packet->vps,
-				    paircopy(handler->certs));
+				    paircopy(request->packet, handler->certs));
 
 	/* This case is when SSL generates Alert then we
 	 * send that alert to the client and then send the EAP-Failure
@@ -831,7 +802,7 @@ fr_tls_status_t eaptls_process(EAP_HANDLER *handler)
 	 */
 	if (tlspacket->dlen !=
 	    (tls_session->record_plus)(&tls_session->dirty_in, tlspacket->data, tlspacket->dlen)) {
-		eaptls_free(&tlspacket);
+		talloc_free(tlspacket);
 		RDEBUG("Exceeded maximum record size");
 		status =FR_TLS_FAIL;
 		goto done;
@@ -840,7 +811,7 @@ fr_tls_status_t eaptls_process(EAP_HANDLER *handler)
 	/*
 	 *	No longer needed.
 	 */
-	eaptls_free(&tlspacket);
+	talloc_free(tlspacket);
 
 	/*
 	 *	SSL initalization is done.  Return.
@@ -853,10 +824,10 @@ fr_tls_status_t eaptls_process(EAP_HANDLER *handler)
 		 *	there more fragments coming, then send ACK,
 		 *	and get the caller to continue the
 		 *	conversation.
-		 */	
-	        if ((status == FR_TLS_MORE_FRAGMENTS) ||
-        	    (status == FR_TLS_MORE_FRAGMENTS_WITH_LENGTH) ||
-            	    (status == FR_TLS_FIRST_FRAGMENT)) {
+		 */
+		if ((status == FR_TLS_MORE_FRAGMENTS) ||
+		    (status == FR_TLS_MORE_FRAGMENTS_WITH_LENGTH) ||
+	    	    (status == FR_TLS_FIRST_FRAGMENT)) {
 			/*
 			 *	Send the ACK.
 			 */
@@ -891,7 +862,7 @@ int eaptls_compose(EAP_DS *eap_ds, EAPTLS_PACKET *reply)
 	uint8_t *ptr;
 
 	/*
-	 *	Don't set eap_ds->request->type.type, as the main EAP
+	 *	Don't set eap_ds->request->type.num, as the main EAP
 	 *	handler will do that for us.  This allows the TLS
 	 *	module to be called from TTLS & PEAP.
 	 */
@@ -910,9 +881,9 @@ int eaptls_compose(EAP_DS *eap_ds, EAPTLS_PACKET *reply)
 	 *	Identifier value in the subsequent fragment contained
 	 *	within an EAP- Reponse.
 	 */
-	eap_ds->request->type.data = malloc(reply->length - TLS_HEADER_LEN + 1);
-	if (eap_ds->request->type.data == NULL) {
-		radlog(L_ERR, "out of memory");
+	eap_ds->request->type.data = talloc_array(eap_ds->request, uint8_t,
+						  reply->length - TLS_HEADER_LEN + 1);
+	if (!eap_ds->request->type.data) {
 		return 0;
 	}
 
@@ -953,9 +924,9 @@ int eaptls_compose(EAP_DS *eap_ds, EAPTLS_PACKET *reply)
  *	fall back to compatibility mode and read the TLS options from
  *	the 'tls' section.
  */
-fr_tls_server_conf_t *eaptls_conf_parse(CONF_SECTION *cs, const char *attr)
+fr_tls_server_conf_t *eaptls_conf_parse(CONF_SECTION *cs, char const *attr)
 {
-	const char 		*tls_conf_name;
+	char const 		*tls_conf_name;
 	CONF_PAIR		*cp;
 	CONF_SECTION		*parent;
 	CONF_SECTION		*tls_cs;
@@ -975,7 +946,7 @@ fr_tls_server_conf_t *eaptls_conf_parse(CONF_SECTION *cs, const char *attr)
 		tls_cs = cf_section_sub_find_name2(parent, TLS_CONFIG_SECTION, tls_conf_name);
 
 		if (!tls_cs) {
-			radlog(L_ERR, "error: cannot find tls config '%s'", tls_conf_name);
+			ERROR("Cannot find tls config '%s'", tls_conf_name);
 			return NULL;
 		}
 	} else {
@@ -987,7 +958,7 @@ fr_tls_server_conf_t *eaptls_conf_parse(CONF_SECTION *cs, const char *attr)
 		 *	We don't fall back if the 'attr' is specified, but we can't
 		 *	find the section - that is just a config error.
 		 */
-		radlog(L_INFO, "debug: '%s' option missing, trying to use legacy configuration", attr);
+		INFO("debug: '%s' option missing, trying to use legacy configuration", attr);
 		tls_cs = cf_section_sub_find(parent, "tls");
 	}
 
@@ -1003,7 +974,7 @@ fr_tls_server_conf_t *eaptls_conf_parse(CONF_SECTION *cs, const char *attr)
 	 *	The EAP RFC's say 1020, but we're less picky.
 	 */
 	if (tls_conf->fragment_size < 100) {
-		radlog(L_ERR, "error: Fragment size is too small.");
+		ERROR("Fragment size is too small");
 		return NULL;
 	}
 
@@ -1014,7 +985,7 @@ fr_tls_server_conf_t *eaptls_conf_parse(CONF_SECTION *cs, const char *attr)
 	 *	that can be devoted *solely* to EAP.
 	 */
 	if (tls_conf->fragment_size > 4000) {
-		radlog(L_ERR, "error: Fragment size is too large.");
+		ERROR("Fragment size is too large");
 		return NULL;
 	}
 

@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_realm.c
@@ -20,7 +20,6 @@
  *
  * @copyright 2000-2013  The FreeRADIUS server project
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -30,11 +29,11 @@ RCSID("$Id$")
 #define  REALM_FORMAT_SUFFIX   1
 
 typedef struct realm_config_t {
-        int        format;
-        char       *formatstring;
-        char       *delim;
-	int        ignore_default;
-	int        ignore_null;
+	int	format;
+	char	*formatstring;
+	char	*delim;
+	bool	ignore_default;
+	bool	ignore_null;
 } realm_config_t;
 
 static CONF_PARSER module_config[] = {
@@ -57,14 +56,14 @@ static CONF_PARSER module_config[] = {
  */
 static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm)
 {
-	char namebuf[MAX_STRING_LEN];
+	char *namebuf;
 	char *username;
-	const char *realmname = NULL;
+	char const *realmname = NULL;
 	char *ptr;
 	VALUE_PAIR *vp;
 	REALM *realm;
 
-        struct realm_config_t *inst = instance;
+	struct realm_config_t *inst = instance;
 
 	/* initiate returnrealm */
 	*returnrealm = NULL;
@@ -79,13 +78,13 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 	 *	Also, if there's no User-Name attribute, we can't
 	 *	proxy it, either.
 	 */
-	if ((request->username == NULL)
+	if ((!request->username)
 #ifdef WITH_PROXY
 	    || (request->proxy != NULL)
 #endif
 	    ) {
-	    
-		RDEBUG2("Proxy reply, or no User-Name.  Ignoring.");
+
+		RDEBUG2("Proxy reply, or no User-Name.  Ignoring");
 		return RLM_MODULE_OK;
 	}
 
@@ -95,7 +94,7 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 	 */
 
 	if (pairfind(request->packet->vps, PW_REALM, 0, TAG_ANY) != NULL ) {
-	        RDEBUG2("Request already proxied.  Ignoring.");
+		RDEBUG2("Request already has destination realm set.  Ignoring");
 		return RLM_MODULE_OK;
 	}
 
@@ -103,12 +102,10 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 	 *	We will be modifing this later, so we want our own copy
 	 *	of it.
 	 */
-	strlcpy(namebuf, (char *)request->username->vp_strvalue, sizeof(namebuf));
+	namebuf = talloc_strdup(request,  request->username->vp_strvalue);
 	username = namebuf;
 
-	switch(inst->format)
-	{
-
+	switch(inst->format) {
 	case REALM_FORMAT_SUFFIX:
 
 	  /* DEBUG2("  rlm_realm: Checking for suffix after \"%c\"", inst->delim[0]); */
@@ -146,9 +143,10 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 		RDEBUG2("Looking up realm \"%s\" for User-Name = \"%s\"",
 		       realmname, request->username->vp_strvalue);
 	} else {
-		if( inst->ignore_null ) {
+		if (inst->ignore_null ) {
 			RDEBUG2("No '%c' in User-Name = \"%s\", skipping NULL due to config.",
 			inst->delim[0], request->username->vp_strvalue);
+			talloc_free(namebuf);
 			return RLM_MODULE_NOOP;
 		}
 		RDEBUG2("No '%c' in User-Name = \"%s\", looking up realm NULL",
@@ -161,12 +159,14 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 	realm = realm_find(realmname);
 	if (!realm) {
 		RDEBUG2("No such realm \"%s\"",
-		       (realmname == NULL) ? "NULL" : realmname);
+			(!realmname) ? "NULL" : realmname);
+		talloc_free(namebuf);
 		return RLM_MODULE_NOOP;
 	}
 	if( inst->ignore_default &&
 	    (strcmp(realm->name, "DEFAULT")) == 0) {
-		RDEBUG2("Found DEFAULT, but skipping due to config.");
+		RDEBUG2("Found DEFAULT, but skipping due to config");
+		talloc_free(namebuf);
 		return RLM_MODULE_NOOP;
 	}
 
@@ -181,18 +181,16 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 		 *	doesn't exist.
 		 *
 		 */
-		if (request->username->attribute != PW_STRIPPED_USER_NAME) {
+		if (request->username->da->attr != PW_STRIPPED_USER_NAME) {
 			vp = radius_paircreate(request, &request->packet->vps,
-					       PW_STRIPPED_USER_NAME, 0,
-					       PW_TYPE_STRING);
+					       PW_STRIPPED_USER_NAME, 0);
 			RDEBUG2("Adding Stripped-User-Name = \"%s\"", username);
 		} else {
 			vp = request->username;
 			RDEBUG2("Setting Stripped-User-Name = \"%s\"", username);
 		}
 
-		strcpy(vp->vp_strvalue, username);
-		vp->length = strlen((char *)vp->vp_strvalue);
+		pairstrcpy(vp, username);
 		request->username = vp;
 	}
 
@@ -205,9 +203,11 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 	 *	entered.
 	 */
 	if (realm->name[0] != '~') realmname = realm->name;
-	pairadd(&request->packet->vps, pairmake("Realm", realmname,
-						T_OP_EQ));
+	pairmake_packet("Realm", realmname, T_OP_EQ);
 	RDEBUG2("Adding Realm = \"%s\"", realmname);
+
+	talloc_free(namebuf);
+	realmname = username = NULL;
 
 	/*
 	 *	Figure out what to do with the request.
@@ -221,9 +221,9 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 		/*
 		 *	Perhaps accounting proxying was turned off.
 		 */
-	case PW_ACCOUNTING_REQUEST:
+	case PW_CODE_ACCOUNTING_REQUEST:
 		if (!realm->acct_pool) {
-			RDEBUG2("Accounting realm is LOCAL.");
+			RDEBUG2("Accounting realm is LOCAL");
 			return RLM_MODULE_OK;
 		}
 		break;
@@ -231,9 +231,9 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 		/*
 		 *	Perhaps authentication proxying was turned off.
 		 */
-	case PW_AUTHENTICATION_REQUEST:
+	case PW_CODE_AUTHENTICATION_REQUEST:
 		if (!realm->auth_pool) {
-			RDEBUG2("Authentication realm is LOCAL.");
+			RDEBUG2("Authentication realm is LOCAL");
 			return RLM_MODULE_OK;
 		}
 		break;
@@ -241,13 +241,13 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 
 #ifdef WITH_PROXY
 	RDEBUG2("Proxying request from user %s to realm %s",
-	       username, realm->name);
+	       request->username->vp_strvalue, realm->name);
 
 	/*
 	 *	Skip additional checks if it's not an accounting
 	 *	request.
 	 */
-	if (request->packet->code != PW_ACCOUNTING_REQUEST) {
+	if (request->packet->code != PW_CODE_ACCOUNTING_REQUEST) {
 		*returnrealm = realm;
 		return RLM_MODULE_UPDATED;
 	}
@@ -325,71 +325,34 @@ static int check_for_realm(void *instance, REQUEST *request, REALM **returnrealm
 }
 
 /*
- *	Add a "Proxy-To-Realm" attribute to the request.
- */
-static void add_proxy_to_realm(VALUE_PAIR **vps, REALM *realm)
-{
-	VALUE_PAIR *vp;
-
-	/*
-	 *	Tell the server to proxy this request to another
-	 *	realm.
-	 */
-	vp = pairmake("Proxy-To-Realm", realm->name, T_OP_EQ);
-	if (!vp) {
-		radlog(L_ERR|L_CONS, "no memory");
-		exit(1);
-	}
-
-	/*
-	 *  Add it, even if it's already present.
-	 */
-	pairadd(vps, vp);
-}
-
-/*
  *  Perform the realm module instantiation.  Configuration info is
  *  stored in *instance for later use.
  */
 
-static int realm_instantiate(CONF_SECTION *conf, void **instance)
+static int mod_instantiate(CONF_SECTION *conf, void *instance)
 {
-        struct realm_config_t *inst;
+	struct realm_config_t *inst = instance;
 
-        /* setup a storage area for instance data */
-        inst = rad_malloc(sizeof(*inst));
-	if (!inst) {
-		return -1;
-	}
-	memset(inst, 0, sizeof(*inst));
-
-	if(cf_section_parse(conf, inst, module_config) < 0) {
-	       free(inst);
-               return -1;
-	}
-
-	if(strcasecmp(inst->formatstring, "suffix") == 0) {
+	if (strcasecmp(inst->formatstring, "suffix") == 0) {
 	     inst->format = REALM_FORMAT_SUFFIX;
-	} else if(strcasecmp(inst->formatstring, "prefix") == 0) {
+
+	} else if (strcasecmp(inst->formatstring, "prefix") == 0) {
 	     inst->format = REALM_FORMAT_PREFIX;
-        } else {
-	     radlog(L_ERR, "Bad value \"%s\" for realm format value", inst->formatstring);
-	     free(inst);
-	     return -1;
-	}
-	if(strlen(inst->delim) != 1) {
-	     radlog(L_ERR, "Bad value \"%s\" for realm delimiter value", inst->delim);
-	     free(inst);
+
+	} else {
+		cf_log_err_cs(conf, "Invalid value \"%s\" for format",
+			      inst->formatstring);
 	     return -1;
 	}
 
-	*instance = inst;
+	if (strlen(inst->delim) != 1) {
+		cf_log_err_cs(conf, "Invalid value \"%s\" for delimiter",
+			      inst->delim);
+	     return -1;
+	}
+
 	return 0;
-
 }
-
-
-
 
 
 /*
@@ -399,7 +362,7 @@ static int realm_instantiate(CONF_SECTION *conf, void **instance)
  *
  *  This should very nearly duplicate the old proxy_send() code
  */
-static rlm_rcode_t realm_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t mod_authorize(void *instance, REQUEST *request)
 {
 	rlm_rcode_t rcode;
 	REALM *realm;
@@ -418,24 +381,23 @@ static rlm_rcode_t realm_authorize(void *instance, REQUEST *request)
 	 */
 	RDEBUG2("Preparing to proxy authentication request to realm \"%s\"\n",
 	       realm->name);
-	add_proxy_to_realm(&request->config_items, realm);
+	pairmake_config("Proxy-To-Realm", realm->name, T_OP_EQ);
 
 	return RLM_MODULE_UPDATED; /* try the next module */
 }
 
 /*
- * This does the exact same thing as the realm_authorize, it's just called
+ * This does the exact same thing as the mod_authorize, it's just called
  * differently.
  */
-static rlm_rcode_t realm_preacct(void *instance, REQUEST *request)
+static rlm_rcode_t mod_preacct(void *instance, REQUEST *request)
 {
 	int rcode;
-	const char *name = (char *)request->username->vp_strvalue;
 	REALM *realm;
 
-	if (!name)
-	  return RLM_MODULE_OK;
-
+	if (!request->username) {
+		return RLM_MODULE_NOOP;
+	}
 
 	/*
 	 *	Check if we've got to proxy the request.
@@ -451,7 +413,7 @@ static rlm_rcode_t realm_preacct(void *instance, REQUEST *request)
 	 */
 	RDEBUG2("Preparing to proxy accounting request to realm \"%s\"\n",
 	       realm->name);
-	add_proxy_to_realm(&request->config_items, realm);
+	pairmake_config("Proxy-To-Realm", realm->name, T_OP_EQ);
 
 	return RLM_MODULE_UPDATED; /* try the next module */
 }
@@ -461,22 +423,23 @@ static rlm_rcode_t realm_preacct(void *instance, REQUEST *request)
  *	CoA realms via Operator-Name.  Because the realm isn't in a
  *	User-Name, concepts like "prefix" and "suffix' don't matter.
  */
-static rlm_rcode_t realm_coa(UNUSED void *instance, REQUEST *request)
+static rlm_rcode_t realm_recv_coa(UNUSED void *instance, REQUEST *request)
 {
 	VALUE_PAIR *vp;
 	REALM *realm;
 
 	if (pairfind(request->packet->vps, PW_REALM, 0, TAG_ANY) != NULL) {
-	        RDEBUG2("Request already proxied.  Ignoring.");
+		RDEBUG2("Request already has destination realm set.  Ignoring");
 		return RLM_MODULE_OK;
 	}
 
 	vp = pairfind(request->packet->vps, PW_OPERATOR_NAME, 0, TAG_ANY);
+	if (!vp) return RLM_MODULE_NOOP;
 
 	/*
 	 *	Catch the case of broken dictionaries.
 	 */
-	if (vp->type != PW_TYPE_STRING) return RLM_MODULE_NOOP;
+	if (vp->da->type != PW_TYPE_STRING) return RLM_MODULE_NOOP;
 
 	/*
 	 *	The string is too short.
@@ -492,7 +455,7 @@ static rlm_rcode_t realm_coa(UNUSED void *instance, REQUEST *request)
 	if (!realm) return RLM_MODULE_NOTFOUND;
 
 	if (!realm->coa_pool) {
-		RDEBUG2("CoA realm is LOCAL.");
+		RDEBUG2("CoA realm is LOCAL");
 		return RLM_MODULE_OK;
 	}
 
@@ -501,36 +464,32 @@ static rlm_rcode_t realm_coa(UNUSED void *instance, REQUEST *request)
 	 */
 	RDEBUG2("Preparing to proxy authentication request to realm \"%s\"\n",
 	       realm->name);
-	add_proxy_to_realm(&request->config_items, realm);
+	pairmake_config("Proxy-To-Realm", realm->name, T_OP_EQ);
 
 	return RLM_MODULE_UPDATED; /* try the next module */
 }
 #endif
-
-static int realm_detach(void *instance)
-{
-	free(instance);
-	return 0;
-}
 
 /* globally exported name */
 module_t rlm_realm = {
 	RLM_MODULE_INIT,
 	"realm",
 	RLM_TYPE_CHECK_CONFIG_SAFE | RLM_TYPE_HUP_SAFE,   	/* type */
-	realm_instantiate,	       	/* instantiation */
-	realm_detach,			/* detach */
+	sizeof(struct realm_config_t),
+	module_config,
+	mod_instantiate,	       	/* instantiation */
+	NULL,				/* detach */
 	{
 		NULL,			/* authentication */
-		realm_authorize,	/* authorization */
-		realm_preacct,		/* preaccounting */
+		mod_authorize,	/* authorization */
+		mod_preacct,		/* preaccounting */
 		NULL,			/* accounting */
 		NULL,			/* checksimul */
 		NULL,			/* pre-proxy */
 		NULL,			/* post-proxy */
 		NULL			/* post-auth */
 #ifdef WITH_COA
-		, realm_coa,		/* recv-coa */
+		, realm_recv_coa,	/* recv-coa */
 		NULL			/* send-coa */
 #endif
 	},

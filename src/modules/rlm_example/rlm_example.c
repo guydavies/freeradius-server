@@ -12,7 +12,7 @@
  *   along with this program; if not, write to the Free Software
  *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
- 
+
 /**
  * $Id$
  * @file rlm_example.c
@@ -21,7 +21,6 @@
  * @copyright 2013 The FreeRADIUS server project
  * @copyright 2013 your name \<your address\>
  */
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -35,7 +34,7 @@ RCSID("$Id$")
  *	be used as the instance handle.
  */
 typedef struct rlm_example_t {
-	int		boolean;
+	bool		boolean;
 	int		value;
 	char		*string;
 	uint32_t	ipaddr;
@@ -43,12 +42,6 @@ typedef struct rlm_example_t {
 
 /*
  *	A mapping of configuration file names to internal variables.
- *
- *	Note that the string is dynamically allocated, so it MUST
- *	be freed.  When the configuration file parse re-reads the string,
- *	it free's the old one, and strdup's the new one, placing the pointer
- *	to the strdup'd string into 'config.string'.  This gets around
- *	buffer over-flows.
  */
 static const CONF_PARSER module_config[] = {
   { "integer", PW_TYPE_INTEGER,    offsetof(rlm_example_t,value), NULL,   "1" },
@@ -70,29 +63,17 @@ static const CONF_PARSER module_config[] = {
  *	that must be referenced in later calls, store a handle to it
  *	in *instance otherwise put a null pointer there.
  */
-static int example_instantiate(CONF_SECTION *conf, void **instance)
+static int mod_instantiate(CONF_SECTION *conf, void *instance)
 {
-	rlm_example_t *data;
+	rlm_example_t *inst = instance;
 
 	/*
-	 *	Set up a storage area for instance data
+	 *	Do more work here
 	 */
-	data = rad_malloc(sizeof(*data));
-	if (!data) {
+	if (!inst->boolean) {
+		cf_log_err_cs(conf, "Boolean is false: forcing error!");
 		return -1;
 	}
-	memset(data, 0, sizeof(*data));
-
-	/*
-	 *	If the configuration parameters can't be parsed, then
-	 *	fail.
-	 */
-	if (cf_section_parse(conf, data, module_config) < 0) {
-		free(data);
-		return -1;
-	}
-
-	*instance = data;
 
 	return 0;
 }
@@ -103,14 +84,9 @@ static int example_instantiate(CONF_SECTION *conf, void **instance)
  *	from the database. The authentication code only needs to check
  *	the password, the rest is done here.
  */
-static rlm_rcode_t example_authorize(void *instance, REQUEST *request)
+static rlm_rcode_t mod_authorize(UNUSED void *instance, UNUSED REQUEST *request)
 {
 	VALUE_PAIR *state;
-	VALUE_PAIR *reply;
-
-	/* quiet the compiler */
-	instance = instance;
-	request = request;
 
 	/*
 	 *  Look for the 'state' attribute.
@@ -124,18 +100,16 @@ static rlm_rcode_t example_authorize(void *instance, REQUEST *request)
 	/*
 	 *  Create the challenge, and add it to the reply.
 	 */
-       	reply = pairmake("Reply-Message", "This is a challenge", T_OP_EQ);
-	pairadd(&request->reply->vps, reply);
-	state = pairmake("State", "0", T_OP_EQ);
-	pairadd(&request->reply->vps, state);
+	pairmake_reply("Reply-Message", "This is a challenge", T_OP_EQ);
+	pairmake_reply("State", "0", T_OP_EQ);
 
 	/*
 	 *  Mark the packet as an Access-Challenge packet.
 	 *
 	 *  The server will take care of sending it to the user.
 	 */
-	request->reply->code = PW_ACCESS_CHALLENGE;
-	RDEBUG("Sending Access-Challenge.");
+	request->reply->code = PW_CODE_ACCESS_CHALLENGE;
+	RDEBUG("Sending Access-Challenge");
 
 	return RLM_MODULE_HANDLED;
 }
@@ -143,36 +117,25 @@ static rlm_rcode_t example_authorize(void *instance, REQUEST *request)
 /*
  *	Authenticate the user with the given password.
  */
-static rlm_rcode_t example_authenticate(void *instance, REQUEST *request)
+static rlm_rcode_t mod_authenticate(UNUSED void *instance, UNUSED REQUEST *request)
 {
-	/* quiet the compiler */
-	instance = instance;
-	request = request;
-
 	return RLM_MODULE_OK;
 }
 
+#ifdef WITH_ACCOUNTING
 /*
  *	Massage the request before recording it or proxying it
  */
-static rlm_rcode_t example_preacct(void *instance, REQUEST *request)
+static rlm_rcode_t mod_preacct(UNUSED void *instance, UNUSED REQUEST *request)
 {
-	/* quiet the compiler */
-	instance = instance;
-	request = request;
-
 	return RLM_MODULE_OK;
 }
 
 /*
  *	Write accounting information to this modules database.
  */
-static rlm_rcode_t example_accounting(void *instance, REQUEST *request)
+static rlm_rcode_t mod_accounting(UNUSED void *instance, UNUSED REQUEST *request)
 {
-	/* quiet the compiler */
-	instance = instance;
-	request = request;
-
 	return RLM_MODULE_OK;
 }
 
@@ -186,23 +149,22 @@ static rlm_rcode_t example_accounting(void *instance, REQUEST *request)
  *	max. number of logins, do a second pass and validate all
  *	logins by querying the terminal server (using eg. SNMP).
  */
-static rlm_rcode_t example_checksimul(void *instance, REQUEST *request)
+static rlm_rcode_t mod_checksimul(UNUSED void *instance, UNUSED REQUEST *request)
 {
-  instance = instance;
-
   request->simul_count=0;
 
   return RLM_MODULE_OK;
 }
+#endif
 
 
 /*
  *	Only free memory we allocated.  The strings allocated via
  *	cf_section_parse() do not need to be freed.
  */
-static int example_detach(void *instance)
+static int mod_detach(UNUSED void *instance)
 {
-	free(instance);
+	/* free things here */
 	return 0;
 }
 
@@ -219,14 +181,20 @@ module_t rlm_example = {
 	RLM_MODULE_INIT,
 	"example",
 	RLM_TYPE_THREAD_SAFE,		/* type */
-	example_instantiate,		/* instantiation */
-	example_detach,			/* detach */
+	sizeof(rlm_example_t),
+	module_config,
+	mod_instantiate,		/* instantiation */
+	mod_detach,			/* detach */
 	{
-		example_authenticate,	/* authentication */
-		example_authorize,	/* authorization */
-		example_preacct,	/* preaccounting */
-		example_accounting,	/* accounting */
-		example_checksimul,	/* checksimul */
+		mod_authenticate,	/* authentication */
+		mod_authorize,	/* authorization */
+#ifdef WITH_ACCOUNTING
+		mod_preacct,	/* preaccounting */
+		mod_accounting,	/* accounting */
+		mod_checksimul,	/* checksimul */
+#else
+		NULL, NULL, NULL,
+#endif
 		NULL,			/* pre-proxy */
 		NULL,			/* post-proxy */
 		NULL			/* post-auth */

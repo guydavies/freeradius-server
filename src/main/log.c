@@ -23,7 +23,6 @@
  * Copyright 2001  Chad Miller <cmiller@surfsouth.com>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -40,35 +39,142 @@ RCSID("$Id$")
  * Logging facility names
  */
 static const FR_NAME_NUMBER levels[] = {
-	{ ": Debug: ",          L_DBG   },
-	{ ": Auth: ",           L_AUTH  },
-	{ ": Proxy: ",          L_PROXY },
-	{ ": Info: ",           L_INFO  },
-	{ ": Acct: ",           L_ACCT  },
-	{ ": Error: ",          L_ERR   },
+	{ ": Debug: ",		L_DBG		},
+	{ ": Auth: ",		L_AUTH		},
+	{ ": Proxy: ",		L_PROXY		},
+	{ ": Info: ",		L_INFO		},
+	{ ": Acct: ",		L_ACCT		},
+	{ ": Error: ",		L_ERR		},
+	{ ": WARNING: ",	L_DBG_WARN	},
+	{ ": ERROR: ",		L_DBG_ERR	},
+	{ ": WARNING: ",	L_DBG_WARN2	},
+	{ ": ERROR: ",		L_DBG_ERR2	},
 	{ NULL, 0 }
 };
 
-int log_dates_utc = 0;
+#define VTC_RED		"\x1b[31m"
+#define VTC_YELLOW      "\x1b[33m"
+#define VTC_BOLD	"\x1b[1m"
+#define VTC_RESET	"\x1b[0m"
 
+static const FR_NAME_NUMBER colours[] = {
+	{ "",			L_DBG		},
+	{ VTC_BOLD,		L_AUTH		},
+	{ VTC_BOLD,		L_PROXY		},
+	{ VTC_BOLD,		L_INFO		},
+	{ VTC_BOLD,		L_ACCT		},
+	{ VTC_RED,		L_ERR		},
+	{ VTC_BOLD VTC_YELLOW,	L_WARN		},
+	{ VTC_BOLD VTC_RED,	L_DBG_ERR	},
+	{ VTC_BOLD VTC_YELLOW,	L_DBG_WARN	},
+	{ VTC_BOLD VTC_RED,	L_DBG_ERR2	},
+	{ VTC_BOLD VTC_YELLOW,	L_DBG_WARN2	},
+	{ NULL, 0 }
+};
+
+/*
+ *	Syslog facility table.
+ */
+const FR_NAME_NUMBER syslog_str2fac[] = {
+#ifdef LOG_KERN
+	{ "kern",		LOG_KERN	},
+#endif
+#ifdef LOG_USER
+	{ "user",		LOG_USER	},
+#endif
+#ifdef LOG_MAIL
+	{ "mail",		LOG_MAIL	},
+#endif
+#ifdef LOG_DAEMON
+	{ "daemon",		LOG_DAEMON	},
+#endif
+#ifdef LOG_AUTH
+	{ "auth",		LOG_AUTH	},
+#endif
+#ifdef LOG_LPR
+	{ "lpr",		LOG_LPR		},
+#endif
+#ifdef LOG_NEWS
+	{ "news",		LOG_NEWS	},
+#endif
+#ifdef LOG_UUCP
+	{ "uucp",		LOG_UUCP	},
+#endif
+#ifdef LOG_CRON
+	{ "cron",		LOG_CRON	},
+#endif
+#ifdef LOG_AUTHPRIV
+	{ "authpriv",		LOG_AUTHPRIV	},
+#endif
+#ifdef LOG_FTP
+	{ "ftp",		LOG_FTP		},
+#endif
+#ifdef LOG_LOCAL0
+	{ "local0",		LOG_LOCAL0	},
+#endif
+#ifdef LOG_LOCAL1
+	{ "local1",		LOG_LOCAL1	},
+#endif
+#ifdef LOG_LOCAL2
+	{ "local2",		LOG_LOCAL2	},
+#endif
+#ifdef LOG_LOCAL3
+	{ "local3",		LOG_LOCAL3	},
+#endif
+#ifdef LOG_LOCAL4
+	{ "local4",		LOG_LOCAL4	},
+#endif
+#ifdef LOG_LOCAL5
+	{ "local5",		LOG_LOCAL5	},
+#endif
+#ifdef LOG_LOCAL6
+	{ "local6",		LOG_LOCAL6	},
+#endif
+#ifdef LOG_LOCAL7
+	{ "local7",		LOG_LOCAL7	},
+#endif
+	{ NULL,			-1		}
+};
+
+const FR_NAME_NUMBER log_str2dst[] = {
+	{ "null",		L_DST_NULL	},
+	{ "files",		L_DST_FILES	},
+	{ "syslog",		L_DST_SYSLOG	},
+	{ "stdout",		L_DST_STDOUT	},
+	{ "stderr",		L_DST_STDERR	},
+	{ NULL,			L_DST_NUM_DEST	}
+};
+
+bool log_dates_utc = false;
+
+
+fr_log_t default_log = {
+	.colourise = true,
+	.fd = STDOUT_FILENO,
+	.dest = L_DST_STDOUT,
+	.file = NULL,
+	.debug_file = NULL,
+};
 
 /*
  *	Log the message to the logfile. Include the severity and
  *	a time stamp.
  */
-int vradlog(int lvl, const char *fmt, va_list ap)
+DIAG_OFF(format-nonliteral)
+int vradlog(log_type_t type, char const *fmt, va_list ap)
 {
-	struct main_config_t *myconfig = &mainconfig;
 	unsigned char *p;
 	char buffer[8192];
-	int len;
+	char *unsan;
+	size_t len;
+	int colourise = default_log.colourise;
 
 	/*
 	 *	NOT debugging, and trying to log debug messages.
 	 *
 	 *	Throw the message away.
 	 */
-	if (!debug_flag && (lvl == L_DBG)) {
+	if (!debug_flag && ((type & L_DBG) != 0)) {
 		return 0;
 	}
 
@@ -76,12 +182,23 @@ int vradlog(int lvl, const char *fmt, va_list ap)
 	 *	If we don't want any messages, then
 	 *	throw them away.
 	 */
-	if (myconfig->radlog_dest == RADLOG_NULL) {
+	if (default_log.dest == L_DST_NULL) {
 		return 0;
 	}
 
-	*buffer = '\0';
+	buffer[0] = '\0';
 	len = 0;
+
+	if (colourise) {
+		len += strlcpy(buffer + len, fr_int2str(colours, type, ""),
+			       sizeof(buffer) - len) ;
+		if (len == 0) colourise = false;
+	}
+
+	/*
+	 *	Mark the point where we treat the buffer as unsanitized.
+	 */
+	unsan = buffer + len;
 
 	/*
 	 *	Don't print timestamps to syslog, it does that for us.
@@ -90,163 +207,186 @@ int vradlog(int lvl, const char *fmt, va_list ap)
 	 *	Print timestamps for non-debugging, and for high levels
 	 *	of debugging.
 	 */
-	if ((myconfig->radlog_dest != RADLOG_SYSLOG) &&
+	if ((default_log.dest != L_DST_SYSLOG) &&
 	    (debug_flag != 1) && (debug_flag != 2)) {
-		const char *s;
 		time_t timeval;
 
 		timeval = time(NULL);
 		CTIME_R(&timeval, buffer + len, sizeof(buffer) - len - 1);
 
-		s = fr_int2str(levels, (lvl & ~L_CONS), ": ");
-
-		strcat(buffer, s);
 		len = strlen(buffer);
+
+		len += strlcpy(buffer + len,
+			       fr_int2str(levels, type, ": "),
+			       sizeof(buffer) - len);
 	}
 
-	vsnprintf(buffer + len, sizeof(buffer) - len - 1, fmt, ap);
+	switch (type) {
+	case L_DBG_WARN:
+		len += strlcpy(buffer + len, "WARNING: ", sizeof(buffer) - len);
+		break;
+
+	case L_DBG_ERR:
+		len += strlcpy(buffer + len, "ERROR: ", sizeof(buffer) - len);
+		break;
+
+	default:
+		break;
+	}
+
+	if (len < sizeof(buffer)) {
+		len += vsnprintf(buffer + len, sizeof(buffer) - len - 1, fmt, ap);
+	}
 
 	/*
 	 *	Filter out characters not in Latin-1.
 	 */
-	for (p = (unsigned char *)buffer; *p != '\0'; p++) {
+	for (p = (unsigned char *)unsan; *p != '\0'; p++) {
 		if (*p == '\r' || *p == '\n')
 			*p = ' ';
 		else if (*p == '\t') continue;
 		else if (*p < 32 || (*p >= 128 && *p <= 160))
 			*p = '?';
 	}
-	strcat(buffer, "\n");
 
-	switch (myconfig->radlog_dest) {
+	if (colourise && (len < sizeof(buffer))) {
+		len += strlcpy(buffer + len, VTC_RESET, sizeof(buffer) - len);
+	}
+
+	if (len < (sizeof(buffer) - 2)) {
+		buffer[len]	= '\n';
+		buffer[len + 1] = '\0';
+	} else {
+		buffer[sizeof(buffer) - 2] = '\n';
+		buffer[sizeof(buffer) - 1] = '\0';
+	}
+
+	switch (default_log.dest) {
 
 #ifdef HAVE_SYSLOG_H
-	case RADLOG_SYSLOG:
-		switch(lvl & ~L_CONS) {
+	case L_DST_SYSLOG:
+		switch(type) {
 			case L_DBG:
-				lvl = LOG_DEBUG;
+			case L_WARN:
+			case L_DBG_WARN:
+			case L_DBG_WARN2:
+			case L_DBG_ERR:
+			case L_DBG_ERR2:
+				type = LOG_DEBUG;
 				break;
 			case L_AUTH:
-				lvl = LOG_NOTICE;
-				break;
 			case L_PROXY:
-				lvl = LOG_NOTICE;
-				break;
 			case L_ACCT:
-				lvl = LOG_NOTICE;
+				type = LOG_NOTICE;
 				break;
 			case L_INFO:
-				lvl = LOG_INFO;
+				type = LOG_INFO;
 				break;
 			case L_ERR:
-				lvl = LOG_ERR;
+				type = LOG_ERR;
 				break;
 		}
-		syslog(lvl, "%s", buffer);
+		syslog(type, "%s", buffer);
 		break;
 #endif
 
-	case RADLOG_FILES:
-	case RADLOG_STDOUT:
-	case RADLOG_STDERR:
-		write(myconfig->radlog_fd, buffer, strlen(buffer));
-		break;
+	case L_DST_FILES:
+	case L_DST_STDOUT:
+	case L_DST_STDERR:
+		return write(default_log.fd, buffer, strlen(buffer));
 
 	default:
-	case RADLOG_NULL:	/* should have been caught above */
+	case L_DST_NULL:	/* should have been caught above */
 		break;
 	}
 
 	return 0;
 }
+DIAG_ON(format-nonliteral)
 
-int log_debug(const char *msg, ...)
+int radlog(log_type_t type, char const *msg, ...)
 {
 	va_list ap;
 	int r;
 
 	va_start(ap, msg);
-	r = vradlog(L_DBG, msg, ap);
+	r = vradlog(type, msg, ap);
 	va_end(ap);
 
 	return r;
 }
-
-int radlog(int lvl, const char *msg, ...)
-{
-	va_list ap;
-	int r;
-
-	va_start(ap, msg);
-	r = vradlog(lvl, msg, ap);
-	va_end(ap);
-
-	return r;
-}
-
 
 /*
  *      Dump a whole list of attributes to DEBUG2
  */
 void vp_listdebug(VALUE_PAIR *vp)
 {
-        char tmpPair[70];
-        for (; vp; vp = vp->next) {
-                vp_prints(tmpPair, sizeof(tmpPair), vp);
-                DEBUG2("     %s", tmpPair);
-        }
+	vp_cursor_t cursor;
+	char tmpPair[70];
+	for (vp = fr_cursor_init(&cursor, &vp);
+	     vp;
+	     vp = fr_cursor_next(&cursor)) {
+		vp_prints(tmpPair, sizeof(tmpPair), vp);
+		DEBUG2("     %s", tmpPair);
+	}
 }
 
-extern char *request_log_file;
-#ifdef WITH_COMMAND_SOCKET
-extern char *debug_log_file;
-#endif
+inline bool radlog_debug_enabled(log_type_t type, log_debug_t lvl, REQUEST *request)
+{
+	/*
+	 *	It's a debug class message, not this doesn't mean it's a debug type message.
+	 *
+	 *	For example it could be a RIDEBUG message, which would be an informational message,
+	 *	instead of an RDEBUG message which would be a debug debug message.
+	 *
+	 *	There is log function, but the request debug level isn't high enough.
+	 *	OR, we're in debug mode, and the global debug level isn't high enough,
+	 *	then don't log the message.
+	 */
+	if ((type & L_DBG) &&
+	    ((request && request->radlog && (lvl > request->options)) ||
+	     ((debug_flag != 0) && (lvl > debug_flag)))) {
+	 	return false;
+	}
 
-void radlog_request(int lvl, int priority, REQUEST *request, const char *msg, ...)
+	return true;
+}
+
+void radlog_request(log_type_t type, log_debug_t lvl, REQUEST *request, char const *msg, ...)
 {
 	size_t len = 0;
-	const char *filename = request_log_file;
+	char const *filename = default_log.file;
 	FILE *fp = NULL;
 	va_list ap;
 	char buffer[8192];
+	char *p;
+	char const *extra = "";
 
 	va_start(ap, msg);
 
 	/*
 	 *	Debug messages get treated specially.
 	 */
-	if (lvl == L_DBG) {
-		/*
-		 *	There is log function, but the debug level
-		 *	isn't high enough.  OR, we're in debug mode,
-		 *	and the debug level isn't high enough.  Return.
-		 */
-		if ((request && request->radlog &&
-		     (priority > request->options)) ||
-		    ((debug_flag != 0) && (priority > debug_flag))) {
+	if ((type & L_DBG) != 0) {
+
+		if (!radlog_debug_enabled(type, lvl, request)) {
 			va_end(ap);
 			return;
 		}
 
 		/*
 		 *	Use the debug output file, if specified,
-		 *	otherwise leave it as "request_log_file".
+		 *	otherwise leave it as the default log file.
 		 */
 #ifdef WITH_COMMAND_SOCKET
-		filename = debug_log_file;
+		filename = default_log.debug_file;
 		if (!filename)
 #endif
-		  filename = request_log_file;
 
-		/*
-		 *	Debug messages get mashed to L_INFO for
-		 *	radius.log.
-		 */
-		if (!filename) lvl = L_INFO;
+		filename = default_log.file;
 	}
 
 	if (request && filename) {
-		char *p;
 		radlog_func_t rl = request->radlog;
 
 		request->radlog = NULL;
@@ -255,17 +395,19 @@ void radlog_request(int lvl, int priority, REQUEST *request, const char *msg, ..
 		 *	This is SLOW!  Doing it for every log message
 		 *	in every request is NOT recommended!
 		 */
-		
-		radius_xlat(buffer, sizeof(buffer), filename,
-			    request, NULL, NULL); /* FIXME: escape chars! */
+
+		 /* FIXME: escape chars! */
+		if (radius_xlat(buffer, sizeof(buffer), request, filename, NULL, NULL) < 0) {
+			va_end(ap);
+			return;
+		}
 		request->radlog = rl;
-		
+
 		p = strrchr(buffer, FR_DIR_SEP);
 		if (p) {
 			*p = '\0';
 			if (rad_mkdir(buffer, S_IRWXU) < 0) {
-				radlog(L_ERR, "Failed creating %s: %s",
-				       buffer,strerror(errno));
+				ERROR("Failed creating %s: %s", buffer, fr_syserror(errno));
 				va_end(ap);
 				return;
 			}
@@ -279,7 +421,6 @@ void radlog_request(int lvl, int priority, REQUEST *request, const char *msg, ..
 	 *	Print timestamps to the file.
 	 */
 	if (fp) {
-		char *s;
 		time_t timeval;
 		timeval = time(NULL);
 
@@ -287,32 +428,55 @@ void radlog_request(int lvl, int priority, REQUEST *request, const char *msg, ..
 		if (log_dates_utc) {
 			struct tm utc;
 			gmtime_r(&timeval, &utc);
-			asctime_r(&utc, buffer + len);
+			ASCTIME_R(&utc, buffer, sizeof(buffer) - 1);
 		} else
 #endif
-			CTIME_R(&timeval, buffer + len, sizeof(buffer) - len - 1);
-		
-		s = strrchr(buffer, '\n');
-		if (s) {
-			s[0] = ' ';
-			s[1] = '\0';
+		{
+			CTIME_R(&timeval, buffer, sizeof(buffer) - 1);
 		}
-		
-		strcat(buffer, fr_int2str(levels, (lvl & ~L_CONS), ": "));
 		len = strlen(buffer);
+		p = strrchr(buffer, '\n');
+		if (p) {
+			p[0] = ' ';
+			p[1] = '\0';
+		}
+
+		len += strlcpy(buffer + len,
+			       fr_int2str(levels, type, ": "),
+		 	       sizeof(buffer) - len);
+
+		if (len >= sizeof(buffer)) goto finish;
 	}
-	
+
 	if (request && request->module[0]) {
-		snprintf(buffer + len, sizeof(buffer) + len, "%s : ", request->module);
-		len = strlen(buffer);
+		len = snprintf(buffer + len, sizeof(buffer) - len, "%s : ",
+			       request->module);
+
+		if (len >= sizeof(buffer)) goto finish;
 	}
+
 	vsnprintf(buffer + len, sizeof(buffer) - len, msg, ap);
-	
+
+	finish:
+	switch (type) {
+	case L_DBG_WARN:
+		extra = "WARNING: ";
+		type = L_DBG_WARN2;
+		break;
+
+	case L_DBG_ERR:
+		extra = "ERROR: ";
+		type = L_DBG_ERR2;
+		break;
+	default:
+		break;
+	}
+
 	if (!fp) {
 		if (request) {
-			radlog(lvl, "(%u) %s", request->number, buffer);
+			radlog(type, "(%u) %s%s", request->number, extra, buffer);
 		} else {
-			radlog(lvl, "%s", buffer);
+			radlog(type, "%s%s", extra, buffer);
 		}
 	} else {
 		if (request) fprintf(fp, "(%u) ", request->number);
@@ -322,4 +486,39 @@ void radlog_request(int lvl, int priority, REQUEST *request, const char *msg, ..
 	}
 
 	va_end(ap);
+}
+
+void log_talloc(char const *msg)
+{
+	INFO("%s", msg);
+}
+
+void log_talloc_report(TALLOC_CTX *ctx)
+{
+	FILE *fd;
+	char const *null_ctx = NULL;
+	int i = 0;
+
+	if (ctx) {
+		null_ctx = talloc_get_name(NULL);
+	}
+
+	fd = fdopen(default_log.fd, "w");
+	if (!fd) {
+		ERROR("Couldn't write memory report, fdopen failed: %s", fr_syserror(errno));
+
+		return;
+	}
+
+	if (!ctx) {
+		talloc_report_full(NULL, fd);
+	} else {
+		do {
+			INFO("Context level %i", i++);
+
+			talloc_report_full(ctx, fd);
+		} while ((ctx = talloc_parent(ctx)) && (talloc_get_name(ctx) != null_ctx));  /* Stop before we hit NULL ctx */
+	}
+
+	fclose(fd);
 }

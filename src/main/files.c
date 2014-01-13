@@ -22,7 +22,6 @@
  * Copyright 2000  Alan DeKok <aland@ox.org>
  */
 
-#include <freeradius-devel/ident.h>
 RCSID("$Id$")
 
 #include <freeradius-devel/radiusd.h>
@@ -38,15 +37,7 @@ RCSID("$Id$")
  */
 void pairlist_free(PAIR_LIST **pl)
 {
-	PAIR_LIST *p, *next;
-
-	for (p = *pl; p; p = next) {
-		/* name is allocated contiguous with p */
-		if (p->check) pairfree(&p->check);
-		if (p->reply) pairfree(&p->reply);
-		next = p->next;
-		free(p);
-	}
+	talloc_free(*pl);
 	*pl = NULL;
 }
 
@@ -58,13 +49,13 @@ void pairlist_free(PAIR_LIST **pl)
  *	Read the users, huntgroups or hints file.
  *	Return a PAIR_LIST.
  */
-int pairlist_read(const char *file, PAIR_LIST **list, int complain)
+int pairlist_read(TALLOC_CTX *ctx, char const *file, PAIR_LIST **list, int complain)
 {
 	FILE *fp;
 	int mode = FIND_MODE_NAME;
 	char entry[256];
 	char buffer[8192];
-	const char *ptr;
+	char const *ptr;
 	VALUE_PAIR *check_tmp;
 	VALUE_PAIR *reply_tmp;
 	PAIR_LIST *pl = NULL, *t;
@@ -75,7 +66,7 @@ int pairlist_read(const char *file, PAIR_LIST **list, int complain)
 	char newfile[8192];
 
 	DEBUG2("reading pairlist file %s", file);
-	
+
 	/*
 	 *	Open the file.  The error message should be a little
 	 *	more useful...
@@ -83,8 +74,7 @@ int pairlist_read(const char *file, PAIR_LIST **list, int complain)
 	if ((fp = fopen(file, "r")) == NULL) {
 		if (!complain)
 			return -1;
-		radlog(L_CONS|L_ERR, "Couldn't open %s for reading: %s",
-				file, strerror(errno));
+		ERROR("Couldn't open %s for reading: %s", file, fr_syserror(errno));
 		return -1;
 	}
 
@@ -97,7 +87,7 @@ int pairlist_read(const char *file, PAIR_LIST **list, int complain)
 		lineno++;
 		if (!feof(fp) && (strchr(buffer, '\n') == NULL)) {
 			fclose(fp);
-			radlog(L_ERR, "%s[%d]: line too long", file, lineno);
+			ERROR("%s[%d]: line too long", file, lineno);
 			pairlist_free(&pl);
 			return -1;
 		}
@@ -118,8 +108,7 @@ parse_again:
 			 */
 			if (isspace((int) buffer[0]))  {
 				if (parsecode != T_EOL) {
-					radlog(L_ERR|L_CONS,
-					       "%s[%d]: Unexpected trailing comma for entry %s",
+					ERROR("%s[%d]: Unexpected trailing comma for entry %s",
 					       file, lineno, entry);
 					fclose(fp);
 					return -1;
@@ -164,12 +153,11 @@ parse_again:
 				}
 
 				t = NULL;
-				
-				if (pairlist_read(newfile, &t, 0) != 0) {
+
+				if (pairlist_read(ctx, newfile, &t, 0) != 0) {
 					pairlist_free(&pl);
-					radlog(L_ERR|L_CONS,
-					       "%s[%d]: Could not open included file %s: %s",
-					       file, lineno, newfile, strerror(errno));
+					ERROR("%s[%d]: Could not open included file %s: %s",
+					      file, lineno, newfile, fr_syserror(errno));
 					fclose(fp);
 					return -1;
 				}
@@ -192,17 +180,15 @@ parse_again:
 			check_tmp = NULL;
 			reply_tmp = NULL;
 			old_lineno = lineno;
-			parsecode = userparse(ptr, &check_tmp);
+			parsecode = userparse(ctx, ptr, &check_tmp);
 			if (parsecode == T_OP_INVALID) {
 				pairlist_free(&pl);
-				radlog(L_ERR|L_CONS,
-				"%s[%d]: Parse error (check) for entry %s: %s",
+				ERROR("%s[%d]: Parse error (check) for entry %s: %s",
 					file, lineno, entry, fr_strerror());
 				fclose(fp);
 				return -1;
 			} else if (parsecode == T_COMMA) {
-				radlog(L_ERR|L_CONS,
-				       "%s[%d]: Unexpected trailing comma in check item list for entry %s",
+				ERROR("%s[%d]: Unexpected trailing comma in check item list for entry %s",
 				       file, lineno, entry);
 				fclose(fp);
 				return -1;
@@ -213,8 +199,7 @@ parse_again:
 		else {
 			if(*buffer == ' ' || *buffer == '\t') {
 				if (parsecode != T_COMMA) {
-					radlog(L_ERR|L_CONS,
-					       "%s[%d]: Syntax error: Previous line is missing a trailing comma for entry %s",
+					ERROR("%s[%d]: Syntax error: Previous line is missing a trailing comma for entry %s",
 					       file, lineno, entry);
 					fclose(fp);
 					return -1;
@@ -223,39 +208,28 @@ parse_again:
 				/*
 				 *	Parse the reply values
 				 */
-				parsecode = userparse(buffer, &reply_tmp);
+				parsecode = userparse(ctx, buffer, &reply_tmp);
 				/* valid tokens are 1 or greater */
 				if (parsecode < 1) {
 					pairlist_free(&pl);
-					radlog(L_ERR|L_CONS,
-					       "%s[%d]: Parse error (reply) for entry %s: %s",
+					ERROR("%s[%d]: Parse error (reply) for entry %s: %s",
 					       file, lineno, entry, fr_strerror());
 					fclose(fp);
 					return -1;
 				}
-			}
-			else {
-				size_t entry_len;
-				char *q;
-
-				entry_len = strlen(entry) + 1;
-
+			} else {
 				/*
 				 *	Done with this entry...
 				 */
-				q = rad_malloc(sizeof(*t) + entry_len);
-				t = (PAIR_LIST *) q;
+				MEM(t = talloc_zero(ctx, PAIR_LIST));
 
-				memset(t, 0, sizeof(*t));
 				t->check = check_tmp;
 				t->reply = reply_tmp;
 				t->lineno = old_lineno;
 				check_tmp = NULL;
 				reply_tmp = NULL;
 
-				q += sizeof(*t);
-				memcpy(q, entry, entry_len);
-				t->name = q;
+				t->name = talloc_strdup(t, entry);
 
 				*last = t;
 				last = &(t->next);
