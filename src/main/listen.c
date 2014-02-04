@@ -434,6 +434,7 @@ static int dual_tcp_recv(rad_listen_t *listener)
 		sock->packet->src_port = sock->other_port;
 		sock->packet->dst_ipaddr = sock->my_ipaddr;
 		sock->packet->dst_port = sock->my_port;
+		sock->packet->proto = sock->proto;
 	}
 
 	/*
@@ -454,9 +455,9 @@ static int dual_tcp_recv(rad_listen_t *listener)
 	if (rcode == -1) {	/* error reading packet */
 		char buffer[256];
 
-		ERROR("Invalid packet from %s port %d: closing socket",
+		ERROR("Invalid packet from %s port %d, closing socket: %s",
 		       ip_ntoh(&packet->src_ipaddr, buffer, sizeof(buffer)),
-		       packet->src_port);
+		       packet->src_port, fr_strerror());
 	}
 
 	if (rcode < 0) {	/* error or connection reset */
@@ -2584,7 +2585,7 @@ static rad_listen_t *listen_alloc(TALLOC_CTX *ctx, RAD_LISTEN_TYPE type)
  *	Not thread-safe, but all calls to it are protected by the
  *	proxy mutex in event.c
  */
-rad_listen_t *proxy_new_listener(home_server *home, int src_port)
+rad_listen_t *proxy_new_listener(home_server_t *home, int src_port)
 {
 	rad_listen_t *this;
 	listen_socket_t *sock;
@@ -3207,7 +3208,7 @@ add_sockets:
 	    (*head != NULL) && !defined_proxy) {
 		listen_socket_t *sock = NULL;
 		int		port = 0;
-		home_server	home;
+		home_server_t	home;
 
 		memset(&home, 0, sizeof(home));
 

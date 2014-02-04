@@ -178,6 +178,8 @@ ATTRIBUTE	Home-Server-Pool			1111	string
 
 ATTRIBUTE	FreeRADIUS-Client-IP-Address		1120	ipaddr
 ATTRIBUTE	FreeRADIUS-Client-IPv6-Address		1121	ipv6addr
+ATTRIBUTE	FreeRADIUS-Client-IP-Prefix		1150	ipv4prefix
+ATTRIBUTE	FreeRADIUS-Client-IPv6-Prefix		1151	ipv6prefix
 
 ATTRIBUTE	FreeRADIUS-Client-Require-MA		1122	integer
 
@@ -447,6 +449,17 @@ ATTRIBUTE	Tmp-Date-6				1846	date
 ATTRIBUTE	Tmp-Date-7				1847	date
 ATTRIBUTE	Tmp-Date-8				1848	date
 ATTRIBUTE	Tmp-Date-9				1849	date
+
+ATTRIBUTE	Tmp-Integer64-0				1871	integer64
+ATTRIBUTE	Tmp-Integer64-1				1872	integer64
+ATTRIBUTE	Tmp-Integer64-2				1873	integer64
+ATTRIBUTE	Tmp-Integer64-3				1874	integer64
+ATTRIBUTE	Tmp-Integer64-4				1875	integer64
+ATTRIBUTE	Tmp-Integer64-5				1876	integer64
+ATTRIBUTE	Tmp-Integer64-6				1877	integer64
+ATTRIBUTE	Tmp-Integer64-7				1878	integer64
+ATTRIBUTE	Tmp-Integer64-8				1879	integer64
+ATTRIBUTE	Tmp-Integer64-9				1880	integer64
 #
 #  These attributes shouldn't be used anywhere.  They are defined here
 #  only for casting of values in conditional expressions.

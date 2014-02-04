@@ -27,7 +27,7 @@ RCSID("$Id$")
 #include <freeradius-devel/radiusd.h>
 #include "krb5.h"
 
-#ifdef HEIMDAL_KRB5
+#ifdef HAVE_KRB5_GET_ERROR_MESSAGE
 #  define KRB5_STRERROR_BUFSIZE (2048)
 
 fr_thread_local_setup(char *, krb5_error_buffer)	/* macro */
@@ -69,7 +69,13 @@ char const *rlm_krb5_error(krb5_context context, krb5_error_code code)
 	msg = krb5_get_error_message(context, code);
 	if (msg) {
 		strlcpy(buffer, msg, KRB5_STRERROR_BUFSIZE);
+#ifdef HAVE_KRB5_FREE_ERROR_MESSAGE
 		krb5_free_error_message(context, msg);
+#elif defined(HAVE_KRB5_FREE_ERROR_STRING)
+		krb5_free_error_string(context, msg);
+#else
+#  error "No way to free error strings, missing krb5_free_error_message() and krb5_free_error_string()"
+#endif
 	} else {
 		strlcpy(buffer, "Unknown error", KRB5_STRERROR_BUFSIZE);
 	}

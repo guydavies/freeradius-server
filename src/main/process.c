@@ -309,12 +309,12 @@ static void debug_packet(REQUEST *request, RADIUS_PACKET *packet, int direction)
 	 *	This really belongs in a utility library
 	 */
 	if ((packet->code > 0) && (packet->code < FR_MAX_PACKET_CODE)) {
-		RDEBUG("%s %s packet %s host %s port %d, id=%d, length=%d",
+		RDEBUG("%s %s packet %s host %s port %i, id=%i, length=%zu",
 		       received, fr_packet_codes[packet->code], from,
 		       inet_ntop(ip->af, &ip->ipaddr, buffer, sizeof(buffer)),
 		       port, packet->id, packet->data_len);
 	} else {
-		RDEBUG("%s packet %s host %s port %d code=%d, id=%d, length=%d",
+		RDEBUG("%s packet %s host %s port %d code=%d, id=%d, length=%zu",
 		       received, from,
 		       inet_ntop(ip->af, &ip->ipaddr, buffer, sizeof(buffer)),
 		       port,
@@ -380,7 +380,7 @@ STATE_MACHINE_DECL(request_done)
 	 */
 	if (!we_are_master()) {
 		request->child_state = REQUEST_DONE;
-		request->child_pid = NO_SUCH_CHILD_PID;;
+		request->child_pid = NO_SUCH_CHILD_PID;
 		return;
 	}
 #endif
@@ -498,15 +498,6 @@ STATE_MACHINE_DECL(request_done)
 			rad_assert(0 == 1);
 		}
 		request->in_request_hash = false;
-
-		/*
-		 *	@todo: do final states for TCP sockets, too?
-		 */
-		request_stats_final(request);
-
-#ifdef WITH_TCP
-		request->listener->count--;
-#endif
 	}
 
 #ifdef WITH_PROXY
@@ -583,6 +574,14 @@ STATE_MACHINE_DECL(request_done)
 
 #ifdef HAVE_PTHREAD_H
 	rad_assert(request->child_pid == NO_SUCH_CHILD_PID);
+#endif
+
+	/*
+	 *	@todo: do final states for TCP sockets, too?
+	 */
+	request_stats_final(request);
+#ifdef WITH_TCP
+	request->listener->count--;
 #endif
 
 	if (request->packet) {
@@ -1035,7 +1034,7 @@ static int request_pre_handler(REQUEST *request, UNUSED int action)
 			 */
 			if (radius_evaluate_cond(request, RLM_MODULE_OK, 0, debug_condition)) {
 				request->options = 2;
-				request->radlog = radlog_request;
+				request->radlog = vradlog_request;
 			}
 		}
 #endif
@@ -1446,7 +1445,7 @@ static REQUEST *request_setup(rad_listen_t *listener, RADIUS_PACKET *packet,
 	/*
 	 *	Create and initialize the new request.
 	 */
-	request = request_alloc(listener);
+	request = request_alloc(NULL);
 	request->reply = rad_alloc(request, 0);
 	if (!request->reply) {
 		ERROR("No memory");
@@ -1735,6 +1734,7 @@ static void remove_from_proxy_hash_nl(REQUEST *request, bool yank)
 	}
 
 #ifdef WITH_TCP
+	rad_assert(request->proxy_listener != NULL);
 	request->proxy_listener->count--;
 #endif
 	request->proxy_listener = NULL;
@@ -2186,7 +2186,7 @@ static int request_will_proxy(REQUEST *request)
 	int rcode, pre_proxy_type = 0;
 	char const *realmname = NULL;
 	VALUE_PAIR *vp, *strippedname;
-	home_server *home;
+	home_server_t *home;
 	REALM *realm = NULL;
 	home_pool_t *pool = NULL;
 
@@ -2491,7 +2491,7 @@ static int request_proxy(REQUEST *request, int retransmit)
  */
 static int request_proxy_anew(REQUEST *request)
 {
-	home_server *home;
+	home_server_t *home;
 
 	/*
 	 *	Delete the request from the proxy list.
@@ -2560,7 +2560,7 @@ static int request_proxy_anew(REQUEST *request)
 
 STATE_MACHINE_DECL(request_ping)
 {
-	home_server *home = request->home_server;
+	home_server_t *home = request->home_server;
 	char buffer[128];
 
 	TRACE_STATE_MACHINE;
@@ -2610,7 +2610,7 @@ STATE_MACHINE_DECL(request_ping)
 		 *	pings.
 		 */
 		home->state = HOME_STATE_ALIVE;
-		exec_trigger(request, request->home_server->cs, "home_server.alive", false);
+		exec_trigger(request, home->cs, "home_server.alive", false);
 		home->currently_outstanding = 0;
 		home->num_sent_pings = 0;
 		home->num_received_pings = 0;
@@ -2641,7 +2641,7 @@ STATE_MACHINE_DECL(request_ping)
  */
 static void ping_home_server(void *ctx)
 {
-	home_server *home = ctx;
+	home_server_t *home = ctx;
 	REQUEST *request;
 	VALUE_PAIR *vp;
 	struct timeval when, now;
@@ -2775,7 +2775,7 @@ static void ping_home_server(void *ctx)
 	INSERT_EVENT(ping_home_server, home);
 }
 
-static void home_trigger(home_server *home, char const *trigger)
+static void home_trigger(home_server_t *home, char const *trigger)
 {
 	REQUEST my_request;
 	RADIUS_PACKET my_packet;
@@ -2789,7 +2789,7 @@ static void home_trigger(home_server *home, char const *trigger)
 	exec_trigger(&my_request, home->cs, trigger, false);
 }
 
-static void mark_home_server_zombie(home_server *home)
+static void mark_home_server_zombie(home_server_t *home)
 {
 	char buffer[128];
 
@@ -2834,7 +2834,7 @@ static void mark_home_server_zombie(home_server *home)
 
 void revive_home_server(void *ctx)
 {
-	home_server *home = ctx;
+	home_server_t *home = ctx;
 	char buffer[128];
 
 #ifdef WITH_TCP
@@ -2857,7 +2857,7 @@ void revive_home_server(void *ctx)
 	       home->port);
 }
 
-void mark_home_server_dead(home_server *home, struct timeval *when)
+void mark_home_server_dead(home_server_t *home, struct timeval *when)
 {
 	int previous_state = home->state;
 	char buffer[128];
@@ -2907,7 +2907,7 @@ void mark_home_server_dead(home_server *home, struct timeval *when)
 STATE_MACHINE_DECL(proxy_wait_for_reply)
 {
 	struct timeval now, when;
-	home_server *home = request->home_server;
+	home_server_t *home = request->home_server;
 	char buffer[128];
 
 	TRACE_STATE_MACHINE;
@@ -3606,6 +3606,36 @@ static void event_status(struct timeval *wake)
 
 }
 
+#ifdef WITH_TCP
+static void listener_free_cb(void *ctx)
+{
+	rad_listen_t *this = ctx;
+	char buffer[1024];
+
+	if (this->count > 0) {
+		struct timeval when;
+		listen_socket_t *sock = this->data;
+
+		fr_event_now(el, &when);
+		when.tv_sec += 3;
+		
+		if (!fr_event_insert(el, listener_free_cb, this, &when,
+				     &(sock->ev))) {
+			rad_panic("Failed to insert event");
+		}
+
+		return;
+	}
+
+	/*
+	 *	It's all free, close the socket.
+	 */
+
+	this->print(this, buffer, sizeof(buffer));
+	DEBUG("... cleaning up socket %s", buffer);
+	listen_free(&this);
+}
+#endif
 
 int event_new_fd(rad_listen_t *this)
 {
@@ -3795,6 +3825,7 @@ int event_new_fd(rad_listen_t *this)
 #ifdef WITH_TCP
 		listen_socket_t *sock = this->data;
 #endif
+		struct timeval when;
 
 		/*
 		 *	Remove it from the list of live FD's.
@@ -3835,7 +3866,7 @@ int event_new_fd(rad_listen_t *this)
 #endif
 
 #ifdef WITH_TCP
-		INFO(" ... closing socket %s", buffer);
+		INFO(" ... shutting down socket %s", buffer);
 
 #ifdef WITH_PROXY
 		/*
@@ -3868,14 +3899,24 @@ int event_new_fd(rad_listen_t *this)
 		}
 
 		/*
-		 *	Remove any pending cleanups.
-		 */
-		if (sock->ev) fr_event_delete(el, &sock->ev);
+		 *	No child threads, clean it up now.
+		 */		
+		if (!spawn_flag) {
+			if (sock->ev) fr_event_delete(el, &sock->ev);
+			listen_free(&this);
+			return 1;
+		}
 
 		/*
-		 *	And finally, close the socket.
+		 *	Wait until all requests using this socket are done.
 		 */
-		listen_free(&this);
+		gettimeofday(&when, NULL);
+		when.tv_sec += 3;
+		
+		if (!fr_event_insert(el, listener_free_cb, this, &when,
+				     &(sock->ev))) {
+			rad_panic("Failed to insert event");
+		}
 	}
 #endif	/* WITH_TCP */
 
@@ -4183,7 +4224,31 @@ int radius_event_init(CONF_SECTION *cs, int have_children)
 }
 
 
-static int request_hash_cb(UNUSED void *ctx, void *data)
+static int proxy_delete_cb(UNUSED void *ctx, void *data)
+{
+	REQUEST *request = fr_packet2myptr(REQUEST, packet, data);
+
+	request->master_state = REQUEST_STOP_PROCESSING;
+
+	/*
+	 *	Not done, or the child thread is still processing it.
+	 */
+	if (request->child_state != REQUEST_DONE) return 0; /* continue */
+
+#ifdef HAVE_PTHREAD_H
+	if (pthread_equal(request->child_pid, NO_SUCH_CHILD_PID) == 0) return 0;
+#endif
+
+	request->in_proxy_hash = false;
+
+	/*
+	 *	Delete it from the list.
+	 */
+	return 1;
+}
+
+
+static int request_delete_cb(UNUSED void *ctx, void *data)
 {
 	REQUEST *request = fr_packet2myptr(REQUEST, packet, data);
 
@@ -4191,22 +4256,28 @@ static int request_hash_cb(UNUSED void *ctx, void *data)
 	rad_assert(request->in_proxy_hash == false);
 #endif
 
-	request_done(request, FR_ACTION_DONE);
+	request->master_state = REQUEST_STOP_PROCESSING;
 
-	return 0;
-}
+	/*
+	 *	Not done, or the child thread is still processing it.
+	 */
+	if (request->child_state != REQUEST_DONE) return 0; /* continue */
 
-
-#ifdef WITH_PROXY
-static int proxy_hash_cb(UNUSED void *ctx, void *data)
-{
-	REQUEST *request = fr_packet2myptr(REQUEST, proxy, data);
-
-	request_done(request, FR_ACTION_DONE);
-
-	return 0;
-}
+#ifdef HAVE_PTHREAD_H
+	if (pthread_equal(request->child_pid, NO_SUCH_CHILD_PID) == 0) return 0;
 #endif
+
+	request->in_request_hash = false;
+	if (request->ev) fr_event_delete(el, &request->ev);	
+
+	request_free(&request);
+
+	/*
+	 *	Delete it from the list.
+	 */
+	return 1;
+}
+
 
 void radius_event_free(void)
 {
@@ -4223,13 +4294,13 @@ void radius_event_free(void)
 	 *	referenced from anywhere else.  Remove them first.
 	 */
 	if (proxy_list) {
-		fr_packet_list_walk(proxy_list, NULL, proxy_hash_cb);
+		fr_packet_list_walk(proxy_list, NULL, proxy_delete_cb);
 		fr_packet_list_free(proxy_list);
 		proxy_list = NULL;
 	}
 #endif
 
-	fr_packet_list_walk(pl, NULL, request_hash_cb);
+	fr_packet_list_walk(pl, NULL, request_delete_cb);
 
 	fr_packet_list_free(pl);
 	pl = NULL;

@@ -27,7 +27,6 @@ RCSID("$Id$")
 
 #define _LIBRADIUS 1
 #include <assert.h>
-#include <signal.h>
 #include <time.h>
 #include <math.h>
 #include <freeradius-devel/libradius.h>
@@ -55,7 +54,7 @@ typedef int (*rbcmp)(void const *, void const *);
 
 static char const *radsniff_version = "radsniff version " RADIUSD_VERSION_STRING
 #ifdef RADIUSD_VERSION_COMMIT
-" (git #" RADIUSD_VERSION_COMMIT ")"
+" (git #" STRINGIFY(RADIUSD_VERSION_COMMIT) ")"
 #endif
 ", built on " __DATE__ " at " __TIME__;
 
@@ -74,6 +73,16 @@ static int rs_useful_codes[] = {
 	PW_CODE_COA_REQUEST,			//!< RFC3575/RFC5176 - CoA-Request
 	PW_CODE_COA_ACK,			//!< RFC3575/RFC5176 - CoA-Ack (positive)
 	PW_CODE_COA_NAK,			//!< RFC3575/RFC5176 - CoA-Nak (not willing to perform)
+};
+
+const FR_NAME_NUMBER rs_events[] = {
+	{ "received",	RS_NORMAL	},
+	{ "norsp",	RS_LOST		},
+	{ "rtx",	RS_RTX		},
+	{ "noreq",	RS_UNLINKED	},
+	{ "reused",	RS_REUSED	},
+	{ "error",	RS_ERROR	},
+	{  NULL , -1 }
 };
 
 static void NEVER_RETURNS usage(int status);
@@ -309,33 +318,11 @@ static void rs_packet_print_csv(uint64_t count, rs_status_t status, fr_pcap_t *h
 
 	ssize_t len, s = sizeof(buffer);
 
-	switch (status) {
-		case RS_NORMAL:
-			status_str = "received";
-			break;
-		case RS_LOST:
-			status_str = "norsp";
-			break;
-
-		case RS_RTX:
-			status_str = "rtx";
-			break;
-
-		case RS_UNLINKED:
-			status_str = "noreq";
-			break;
-
-		case RS_REUSED:
-			status_str = "reused";
-			break;
-
-		case RS_ERROR:
-			status_str = "error";
-			break;
-	}
-
 	inet_ntop(packet->src_ipaddr.af, &packet->src_ipaddr.ipaddr, src, sizeof(src));
 	inet_ntop(packet->dst_ipaddr.af, &packet->dst_ipaddr.ipaddr, dst, sizeof(dst));
+
+	status_str = fr_int2str(rs_events, status, NULL);
+	assert(status_str);
 
 	len = snprintf(p, s, "%s,%" PRIu64 ",%s,", status_str, count, timestr);
 	p += len;
@@ -411,7 +398,6 @@ static void rs_packet_print_csv(uint64_t count, rs_status_t status, fr_pcap_t *h
 static void rs_packet_print_fancy(uint64_t count, rs_status_t status, fr_pcap_t *handle, RADIUS_PACKET *packet,
 				  struct timeval *elapsed, struct timeval *latency, bool response, bool body)
 {
-	char const *status_str;
 	char buffer[2048];
 	char *p = buffer;
 
@@ -420,37 +406,17 @@ static void rs_packet_print_fancy(uint64_t count, rs_status_t status, fr_pcap_t 
 
 	ssize_t len, s = sizeof(buffer);
 
-	switch (status) {
-		default:
-		case RS_NORMAL:
-			status_str = NULL;
-			break;
-		case RS_LOST:
-			status_str = "** NO RESPONSE **";
-			break;
-
-		case RS_RTX:
-			status_str = "** RTX **";
-			break;
-
-		case RS_UNLINKED:
-			status_str = "** NO REQUEST **";
-			break;
-
-		case RS_REUSED:
-			status_str = "** ID REUSED **";
-			break;
-
-		case RS_ERROR:
-			status_str = "** ERROR **";
-			break;
-	}
-
 	inet_ntop(packet->src_ipaddr.af, &packet->src_ipaddr.ipaddr, src, sizeof(src));
 	inet_ntop(packet->dst_ipaddr.af, &packet->dst_ipaddr.ipaddr, dst, sizeof(dst));
 
-	if (status_str) {
-		len = snprintf(p, s, "%s ", status_str);
+	/* Only print out status str if something's not right */
+	if (status != RS_NORMAL) {
+		char const *status_str;
+
+		status_str = fr_int2str(rs_events, status, NULL);
+		assert(status_str);
+
+		len = snprintf(p, s, "** %s ** ", status_str);
 		p += len;
 		s -= len;
 		if (s <= 0) return;
@@ -761,7 +727,8 @@ static int rs_get_pairs(TALLOC_CTX *ctx, VALUE_PAIR **out, VALUE_PAIR *vps, DICT
 {
 	vp_cursor_t list_cursor, out_cursor;
 	VALUE_PAIR *match, *last_match, *copy;
-	int i, count = 0;
+	uint64_t count = 0;
+	int i;
 
 	last_match = vps;
 
@@ -790,9 +757,34 @@ static int rs_get_pairs(TALLOC_CTX *ctx, VALUE_PAIR **out, VALUE_PAIR *vps, DICT
 	return count;
 }
 
-static void rs_packet_cleanup(void *ctx)
+static int _request_free(rs_request_t *request)
 {
-	rs_request_t *request = talloc_get_type_abort(ctx, rs_request_t);
+	/*
+	 *	If were attempting to cleanup the request, and it's no longer in the request_tree
+	 *	something has gone very badly wrong.
+	 */
+	if (request->in_request_tree) {
+		assert(rbtree_deletebydata(request_tree, request));
+	}
+
+	if (request->in_link_tree) {
+		assert(rbtree_deletebydata(link_tree, request));
+	}
+
+	if (request->event) {
+		assert(fr_event_delete(events, &request->event));
+	}
+
+	rad_free(&request->packet);
+	rad_free(&request->expect);
+	rad_free(&request->linked);
+
+	return 0;
+}
+
+static void rs_packet_cleanup(rs_request_t *request)
+{
+
 	RADIUS_PACKET *packet = request->packet;
 	uint64_t count = request->id;
 
@@ -800,14 +792,17 @@ static void rs_packet_cleanup(void *ctx)
 	assert(!request->rt_rsp || request->stats_rsp);
 	assert(packet);
 
-	if (RIDEBUG_ENABLED()) {
-		rs_time_print(timestr, sizeof(timestr), &request->when);
-	}
-
 	/*
 	 *	Don't pollute stats or print spurious messages as radsniff closes.
 	 */
-	if (cleanup) goto skip;
+	if (cleanup) {
+		talloc_free(request);
+		return;
+	}
+
+	if (RIDEBUG_ENABLED()) {
+		rs_time_print(timestr, sizeof(timestr), &request->when);
+	}
 
 	/*
 	 *	Were at packet cleanup time which is when the packet was received + timeout
@@ -819,8 +814,12 @@ static void rs_packet_cleanup(void *ctx)
 		if (!request->linked) {
 			request->stats_req->interval.lost_total++;
 
-			conf->logger(request->id, RS_LOST, request->in, packet, NULL, NULL, false,
-				     conf->filter_response_vps);
+			if (conf->event_flags & RS_LOST) {
+				/* @fixme We should use flags in the request to indicate whether it's been dumped
+				 * to a PCAP file or logged yet, this simplifies the body logging logic */
+				conf->logger(request->id, RS_LOST, request->in, packet, NULL, NULL, false,
+					     conf->filter_response_vps || !(conf->event_flags & RS_NORMAL));
+			}
 		}
 
 		if (request->in->type == PCAP_INTERFACE_IN) {
@@ -845,27 +844,32 @@ static void rs_packet_cleanup(void *ctx)
 		}
 	}
 
-	skip:
-
-	/*
-	 *	If were attempting to cleanup the request, and it's no longer in the request_tree
-	 *	something has gone very badly wrong.
-	 */
-	assert(rbtree_deletebydata(request_tree, request));
+	talloc_free(request);
 }
 
-static int _request_free(rs_request_t *request)
+static void _rs_event(void *ctx)
 {
-	if (request->link_vps) {
-		assert(rbtree_deletebydata(link_tree, request));
-	}
-
-	rad_free(&request->packet);
-	rad_free(&request->expect);
-	rad_free(&request->linked);
-
-	return 0;
+	rs_request_t *request = talloc_get_type_abort(ctx, rs_request_t);
+	request->event = NULL;
+	rs_packet_cleanup(request);
 }
+
+/** Wrapper around fr_packet_cmp to strip off the outer request struct
+ *
+ */
+static int rs_packet_cmp(rs_request_t const *a, rs_request_t const *b)
+{
+	return fr_packet_cmp(a->expect, b->expect);
+}
+
+/* This is the same as immediately scheduling the cleanup event */
+#define RS_CLEANUP_NOW(_x, _s)\
+	{\
+		_x->silent_cleanup = _s;\
+		_x->when = header->ts;\
+		rs_packet_cleanup(_x);\
+		_x = NULL;\
+	} while (0)
 
 static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkthdr const *header, uint8_t const *data)
 {
@@ -890,7 +894,7 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 
 	rs_status_t		status = RS_NORMAL;	/* Any special conditions (RTX, Unlinked, ID-Reused) */
 	RADIUS_PACKET		*current;		/* Current packet were processing */
-	rs_request_t		*original;
+	rs_request_t		*original = NULL;
 
 	rs_request_t		search;
 
@@ -983,7 +987,9 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 
 	if (!rad_packet_ok(current, 0, &reason)) {
 		REDEBUG("%s", fr_strerror());
-		conf->logger(count, RS_ERROR, event->in, current, &elapsed, NULL, false, false);
+		if (conf->event_flags & RS_ERROR) {
+			conf->logger(count, RS_ERROR, event->in, current, &elapsed, NULL, false, false);
+		}
 		rad_free(&current);
 
 		return;
@@ -1002,6 +1008,21 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 			/* look for a matching request and use it for decoding */
 			search.expect = current;
 			original = rbtree_finddata(request_tree, &search);
+
+			/*
+			 *	Verify this code is allowed
+			 */
+			if (conf->filter_response_code && (conf->filter_response_code != current->code)) {
+				drop_response:
+				RDEBUG2("Response dropped by filter");
+				rad_free(&current);
+
+				/* We now need to cleanup the original request too */
+				if (original) {
+					RS_CLEANUP_NOW(original, true);
+				}
+				return;
+			}
 
 			/*
 			 *	Only decode attributes if we want to print them or filter on them
@@ -1026,26 +1047,6 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 			 */
 			if (original) {
 				/*
-				 *	Verify this code is allowed
-				 */
-				if (conf->filter_response_code && (conf->filter_response_code != current->code)) {
-					drop_response:
-
-					rad_free(&current);
-					RDEBUG2("Dropped by attribute/packet filter");
-
-					/* We now need to cleanup the original request too */
-					original->silent_cleanup = true;
-					original->when = header->ts;	/* Needed for correct TS */
-
-					/* This is the same as scheduling the event immediately */
-					fr_event_delete(event->list, &original->event);
-					rs_packet_cleanup(original);
-
-					return;
-				}
-
-				/*
 				 *	Now verify the packet passes the attribute filter
 				 */
 				if (conf->filter_response_vps) {
@@ -1053,33 +1054,39 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 					if (!pairvalidate_relaxed(conf->filter_response_vps, current->vps)) {
 						goto drop_response;
 					}
-					original->silent_cleanup = false;
 				}
 
 				/*
-				 *	Is this a retransmit?
+				 *	Is this a retransmission?
 				 */
-				if (!original->linked) {
-					original->stats_rsp = &stats->exchange[current->code];
-				} else {
+				if (original->linked) {
 					status = RS_RTX;
 					original->rt_rsp++;
 
 					rad_free(&original->linked);
 					fr_event_delete(event->list, &original->event);
+				/*
+				 *	...nope it's the first response to a request.
+				 */
+				} else {
+					original->stats_rsp = &stats->exchange[current->code];
 				}
 
+				/*
+				 *	Insert a callback to remove the request and response
+				 *	from the tree after the timeout period.
+				 *	The delay is so we can detect retransmissions.
+				 */
 				original->linked = talloc_steal(original, current);
 				rs_tv_add_ms(&header->ts, conf->stats.timeout, &original->when);
-				if (!fr_event_insert(event->list, rs_packet_cleanup, original, &original->when,
+				if (!fr_event_insert(event->list, _rs_event, original, &original->when,
 						     &original->event)) {
 					REDEBUG("Failed inserting new event");
 					/*
 					 *	Delete the original request/event, it's no longer valid
 					 *	for statistics.
 					 */
-					fr_event_delete(event->list, &original->event);
-					rbtree_deletebydata(request_tree, original);
+					talloc_free(original);
 					return;
 				}
 			/*
@@ -1093,7 +1100,7 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 				 */
 				if (conf->filter_request) {
 					rad_free(&current);
-					RDEBUG2("Dropped by attribute filter");
+					RDEBUG2("Original request dropped by filter");
 					return;
 				}
 
@@ -1110,6 +1117,18 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 	case PW_CODE_DISCONNECT_REQUEST:
 	case PW_CODE_STATUS_SERVER:
 		{
+			/*
+			 *	Verify this code is allowed
+			 */
+			if (conf->filter_request_code && (conf->filter_request_code != current->code)) {
+				drop_request:
+
+				RDEBUG2("Request dropped by filter");
+				rad_free(&current);
+
+				return;
+			}
+
 			/*
 			 *	Only decode attributes if we want to print them or filter on them
 			 *	rad_packet_ok does checks to verify the packet is actually valid.
@@ -1134,7 +1153,7 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 			/*
 			 *	Save the request for later matching
 			 */
-			search.expect = rad_alloc_reply(conf, current);
+			search.expect = rad_alloc_reply(current, current);
 			if (!search.expect) {
 				REDEBUG("Failed allocating memory to hold expected reply");
 				rs_tv_add_ms(&header->ts, conf->stats.timeout, &stats->quiet);
@@ -1143,70 +1162,57 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 			}
 			search.expect->code = current->code;
 
-			/*
-			 *	Process requests before the filter, so that we can force expiry
-			 *	when we detect ID re-use, if we don't do this we get false RTX
-			 *	notifications for responses.
-			 */
-			original = rbtree_finddata(request_tree, &search);
-
-			/*
-			 *	Upstream device re-used src/dst ip/port id...
-			 */
-			if (original) {
-				if (memcmp(original->expect->vector, current->vector,
-					   sizeof(original->expect->vector) != 0)) {
-					/*
-					 *	...before the request timed out (which may be an issue)
-					 *	and before we saw a response (which may be a bigger issue).
-					 */
-					if (!original->linked) {
-						status = RS_REUSED;
-						stats->exchange[current->code].interval.reused_total++;
-						original->silent_cleanup = true;
-					}
-
-					/* This is the same as immediately scheduling the cleanup event */
-					original->when = header->ts;
-					fr_event_delete(event->list, &original->event);
-					rs_packet_cleanup(original);
-					original = NULL;
-				}
-				/* else it's a proper RTX with the same src/dst id authenticator/nonce */
-			/*
-			 *	If we have linking attributes set, attempt to find a request in the
-			 *	linking tree.
-			 */
-			} else if ((conf->link_da_num > 0) && current->vps) {
+			if ((conf->link_da_num > 0) && current->vps) {
 				int ret;
 				ret = rs_get_pairs(current, &search.link_vps, current->vps, conf->link_da,
 						   conf->link_da_num);
 				if (ret < 0) {
 					ERROR("Failed extracting RTX linking pairs from request");
-
-					talloc_free(original);
+					rad_free(&current);
 					return;
-				}
-
-				/*
-				 *	Only bother searching if we have vps to search with...
-				 */
-				if (search.link_vps) {
-					original = rbtree_finddata(link_tree, &search);
 				}
 			}
 
 			/*
-			 *	Verify this code is allowed
+			 *	If we have linking attributes set, attempt to find a request in the linking tree.
 			 */
-			if (conf->filter_request_code && (conf->filter_request_code != current->code)) {
-				drop_request:
+			if (search.link_vps) {
+				rs_request_t *tuple;
 
-				rad_free(&search.expect);
-				rad_free(&current);
-				RDEBUG2("Dropped by attribute/packet filter");
+				original = rbtree_finddata(link_tree, &search);
+				tuple = rbtree_finddata(request_tree, &search);
 
-				return;
+				/*
+				 *	If the packet we matched using attributes is not the same
+				 *	as the packet in the request tree, then we need to clean up
+				 *	the packet in the request tree.
+				 */
+				if (tuple && (original != tuple)) {
+					RS_CLEANUP_NOW(tuple, true);
+				}
+			/*
+			 *	Detect duplicates using the normal 5-tuple of src/dst ips/ports id
+			 */
+			} else {
+				original = rbtree_finddata(request_tree, &search);
+				if (original && memcmp(original->expect->vector, current->vector,
+				    sizeof(original->expect->vector) != 0)) {
+					/*
+					 *	ID reused before the request timed out (which may be an issue)...
+					 */
+					if (!original->linked) {
+						status = RS_REUSED;
+						stats->exchange[current->code].interval.reused_total++;
+						/* Occurs regularly downstream of proxy servers (so don't complain) */
+						RS_CLEANUP_NOW(original, true);
+					/*
+					 *	...and before we saw a response (which may be a bigger issue).
+					 */
+					} else {
+						RS_CLEANUP_NOW(original, false);
+					}
+					/* else it's a proper RTX with the same src/dst id authenticator/nonce */
+				}
 			}
 
 			/*
@@ -1226,13 +1232,21 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 				original->rt_req++;
 
 				rad_free(&original->packet);
-				rad_free(&original->expect);
+
 				/* We may of seen the response, but it may of been lost upstream */
 				rad_free(&original->linked);
 
 				original->packet = talloc_steal(original, current);
+
+				/* Request may need to be reinserted as the 5 tuple of the response may of changed */
+				if (rs_packet_cmp(original, &search) != 0) {
+					rbtree_deletebydata(request_tree, original);
+				}
+
+				rad_free(&original->expect);
 				original->expect = talloc_steal(original, search.expect);
 
+				/* Disarm the timer for the cleanup event for the original request */
 				fr_event_delete(event->list, &original->event);
 			/*
 			 *	...nope it's a new request.
@@ -1250,9 +1264,10 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 
 				if (search.link_vps) {
 					original->link_vps = pairsteal(original, search.link_vps);
-					if (!rbtree_insert(link_tree, original)) {
-						REDEBUG("Failed inserting linking pairs");
-					}
+
+					/* We should never have conflicts */
+					assert(rbtree_insert(link_tree, original));
+					original->in_link_tree = true;
 				}
 
 				/*
@@ -1264,8 +1279,12 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 				if (conf->filter_response_vps) {
 					original->silent_cleanup = true;
 				}
+			}
 
-				rbtree_insert(request_tree, original);
+			if (!original->in_request_tree) {
+				/* We should never have conflicts */
+				assert(rbtree_insert(request_tree, original));
+				original->in_request_tree = true;
 			}
 
 			/*
@@ -1273,15 +1292,17 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 			 */
 			original->packet->timestamp = header->ts;
 			rs_tv_add_ms(&header->ts, conf->stats.timeout, &original->when);
-			if (!fr_event_insert(event->list, rs_packet_cleanup, original,
+			if (!fr_event_insert(event->list, _rs_event, original,
 					     &original->when, &original->event)) {
 				REDEBUG("Failed inserting new event");
-				rbtree_deletebydata(request_tree, original);
+
+				talloc_free(original);
 				return;
 			}
 			response = false;
-		}
 			break;
+		}
+
 		default:
 			REDEBUG("Unsupported code %i", current->code);
 			rad_free(&current);
@@ -1321,21 +1342,25 @@ static void rs_packet_process(uint64_t count, rs_event_t *event, struct pcap_pkt
 		/*
 		 *	Were filtering on response, now print out the full data from the request
 		 */
-		if (conf->filter_response && RIDEBUG_ENABLED()) {
+		if (conf->filter_response && RIDEBUG_ENABLED() && (conf->event_flags & RS_NORMAL)) {
 			rs_time_print(timestr, sizeof(timestr), &original->packet->timestamp);
 			rs_tv_sub(&original->packet->timestamp, &start_pcap, &elapsed);
-			conf->logger(original->id, 0, original->in, original->packet, &elapsed, NULL, false, true);
+			conf->logger(original->id, RS_NORMAL, original->in, original->packet, &elapsed, NULL, false, true);
 			rs_tv_sub(&header->ts, &start_pcap, &elapsed);
 			rs_time_print(timestr, sizeof(timestr), &header->ts);
 		}
-		conf->logger(count, status, event->in, current, &elapsed, &latency, response, true);
+
+		if (conf->event_flags & status) {
+			conf->logger(count, status, event->in, current, &elapsed, &latency, response, true);
+		}
 	/*
 	 *	It's the original request
 	 *
 	 *	If were filtering on responses we can only indicate we received it on response, or timeout.
 	 */
-	} else if (!conf->filter_response) {
-		conf->logger(count, status, event->in, current, &elapsed, NULL, response, true);
+	} else if (!conf->filter_response && (conf->event_flags & status)) {
+		conf->logger(original ? original->id : count, status, event->in,
+			     current, &elapsed, NULL, response, true);
 	}
 
 	fflush(fr_log_fp);
@@ -1437,15 +1462,6 @@ static void _rs_event_status(struct timeval *wake)
 	}
 }
 
-/** Wrapper function to allow rad_free to be called as an rbtree destructor callback
- *
- * @param request to free.
- */
-static void _rb_rad_free(void *request)
-{
-	talloc_free(request);
-}
-
 /** Compare requests using packet info and lists of attributes
  *
  */
@@ -1456,7 +1472,7 @@ static int rs_rtx_cmp(rs_request_t const *a, rs_request_t const *b)
 	assert(a->link_vps);
 	assert(b->link_vps);
 
-	rcode = (int)  a->expect->dst_port - (int) b->expect->dst_port;
+	rcode = (int) a->expect->code - (int) b->expect->code;
 	if (rcode != 0) return rcode;
 
 	rcode = a->expect->sockfd - b->expect->sockfd;
@@ -1469,14 +1485,6 @@ static int rs_rtx_cmp(rs_request_t const *a, rs_request_t const *b)
 	if (rcode != 0) return rcode;
 
 	return pairlistcmp(a->link_vps, b->link_vps);
-}
-
-/** Wrapper around fr_packet_cmp to strip off the outer request struct
- *
- */
-static int rs_packet_cmp(rs_request_t const *a, rs_request_t const *b)
-{
-	return fr_packet_cmp(a->expect, b->expect);
 }
 
 static int rs_build_dict_list(DICT_ATTR const **out, size_t len, char *list)
@@ -1522,7 +1530,7 @@ static int rs_build_filter(VALUE_PAIR **out, char const *filter)
 	}
 
 	if (!*out) {
-		ERROR("Empty RADIUS filter \"%s\"", filter);
+		ERROR("Empty RADIUS filter '%s'", filter);
 		return -1;
 	}
 
@@ -1546,37 +1554,93 @@ static int rs_build_filter(VALUE_PAIR **out, char const *filter)
 	return 0;
 }
 
+static int rs_build_flags(int *flags, FR_NAME_NUMBER const *map, char *list)
+{
+	size_t i = 0;
+	char *p, *tok;
+
+	p = list;
+	while ((tok = strsep(&p, "\t ,")) != NULL) {
+		int flag;
+
+		if ((*tok == '\t') || (*tok == ' ') || (*tok == '\0')) {
+			continue;
+		}
+
+		*flags |= flag = fr_str2int(map, tok, -1);
+		if (flag < 0) {
+			ERROR("Invalid flag \"%s\"", tok);
+			return -1;
+		}
+
+		i++;
+	}
+
+	return i;
+}
+
+/** Callback for when the request is removed from the request tree
+ *
+ * @param request being removed.
+ */
+static void _unmark_request(void *request)
+{
+	rs_request_t *this = request;
+	this->in_request_tree = false;
+}
+
+/** Callback for when the request is removed from the link tree
+ *
+ * @param request being removed.
+ */
+static void _unmark_link(void *request)
+{
+	rs_request_t *this = request;
+	this->in_link_tree = false;
+}
+
 static void NEVER_RETURNS usage(int status)
 {
 	FILE *output = status ? stderr : stdout;
 	fprintf(output, "Usage: radsniff [options][stats options] -- [pcap files]\n");
 	fprintf(output, "options:\n");
-	fprintf(output, "  -c <count>         Number of packets to capture.\n");
-	fprintf(output, "  -d <directory>     Set dictionary directory.\n");
-	fprintf(output, "  -f <filter>        PCAP filter (default is 'udp port <port> or <port + 1> or 3799')\n");
-	fprintf(output, "  -h                 This help message.\n");
-	fprintf(output, "  -i <interface>     Capture packets from interface (defaults to all if supported).\n");
-	fprintf(output, "  -I <file>          Read packets from file (overrides input of -F).\n");
-	fprintf(output, "  -l <attr>[,<attr>] Output packet sig and a list of attributes.\n");
-	fprintf(output, "  -L <attr>[,<attr>] Detect retransmissions using these attributes to link requests.\n");
-	fprintf(output, "  -m                 Don't put interface(s) into promiscuous mode.\n");
-	fprintf(output, "  -p <port>          Filter packets by port (default is 1812).\n");
-	fprintf(output, "  -P <pidfile>       Daemonize and write out <pidfile>.\n");
-	fprintf(output, "  -q                 Print less debugging information.\n");
-	fprintf(output, "  -r <filter>        RADIUS attribute request filter.\n");
-	fprintf(output, "  -R <filter>        RADIUS attribute response filter.\n");
-	fprintf(output, "  -s <secret>        RADIUS secret.\n");
-	fprintf(output, "  -S                 Write PCAP data to stdout.\n");
-	fprintf(output, "  -v                 Show program version information.\n");
-	fprintf(output, "  -w <file>          Write output packets to file (overrides output of -F).\n");
-	fprintf(output, "  -x                 Print more debugging information (defaults to -xx).\n");
+	fprintf(output, "  -a                    List all interfaces available for capture.\n");
+	fprintf(output, "  -c <count>            Number of packets to capture.\n");
+	fprintf(output, "  -d <directory>        Set dictionary directory.\n");
+	fprintf(stderr, "  -d <raddb>            Set configuration directory (defaults to " RADDBDIR ").\n");
+	fprintf(stderr, "  -D <dictdir>          Set main dictionary directory (defaults to " DICTDIR ").\n");
+	fprintf(output, "  -e <event>[,<event>]  Only log requests with these event flags.\n");
+	fprintf(output, "                        Event may be one of the following:\n");
+	fprintf(output, "                        - received - a request or response.\n");
+	fprintf(output, "                        - norsp    - seen for a request.\n");
+	fprintf(output, "                        - rtx      - of a request that we've seen before.\n");
+	fprintf(output, "                        - noreq    - could be matched with the response.\n");
+	fprintf(output, "                        - reused   - ID too soon.\n");
+	fprintf(output, "                        - error    - decoding the packet.\n");
+	fprintf(output, "  -f <filter>           PCAP filter (default is 'udp port <port> or <port + 1> or 3799')\n");
+	fprintf(output, "  -h                    This help message.\n");
+	fprintf(output, "  -i <interface>        Capture packets from interface (defaults to all if supported).\n");
+	fprintf(output, "  -I <file>             Read packets from file (overrides input of -F).\n");
+	fprintf(output, "  -l <attr>[,<attr>]    Output packet sig and a list of attributes.\n");
+	fprintf(output, "  -L <attr>[,<attr>]    Detect retransmissions using these attributes to link requests.\n");
+	fprintf(output, "  -m                    Don't put interface(s) into promiscuous mode.\n");
+	fprintf(output, "  -p <port>             Filter packets by port (default is 1812).\n");
+	fprintf(output, "  -P <pidfile>          Daemonize and write out <pidfile>.\n");
+	fprintf(output, "  -q                    Print less debugging information.\n");
+	fprintf(output, "  -r <filter>           RADIUS attribute request filter.\n");
+	fprintf(output, "  -R <filter>           RADIUS attribute response filter.\n");
+	fprintf(output, "  -s <secret>           RADIUS secret.\n");
+	fprintf(output, "  -S                    Write PCAP data to stdout.\n");
+	fprintf(output, "  -v                    Show program version information.\n");
+	fprintf(output, "  -w <file>             Write output packets to file (overrides output of -F).\n");
+	fprintf(output, "  -x                    Print more debugging information (defaults to -xx).\n");
 	fprintf(output, "stats options:\n");
-	fprintf(output, "  -W <interval>      Periodically write out statistics every <interval> seconds.\n");
-	fprintf(output, "  -T <timeout>       How many milliseconds before the request is counted as lost "
+	fprintf(output, "  -W <interval>         Periodically write out statistics every <interval> seconds.\n");
+	fprintf(output, "  -T <timeout>          How many milliseconds before the request is counted as lost "
 		"(defaults to %i).\n", RS_DEFAULT_TIMEOUT);
 #ifdef HAVE_COLLECTDC_H
-	fprintf(output, "  -N <prefix>        collectd plugin instance name.\n");
-	fprintf(output, "  -O <server>        Write statistics to this collectd server.\n");
+	fprintf(output, "  -N <prefix>           collectd plugin instance name.\n");
+	fprintf(output, "  -O <server>           Write statistics to this collectd server.\n");
 #endif
 	exit(status);
 }
@@ -1601,12 +1665,20 @@ int main(int argc, char *argv[])
 	char buffer[1024];
 
 	int opt;
-	char const *radius_dir = RADIUS_DIR;
+	char const *radius_dir = RADDBDIR;
+	char const *dict_dir = DICTDIR;
 
 	rs_stats_t stats;
 
 	fr_debug_flag = 1;
 	fr_log_fp = stdout;
+
+	/*
+	 *	Useful if using radsniff as a long running stats daemon
+	 */
+#ifndef NDEBUG
+	fr_fault_setup(getenv("PANIC_ACTION"), argv[0]);
+#endif
 
 	talloc_set_log_stderr();
 
@@ -1644,8 +1716,28 @@ int main(int argc, char *argv[])
 	/*
 	 *  Get options
 	 */
-	while ((opt = getopt(argc, argv, "b:c:d:DFf:hi:I:l:L:mp:P:qr:R:s:Svw:xXW:T:P:N:O:")) != EOF) {
+	while ((opt = getopt(argc, argv, "ab:c:d:D:e:Ff:hi:I:l:L:mp:P:qr:R:s:Svw:xXW:T:P:N:O:")) != EOF) {
 		switch (opt) {
+		case 'a':
+			{
+				pcap_if_t *all_devices = NULL;
+				pcap_if_t *dev_p;
+
+				if (pcap_findalldevs(&all_devices, errbuf) < 0) {
+					ERROR("Error getting available capture devices: %s", errbuf);
+					goto finish;
+				}
+
+				int i = 1;
+				for (dev_p = all_devices;
+				     dev_p;
+				     dev_p = dev_p->next) {
+					INFO("%i.%s", i++, dev_p->name);
+				}
+				ret = 0;
+				goto finish;
+			}
+
 		/* super secret option */
 		case 'b':
 			conf->buffer_pkts = atoi(optarg);
@@ -1668,24 +1760,14 @@ int main(int argc, char *argv[])
 			break;
 
 		case 'D':
-			{
-				pcap_if_t *all_devices = NULL;
-				pcap_if_t *dev_p;
+			dict_dir = optarg;
+			break;
 
-				if (pcap_findalldevs(&all_devices, errbuf) < 0) {
-					ERROR("Error getting available capture devices: %s", errbuf);
-					goto finish;
-				}
-
-				int i = 1;
-				for (dev_p = all_devices;
-				     dev_p;
-				     dev_p = dev_p->next) {
-					INFO("%i.%s", i++, dev_p->name);
-				}
-				ret = 0;
-				goto finish;
+		case 'e':
+			if (rs_build_flags((int *) &conf->event_flags, rs_events, optarg) < 0) {
+				usage(64);
 			}
+			break;
 
 		case 'f':
 			conf->pcap_filter = optarg;
@@ -1808,6 +1890,14 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/*
+	 *	Mismatch between the binary and the libraries it depends on
+	 */
+	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
+		fr_perror("radsniff");
+		exit(1);
+	}
+
 	/* Useful for file globbing */
 	while (optind < argc) {
 		*in_head = fr_pcap_init(conf, argv[optind], PCAP_FILE_IN);
@@ -1894,11 +1984,18 @@ int main(int argc, char *argv[])
 		conf->pcap_filter = buffer;
 	}
 
-	if (dict_init(radius_dir, RADIUS_DICTIONARY) < 0) {
+	if (dict_init(dict_dir, RADIUS_DICTIONARY) < 0) {
 		fr_perror("radsniff");
 		ret = 64;
 		goto finish;
 	}
+
+	if (dict_read(radius_dir, RADIUS_DICTIONARY) == -1) {
+		fr_perror("radsniff");
+		ret = 64;
+		goto finish;
+	}
+
 	fr_strerror();	/* Clear out any non-fatal errors */
 
 	if (conf->list_attributes) {
@@ -1917,7 +2014,7 @@ int main(int argc, char *argv[])
 			usage(64);
 		}
 
-		link_tree = rbtree_create((rbcmp) rs_rtx_cmp, NULL, 0);
+		link_tree = rbtree_create((rbcmp) rs_rtx_cmp, _unmark_link, 0);
 		if (!link_tree) {
 			ERROR("Failed creating RTX tree");
 			goto finish;
@@ -1959,6 +2056,13 @@ int main(int argc, char *argv[])
 	}
 
 	/*
+	 *	Default to logging and capturing all events
+	 */
+	if (conf->event_flags == 0) {
+		memset(&conf->event_flags, 1, sizeof(conf->event_flags));
+	}
+
+	/*
 	 *	If we need to list attributes, link requests using attributes, filter attributes
 	 *	or print the packet contents, we need to decode the attributes.
 	 *
@@ -1973,7 +2077,7 @@ int main(int argc, char *argv[])
 	/*
 	 *	Setup the request tree
 	 */
-	request_tree = rbtree_create((rbcmp) rs_packet_cmp, _rb_rad_free, 0);
+	request_tree = rbtree_create((rbcmp) rs_packet_cmp, _unmark_request, 0);
 	if (!request_tree) {
 		ERROR("Failed creating request tree");
 		goto finish;
@@ -2214,22 +2318,12 @@ int main(int argc, char *argv[])
 	 *	Setup signal handlers so we always exit gracefully, ensuring output buffers are always
 	 *	flushed.
 	 */
-	{
-#ifdef HAVE_SIGACTION
-		struct sigaction action;
-		memset(&action, 0, sizeof(action));
-
-		action.sa_handler = rs_cleanup;
-		sigaction(SIGINT, &action, NULL);
-		sigaction(SIGQUIT, &action, NULL);
-		sigaction(SIGTERM, &action, NULL);
-#else
-		signal(SIGINT, rs_cleanup);
-#  ifdef SIGQUIT
-		signal(SIGQUIT, rs_cleanup);
-#  endif
+	fr_set_signal(SIGINT, rs_cleanup);
+	fr_set_signal(SIGTERM, rs_cleanup);
+#ifdef SIGQUIT
+	fr_set_signal(SIGQUIT, rs_cleanup);
 #endif
-	}
+
 	fr_event_loop(events);	/* Enter the main event loop */
 
 	DEBUG("Done sniffing");

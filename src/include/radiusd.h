@@ -139,7 +139,7 @@ typedef struct radclient {
 
 #ifdef WITH_COA
 	char			*coa_name;
-	home_server		*coa_server;
+	home_server_t		*coa_server;
 	home_pool_t		*coa_pool;
 #endif
 } RADCLIENT;
@@ -242,13 +242,13 @@ struct request {
 #endif
 
 
-	int		     simul_max;	//!< Maximum number of
+	int			simul_max;	//!< Maximum number of
 						//!< concurrent sessions for
 						//!< this user.
 #ifdef WITH_SESSION_MGMT
-	int		     simul_count;	//!< The current number of
+	int			simul_count;	//!< The current number of
 						//!< sessions for this user.
-	int		     simul_mpp; 	//!< WEIRD: 1 is false,
+	int			simul_mpp; 	//!< WEIRD: 1 is false,
 						//!< 2 is true.
 #endif
 
@@ -275,7 +275,7 @@ struct request {
 #ifdef WITH_PROXY
 	int			in_proxy_hash;
 
-	home_server	       	*home_server;
+	home_server_t	       	*home_server;
 	home_pool_t		*home_pool; /* for dynamic failover */
 
 	struct timeval		proxy_retransmit;
@@ -298,22 +298,22 @@ struct request {
 #endif
 };				/* REQUEST typedef */
 
-#define RAD_REQUEST_OPTION_NONE	    (0)
-#define RAD_REQUEST_OPTION_DEBUG	   (1)
-#define RAD_REQUEST_OPTION_DEBUG2	  (2)
-#define RAD_REQUEST_OPTION_DEBUG3	  (3)
-#define RAD_REQUEST_OPTION_DEBUG4	  (4)
+#define RAD_REQUEST_OPTION_NONE		(0)
+#define RAD_REQUEST_OPTION_DEBUG	(1)
+#define RAD_REQUEST_OPTION_DEBUG2	(2)
+#define RAD_REQUEST_OPTION_DEBUG3	(3)
+#define RAD_REQUEST_OPTION_DEBUG4	(4)
 
-#define REQUEST_ACTIVE 		(1)
-#define REQUEST_STOP_PROCESSING (2)
-#define REQUEST_COUNTED		(3)
+#define REQUEST_ACTIVE 			(1)
+#define REQUEST_STOP_PROCESSING		(2)
+#define REQUEST_COUNTED			(3)
 
-#define REQUEST_QUEUED		(1)
-#define REQUEST_RUNNING		(2)
-#define REQUEST_PROXIED		(3)
-#define REQUEST_REJECT_DELAY	(4)
-#define REQUEST_CLEANUP_DELAY	(5)
-#define REQUEST_DONE		(6)
+#define REQUEST_QUEUED			(1)
+#define REQUEST_RUNNING			(2)
+#define REQUEST_PROXIED			(3)
+#define REQUEST_REJECT_DELAY		(4)
+#define REQUEST_CLEANUP_DELAY		(5)
+#define REQUEST_DONE			(6)
 
 typedef struct radclient_list RADCLIENT_LIST;
 
@@ -379,7 +379,7 @@ typedef struct listen_socket_t {
 	int		max_rate;
 
 	/* for outgoing sockets */
-	home_server	*home;
+	home_server_t	*home;
 	fr_ipaddr_t	other_ipaddr;
 	int		other_port;
 
@@ -446,6 +446,7 @@ typedef struct main_config_t {
 	char const	*auth_badpass_msg;
 	char const	*auth_goodpass_msg;
 	int		debug_memory;
+	char const	*panic_action;
 } MAIN_CONFIG_T;
 
 #define SECONDS_PER_DAY		86400
@@ -590,6 +591,7 @@ int		pairlist_read(TALLOC_CTX *ctx, char const *file, PAIR_LIST **list, int comp
 void		pairlist_free(PAIR_LIST **);
 
 /* version.c */
+int		rad_check_lib_magic(uint64_t magic);
 int 		ssl_check_version(void);
 char const	*ssl_version(void);
 void		version(void);
@@ -601,12 +603,9 @@ int		rad_postauth(REQUEST *);
 int		rad_virtual_server(REQUEST *);
 
 /* exec.c */
-pid_t radius_start_program(char const *cmd, REQUEST *request,
-			int exec_wait,
-			int *input_fd,
-			int *output_fd,
-			VALUE_PAIR *input_pairs,
-			int shell_escape);
+pid_t radius_start_program(char const *cmd, REQUEST *request, bool exec_wait,
+			   int *input_fd, int *output_fd,
+			   VALUE_PAIR *input_pairs, bool shell_escape);
 int radius_readfrom_program(REQUEST *request, int fd, pid_t pid, int timeout,
 			    char *answer, int left);
 int radius_exec_program(REQUEST *request, char const *cmd, bool exec_wait, bool shell_escape,
@@ -635,7 +634,11 @@ void module_failure_msg(REQUEST *request, char const *fmt, ...)
 		__attribute__ ((format (printf, 2, 3)))
 #endif
 ;
-
+void vmodule_failure_msg(REQUEST *request, char const *fmt, va_list ap)
+#ifdef __GNUC__
+		__attribute__ ((format (printf, 2, 0)))
+#endif
+;
 /*
  *	Less code == less bugs
  */
@@ -656,8 +659,8 @@ ssize_t radius_axlat(char **out, REQUEST *request, char const *fmt, RADIUS_ESCAP
 typedef ssize_t (*RAD_XLAT_FUNC)(void *instance, REQUEST *, char const *, char *, size_t);
 int		xlat_register(char const *module, RAD_XLAT_FUNC func, RADIUS_ESCAPE_STRING escape,
 			      void *instance);
-void		xlat_unregister(char const *module, RAD_XLAT_FUNC func,
-				void *instance);
+void		xlat_unregister(char const *module, RAD_XLAT_FUNC func, void *instance);
+ssize_t		xlat_fmt_to_ref(uint8_t const **out, REQUEST *request, char const *fmt);
 void		xlat_free(void);
 
 /* threads.c */
@@ -691,7 +694,7 @@ void fr_suid_down_permanent(void);
 /* listen.c */
 void listen_free(rad_listen_t **head);
 int listen_init(CONF_SECTION *cs, rad_listen_t **head, int spawn_flag);
-rad_listen_t *proxy_new_listener(home_server *home, int src_port);
+rad_listen_t *proxy_new_listener(home_server_t *home, int src_port);
 RADCLIENT *client_listener_find(rad_listen_t *listener,
 				fr_ipaddr_t const *ipaddr, int src_port);
 
@@ -709,7 +712,7 @@ void radius_event_free(void);
 int radius_event_process(void);
 int event_new_fd(rad_listen_t *listener);
 void revive_home_server(void *ctx);
-void mark_home_server_dead(home_server *home, struct timeval *when);
+void mark_home_server_dead(home_server_t *home, struct timeval *when);
 
 /* evaluate.c */
 typedef struct fr_cond_t fr_cond_t;

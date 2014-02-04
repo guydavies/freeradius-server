@@ -97,7 +97,7 @@ static rc_request_t *rc_request_tail = NULL;
 
 char const *radclient_version = "radclient version " RADIUSD_VERSION_STRING
 #ifdef RADIUSD_VERSION_COMMIT
-" (git #" RADIUSD_VERSION_COMMIT ")"
+" (git #" STRINGIFY(RADIUSD_VERSION_COMMIT) ")"
 #endif
 ", built on " __DATE__ " at " __TIME__;
 
@@ -107,7 +107,8 @@ static void NEVER_RETURNS usage(void)
 
 	fprintf(stderr, "  <command>     One of auth, acct, status, coa, or disconnect.\n");
 	fprintf(stderr, "  -c <count>    Send each packet 'count' times.\n");
-	fprintf(stderr, "  -d <raddb>    Set dictionary directory.\n");
+	fprintf(stderr, "  -d <raddb>    Set user dictionary directory (defaults to " RADDBDIR ").\n");
+	fprintf(stderr, "  -D <dictdir>  Set main dictionary directory (defaults to " DICTDIR ").\n");
 	fprintf(stderr, "  -f <file>     Read packets from file, not stdin.\n");
 	fprintf(stderr, "  -F            Print the file name, packet number and reply code.\n");
 	fprintf(stderr, "  -h            Print usage help information.\n");
@@ -253,6 +254,7 @@ static int radclient_init(TALLOC_CTX *ctx, char const *filename)
 		request->packet->src_port = client_port;
 		request->packet->dst_ipaddr = server_ipaddr;
 		request->packet->dst_port = server_port;
+		request->packet->proto = ipproto;
 #endif
 
 		request->filename = filename;
@@ -917,6 +919,7 @@ int main(int argc, char **argv)
 	char *p;
 	int c;
 	char const *radius_dir = RADDBDIR;
+	char const *dict_dir = DICTDIR;
 	char filesecret[256];
 	FILE *fp;
 	int do_summary = 0;
@@ -927,6 +930,10 @@ int main(int argc, char **argv)
 
 	fr_debug_flag = 0;
 
+#ifndef NDEBUG
+	fr_fault_setup(getenv("PANIC_ACTION"), argv[0]);
+#endif
+
 	talloc_set_log_stderr();
 
 	filename_tree = rbtree_create(filename_cmp, NULL, 0);
@@ -935,7 +942,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	while ((c = getopt(argc, argv, "46c:d:f:Fhi:n:p:qr:sS:t:vx"
+	while ((c = getopt(argc, argv, "46c:d:D:f:Fhi:n:p:qr:sS:t:vx"
 #ifdef WITH_TCP
 		"P:"
 #endif
@@ -950,6 +957,9 @@ int main(int argc, char **argv)
 			if (!isdigit((int) *optarg))
 				usage();
 			resend_count = atoi(optarg);
+			break;
+		case 'D':
+			dict_dir = optarg;
 			break;
 		case 'd':
 			radius_dir = optarg;
@@ -1069,7 +1079,20 @@ int main(int argc, char **argv)
 		usage();
 	}
 
-	if (dict_init(radius_dir, RADIUS_DICTIONARY) < 0) {
+	/*
+	 *	Mismatch between the binary and the libraries it depends on
+	 */
+	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
+		fr_perror("radclient");
+		return 1;
+	}
+
+	if (dict_init(dict_dir, RADIUS_DICTIONARY) < 0) {
+		fr_perror("radclient");
+		return 1;
+	}
+
+	if (dict_read(radius_dir, RADIUS_DICTIONARY) == -1) {
 		fr_perror("radclient");
 		return 1;
 	}

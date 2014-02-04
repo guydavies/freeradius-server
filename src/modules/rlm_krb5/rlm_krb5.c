@@ -84,7 +84,7 @@ static int krb5_instantiate(CONF_SECTION *conf, void *instance)
 
 #ifndef KRB5_IS_THREAD_SAFE
 	if (!krb5_is_thread_safe()) {
-		DEBUGI("libkrb5 is not threadsafe, recompile it, and the server with thread support enabled");
+		WDEBUG("libkrb5 is not threadsafe, recompile it, and the server with thread support enabled");
 		WDEBUG("rlm_krb5 will run in single threaded mode, performance may be degraded");
 	} else {
 		WDEBUG("Build time libkrb5 was not threadsafe, but run time library claims to be");
@@ -331,8 +331,9 @@ static rlm_rcode_t krb5_auth(void *instance, REQUEST *request)
 			break;
 
 		case KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN:
-			RDEBUG("User not found: %s (%i)", ret, rlm_krb5_error(conn->context, ret));
+			RDEBUG("User not found (%i): %s", ret, rlm_krb5_error(conn->context, ret));
 			rcode = RLM_MODULE_NOTFOUND;
+			break;
 
 		default:
 			REDEBUG("Error verifying credentials (%i): %s", ret, rlm_krb5_error(conn->context, ret));

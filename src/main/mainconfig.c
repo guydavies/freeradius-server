@@ -164,6 +164,7 @@ static const CONF_PARSER server_config[] = {
 	{ "run_dir",	    PW_TYPE_STRING_PTR, 0, &run_dir,	   "${localstatedir}/run/${name}"},
 	{ "libdir",	     PW_TYPE_STRING_PTR, 0, &radlib_dir,	"${prefix}/lib"},
 	{ "radacctdir",	 PW_TYPE_STRING_PTR, 0, &radacct_dir,       "${logdir}/radacct" },
+	{ "panic_action", PW_TYPE_STRING_PTR, 0, &mainconfig.panic_action, NULL},
 	{ "hostname_lookups",   PW_TYPE_BOOLEAN,    0, &fr_dns_lookups,      "no" },
 	{ "max_request_time", PW_TYPE_INTEGER, 0, &mainconfig.max_request_time, STRINGIFY(MAX_REQUEST_TIME) },
 	{ "cleanup_delay", PW_TYPE_INTEGER, 0, &mainconfig.cleanup_delay, STRINGIFY(CLEANUP_DELAY) },
@@ -731,6 +732,7 @@ static int switch_users(CONF_SECTION *cs)
  */
 int read_mainconfig(int reload)
 {
+	int rcode;
 	char const *p = NULL;
 	CONF_SECTION *cs;
 	struct stat statbuf;
@@ -765,13 +767,44 @@ int read_mainconfig(int reload)
 #endif
 	INFO("Starting - reading configuration files ...");
 
-	/* Initialize the dictionary */
-	if (!mainconfig.dictionary_dir) mainconfig.dictionary_dir = radius_dir;
+	/*
+	 *	We need to load the dictionaries before reading the
+	 *	configuration files.  This is because of the
+	 *	pre-compilation in conffile.c.  That should probably
+	 *	be fixed to be done as a second stage.
+	 */
+	if (!mainconfig.dictionary_dir) {
+		mainconfig.dictionary_dir = talloc_strdup(NULL, DICTDIR);
+	}
+
+	/*
+	 *	Read the distribution dictionaries first, then
+	 *	the ones in raddb.
+	 */
 	DEBUG2("including dictionary file %s/%s", mainconfig.dictionary_dir, RADIUS_DICTIONARY);
 	if (dict_init(mainconfig.dictionary_dir, RADIUS_DICTIONARY) != 0) {
 		ERROR("Errors reading dictionary: %s",
-				fr_strerror());
+		      fr_strerror());
 		return -1;
+	}
+
+	/*
+	 *	It's OK if this one doesn't exist.
+	 */
+	rcode = dict_read(radius_dir, RADIUS_DICTIONARY);
+	if (rcode == -1) {
+		ERROR("Errors reading %s/%s: %s", radius_dir, RADIUS_DICTIONARY,
+		      fr_strerror());
+		return -1;
+	}
+
+	/*
+	 *	We print this after reading it.  That way if
+	 *	it doesn't exist, it's OK, and we don't print
+	 *	anything.
+	 */
+	if (rcode == 0) {
+		DEBUG2("including dictionary file %s/%s", radius_dir, RADIUS_DICTIONARY);
 	}
 
 	/* Read the configuration file */
@@ -953,12 +986,15 @@ int read_mainconfig(int reload)
 		}
 	}
 
-	cc = rad_malloc(sizeof(*cc));
-	memset(cc, 0, sizeof(*cc));
+	cc = talloc_zero(NULL, cached_config_t);
+	if (!cc) return -1;
 
-	cc->cs = cs;
+	cc->cs = talloc_steal(cc ,cs);
 	rad_assert(cs_cache == NULL);
 	cs_cache = cc;
+
+	/* Clear any unprocessed configuration errors */
+	(void) fr_strerror();
 
 	return 0;
 }
@@ -985,8 +1021,8 @@ int free_mainconfig(void)
 	 */
 	for (cc = cs_cache; cc != NULL; cc = next) {
 		next = cc->next;
-		cf_file_free(cc->cs);
-		free(cc);
+
+		talloc_free(cc);
 	}
 
 	dict_free();
@@ -1033,8 +1069,11 @@ void hup_mainconfig(void)
 		return;
 	}
 
-	cc = rad_malloc(sizeof(*cc));
-	memset(cc, 0, sizeof(*cc));
+	cc = talloc_zero(NULL, cached_config_t);
+	if (!cc) {
+		ERROR("Out of memory");
+		return;
+	}
 
 	/*
 	 *	Save the current configuration.  Note that we do NOT
@@ -1046,7 +1085,7 @@ void hup_mainconfig(void)
 	 *	configurations.
 	 */
 	cc->created = time(NULL);
-	cc->cs = cs;
+	cc->cs = talloc_steal(cc, cs);
 	cc->next = cs_cache;
 	cs_cache = cc;
 

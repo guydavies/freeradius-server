@@ -796,10 +796,18 @@ int main(int argc, char *argv[])
 	int c;
 	int report = false;
 	char const *radius_dir = RADDBDIR;
+	char const *dict_dir = DICTDIR;
 
-	while ((c = getopt(argc, argv, "d:xM")) != EOF) switch(c) {
+#ifndef NDEBUG
+	fr_fault_setup(getenv("PANIC_ACTION"), argv[0]);
+#endif
+
+	while ((c = getopt(argc, argv, "d:D:xM")) != EOF) switch(c) {
 		case 'd':
 			radius_dir = optarg;
+			break;
+		case 'D':
+			dict_dir = optarg;
 			break;
 	  	case 'x':
 			fr_debug_flag++;
@@ -820,7 +828,20 @@ int main(int argc, char *argv[])
 	}
 	talloc_set_log_fn(log_talloc);
 
-	if (dict_init(radius_dir, RADIUS_DICTIONARY) < 0) {
+	/*
+	 *	Mismatch between the binary and the libraries it depends on
+	 */
+	if (fr_check_lib_magic(RADIUSD_MAGIC_NUMBER) < 0) {
+		fr_perror("radattr");
+		return 1;
+	}
+
+	if (dict_init(dict_dir, RADIUS_DICTIONARY) < 0) {
+		fr_perror("radattr");
+		return 1;
+	}
+
+	if (dict_read(radius_dir, RADIUS_DICTIONARY) == -1) {
 		fr_perror("radattr");
 		return 1;
 	}
