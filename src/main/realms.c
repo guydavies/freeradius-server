@@ -464,8 +464,7 @@ static int home_server_add(realm_config_t *rc, CONF_SECTION *cs)
 			   "No ipaddr, ipv6addr, or virtual_server defined for home server \"%s\".",
 			   name2);
 	error:
-		talloc_free(hs_type);
-		hs_type = NULL;
+		TALLOC_FREE(hs_type);
 		hs_check = NULL;
 		hs_srcipaddr = NULL;
 #ifdef WITH_TCP
@@ -484,13 +483,6 @@ static int home_server_add(realm_config_t *rc, CONF_SECTION *cs)
 	if (0) {
 		cf_log_err_cs(cs,
 			   "Fatal error!  Home server %s is ourselves!",
-			   name2);
-		goto error;
-	}
-
-	if (!home->secret) {
-		cf_log_err_cs(cs,
-			   "No shared secret defined for home server %s.",
 			   name2);
 		goto error;
 	}
@@ -556,7 +548,7 @@ static int home_server_add(realm_config_t *rc, CONF_SECTION *cs)
 
 	} else {
 		cf_log_err_cs(cs,
-			   "Invalid status__check \"%s\" for home server %s.",
+			   "Invalid status_check \"%s\" for home server %s.",
 			   hs_check, name2);
 		goto error;
 	}
@@ -610,6 +602,19 @@ static int home_server_add(realm_config_t *rc, CONF_SECTION *cs)
 	 *	Check the TLS configuration.
 	 */
 	tls = cf_section_sub_find(cs, "tls");
+
+	/*
+	 *	If were doing RADSEC (tls+tcp) the secret should default
+	 *	to radsec, else a secret must be set.
+	 */
+	if (!home->secret) {
+		if (!tls || (home->proto != IPPROTO_TCP)) {
+			cf_log_err_cs(cs, "No shared secret defined for home server %s", name2);
+			goto error;
+		}
+
+		home->secret = "radsec";
+	}
 
 	/*
 	 *	If the home is a virtual server, don't look up source IP.
@@ -1856,9 +1861,13 @@ int realms_init(CONF_SECTION *config)
 	if (cs) {
 		if (cf_section_parse(cs, rc, proxy_config) < 0) {
 			ERROR("Failed parsing proxy section");
-
-			talloc_free(rc);
+		error:
 			realms_free();
+			/*
+			 *	Must be called after realms_free as home_servers
+			 *	parented by rc are in trees freed by realms_free()
+			 */
+			talloc_free(rc);
 			return 0;
 		}
 	} else {
@@ -1872,11 +1881,7 @@ int realms_init(CONF_SECTION *config)
 	for (cs = cf_subsection_find_next(config, NULL, "home_server");
 	     cs != NULL;
 	     cs = cf_subsection_find_next(config, cs, "home_server")) {
-		if (!home_server_add(rc, cs)) {
-			talloc_free(rc);
-			realms_free();
-			return 0;
-		}
+		if (!home_server_add(rc, cs)) goto error;
 	}
 
 	/*
@@ -1889,11 +1894,7 @@ int realms_init(CONF_SECTION *config)
 		for (cs = cf_subsection_find_next(server_cs, NULL, "home_server");
 		     cs != NULL;
 		     cs = cf_subsection_find_next(server_cs, cs, "home_server")) {
-			if (!home_server_add(rc, cs)) {
-				talloc_free(rc);
-				realms_free();
-				return 0;
-			}
+			if (!home_server_add(rc, cs)) goto error;
 		}
 	}
 #endif
@@ -1901,11 +1902,7 @@ int realms_init(CONF_SECTION *config)
 	for (cs = cf_subsection_find_next(config, NULL, "realm");
 	     cs != NULL;
 	     cs = cf_subsection_find_next(config, cs, "realm")) {
-		if (!realm_add(rc, cs)) {
-			talloc_free(rc);
-			realms_free();
-			return 0;
-		}
+		if (!realm_add(rc, cs)) goto error;
 	}
 
 #ifdef WITH_COA
@@ -1923,17 +1920,8 @@ int realms_init(CONF_SECTION *config)
 		if (cf_data_find(cs, "home_server_pool")) continue;
 
 		type = pool_peek_type(config, cs);
-		if (type == HOME_TYPE_INVALID) {
-			talloc_free(rc);
-			realms_free();
-			return 0;
-		}
-
-		if (!server_pool_add(rc, cs, type, true)) {
-			talloc_free(rc);
-			realms_free();
-			return 0;
-		}
+		if (type == HOME_TYPE_INVALID) goto error;
+		if (!server_pool_add(rc, cs, type, true)) goto error;
 	}
 #endif
 
